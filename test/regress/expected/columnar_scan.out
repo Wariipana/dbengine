@@ -1,0 +1,972 @@
+-- F3: Custom Scan — column pruning y descarte de stripes por zone maps.
+CREATE EXTENSION dbengine;
+SET max_parallel_workers_per_gather = 0;
+SET dbengine.staging_threshold_rows = 2000;
+CREATE TABLE s (
+	id     bigint,
+	ts     timestamptz,
+	region text,
+	monto  numeric(12,2),
+	nota   text
+) USING dbengine_columnar;
+INSERT INTO s
+SELECT g,
+	   '2024-01-01'::timestamptz + g * interval '1 minute',
+	   (ARRAY['norte','sur','este','oeste'])[1 + g % 4],
+	   (g % 1000) / 10.0,
+	   'nota-' || g
+FROM generate_series(1, 20000) g;
+RESET dbengine.staging_threshold_rows;
+ANALYZE s;
+SELECT count(*) AS stripes FROM dbengine.stripe
+WHERE relfilenode = pg_relation_filenode('s');
+ stripes 
+---------
+      10
+(1 row)
+
+-- ===========================================================================
+-- Column pruning
+--
+-- Es lo que el Table AM no puede hacer: scan_begin() nunca se entera de qué
+-- columnas pide la query.  El Custom Scan sí.
+-- ===========================================================================
+EXPLAIN (COSTS OFF) SELECT count(*) FROM s;
+              QUERY PLAN              
+--------------------------------------
+ Custom Scan (DbengineVectorAgg) on s
+   Agregados empujados al scan: 1
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT sum(monto) FROM s;
+              QUERY PLAN              
+--------------------------------------
+ Custom Scan (DbengineVectorAgg) on s
+   Agregados empujados al scan: 1
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT region, count(*) FROM s GROUP BY region;
+                  QUERY PLAN                   
+-----------------------------------------------
+ HashAggregate
+   Group Key: region
+   ->  Custom Scan (DbengineColumnarScan) on s
+         Columnas leídas: region
+(4 rows)
+
+-- ===========================================================================
+-- Descarte de stripes por zone maps
+-- ===========================================================================
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT count(*) FROM s WHERE id BETWEEN 100 AND 200;
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Custom Scan (DbengineVectorAgg) on s (actual rows=1.00 loops=1)
+   Agregados empujados al scan: 1
+   Filtro: ((s.id >= 100) AND (s.id <= 200))
+   Predicados sobre zone maps: 2
+   Filas agregadas: 101
+   Filas descartadas por el filtro: 1899
+   Stripes descartados: 9
+(7 rows)
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT count(*) FROM s WHERE id > 19500;
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Custom Scan (DbengineVectorAgg) on s (actual rows=1.00 loops=1)
+   Agregados empujados al scan: 1
+   Filtro: (s.id > 19500)
+   Predicados sobre zone maps: 1
+   Filas agregadas: 500
+   Filas descartadas por el filtro: 1500
+   Stripes descartados: 9
+(7 rows)
+
+-- Un predicado que no descarta nada: region se repite en todos los stripes.
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT count(*) FROM s WHERE region = 'norte';
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Custom Scan (DbengineVectorAgg) on s (actual rows=1.00 loops=1)
+   Agregados empujados al scan: 1
+   Filtro: (s.region = 'norte'::text)
+   Predicados sobre zone maps: 1
+   Filas agregadas: 5000
+   Filas descartadas por el filtro: 15000
+   Stripes descartados: 0
+(7 rows)
+
+-- ===========================================================================
+-- El pruning no puede cambiar ningún resultado
+--
+-- Cada consulta se corre con el Custom Scan y con el seq scan del Table AM;
+-- descartar un stripe que sí tenía filas daría distinto.
+-- ===========================================================================
+CREATE FUNCTION igual(q text) RETURNS text AS $$
+DECLARE
+	con text;
+	sin text;
+BEGIN
+	SET LOCAL dbengine.enable_vectorized = on;
+	EXECUTE 'SELECT (' || q || ')::text' INTO con;
+	SET LOCAL dbengine.enable_vectorized = off;
+	EXECUTE 'SELECT (' || q || ')::text' INTO sin;
+	IF con IS NOT DISTINCT FROM sin THEN
+		RETURN 'igual: ' || coalesce(con, 'NULL');
+	END IF;
+	RETURN 'DIFIERE con=' || coalesce(con, 'NULL') || ' sin=' || coalesce(sin, 'NULL');
+END
+$$ LANGUAGE plpgsql;
+SELECT igual('SELECT count(*) FROM s WHERE id BETWEEN 100 AND 200');
+   igual    
+------------
+ igual: 101
+(1 row)
+
+SELECT igual('SELECT count(*) FROM s WHERE id > 19500');
+   igual    
+------------
+ igual: 500
+(1 row)
+
+SELECT igual('SELECT count(*) FROM s WHERE id < 3');
+  igual   
+----------
+ igual: 2
+(1 row)
+
+SELECT igual('SELECT count(*) FROM s WHERE id = 12345');
+  igual   
+----------
+ igual: 1
+(1 row)
+
+SELECT igual('SELECT count(*) FROM s WHERE id >= 20000');
+  igual   
+----------
+ igual: 1
+(1 row)
+
+SELECT igual('SELECT count(*) FROM s WHERE id <= 0');
+  igual   
+----------
+ igual: 0
+(1 row)
+
+SELECT igual('SELECT count(*) FROM s WHERE id > 1000000');
+  igual   
+----------
+ igual: 0
+(1 row)
+
+SELECT igual('SELECT sum(id) FROM s WHERE id BETWEEN 5000 AND 6000');
+     igual      
+----------------
+ igual: 5505500
+(1 row)
+
+SELECT igual('SELECT count(*) FROM s WHERE ts < ''2024-01-01''::timestamptz');
+  igual   
+----------
+ igual: 0
+(1 row)
+
+SELECT igual('SELECT count(*) FROM s WHERE nota = ''nota-777''');
+  igual   
+----------
+ igual: 1
+(1 row)
+
+SELECT igual('SELECT count(*) FROM s WHERE region = ''sur''');
+    igual    
+-------------
+ igual: 5000
+(1 row)
+
+SELECT igual('SELECT count(*) FROM s WHERE id IS NULL');
+  igual   
+----------
+ igual: 0
+(1 row)
+
+SELECT igual('SELECT count(*) FROM s WHERE id = 100 OR id = 15000');
+  igual   
+----------
+ igual: 2
+(1 row)
+
+SELECT igual('SELECT count(*) FROM s WHERE monto > 99.0');
+   igual    
+------------
+ igual: 180
+(1 row)
+
+-- Tipos cruzados: la columna es bigint y el literal integer.  Es el caso
+-- normal, no un borde, y hay que podar igual.
+SELECT igual('SELECT count(*) FROM s WHERE id > 19990::int');
+   igual   
+-----------
+ igual: 10
+(1 row)
+
+SELECT igual('SELECT max(nota) FROM s WHERE id < 50');
+     igual     
+---------------
+ igual: nota-9
+(1 row)
+
+-- ===========================================================================
+-- Fallback: lo que el Custom Scan no puede acotar vuelve al seq scan
+-- ===========================================================================
+-- Referencia a la fila entera: hacen falta todas las columnas.
+EXPLAIN (COSTS OFF) SELECT count(s.*) FROM s;
+     QUERY PLAN      
+---------------------
+ Aggregate
+   ->  Seq Scan on s
+(2 rows)
+
+-- Columna de sistema que un storage columnar no tiene.
+EXPLAIN (COSTS OFF) SELECT count(*) FROM s WHERE xmin::text <> '';
+                 QUERY PLAN                 
+--------------------------------------------
+ Aggregate
+   ->  Seq Scan on s
+         Filter: ((xmin)::text <> ''::text)
+(3 rows)
+
+-- Apagarlo a mano también cae al seq scan.
+SET dbengine.enable_vectorized = off;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM s;
+     QUERY PLAN      
+---------------------
+ Aggregate
+   ->  Seq Scan on s
+(2 rows)
+
+RESET dbengine.enable_vectorized;
+-- ===========================================================================
+-- Scan paralelo
+-- ===========================================================================
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SELECT count(*), sum(id) FROM s;
+ count |    sum    
+-------+-----------
+ 20000 | 200010000
+(1 row)
+
+SELECT count(*) FROM s WHERE id BETWEEN 100 AND 200;
+ count 
+-------
+   101
+(1 row)
+
+SELECT igual('SELECT sum(id) FROM s');
+      igual       
+------------------
+ igual: 200010000
+(1 row)
+
+RESET ALL;
+SET max_parallel_workers_per_gather = 0;
+-- Apagar el descarte por GUC no cambia ningún resultado, solo lo apaga.
+SET dbengine.enable_zonemap_pruning = off;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT count(*) FROM s WHERE id BETWEEN 100 AND 200;
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Custom Scan (DbengineVectorAgg) on s (actual rows=1.00 loops=1)
+   Agregados empujados al scan: 1
+   Filtro: ((s.id >= 100) AND (s.id <= 200))
+   Filas agregadas: 101
+   Filas descartadas por el filtro: 19899
+   Stripes descartados: 0
+(6 rows)
+
+SELECT igual('SELECT count(*) FROM s WHERE id BETWEEN 100 AND 200');
+   igual    
+------------
+ igual: 101
+(1 row)
+
+RESET dbengine.enable_zonemap_pruning;
+-- ---------------------------------------------------------------------------
+-- Late materialization
+--
+-- El predicado se evalúa con SOLO las columnas que mira; las demás se
+-- decodifican recién para las filas que lo pasan.  Por eso el predicado no
+-- vive en plan.qual sino adentro del nodo — el `Filter:` lo imprime el nodo.
+-- ---------------------------------------------------------------------------
+SET dbengine.enable_agg_pushdown = off;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT id, nota FROM s WHERE id BETWEEN 100 AND 200;
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Custom Scan (DbengineColumnarScan) on s (actual rows=101.00 loops=1)
+   Columnas leídas: id, nota
+   Filter: ((s.id >= 100) AND (s.id <= 200))
+   Rows Removed by Filter: 1899
+   Predicados sobre zone maps: 2
+   Stripes descartados: 9
+(6 rows)
+
+-- Sin predicado se llenan todas las columnas igual.
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT count(nota) FROM s;
+                                  QUERY PLAN                                  
+------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Custom Scan (DbengineColumnarScan) on s (actual rows=20000.00 loops=1)
+         Columnas leídas: nota
+         Stripes descartados: 0
+(4 rows)
+
+SELECT igual('SELECT count(nota) FROM s');
+    igual     
+--------------
+ igual: 20000
+(1 row)
+
+SELECT igual('SELECT sum(length(nota)) FROM s WHERE id < 500');
+    igual    
+-------------
+ igual: 3884
+(1 row)
+
+SELECT igual('SELECT max(nota) FROM s WHERE region = ''sur''');
+      igual       
+------------------
+ igual: nota-9997
+(1 row)
+
+-- La fila entera: todas las columnas se materializan.
+SELECT igual('SELECT count(*) FROM (SELECT * FROM s WHERE id BETWEEN 100 AND 200) z');
+   igual    
+------------
+ igual: 101
+(1 row)
+
+SELECT igual('SELECT md5(string_agg(t.*::text, ''|'' ORDER BY t.id)) FROM (SELECT * FROM s WHERE id < 50) t');
+                  igual                  
+-----------------------------------------
+ igual: 5e47f4df2ee10d8d2fbbb7eb9bc03c1b
+(1 row)
+
+-- Predicado sobre una columna que la proyección NO pide.
+SELECT igual('SELECT sum(id) FROM s WHERE nota = ''nota-42''');
+   igual   
+-----------
+ igual: 42
+(1 row)
+
+-- Predicado sobre una columna que sí pide.
+SELECT igual('SELECT count(*) FROM (SELECT nota FROM s WHERE nota IS NOT NULL) z');
+    igual     
+--------------
+ igual: 20000
+(1 row)
+
+RESET dbengine.enable_agg_pushdown;
+-- ===========================================================================
+-- Particiones
+--
+-- Una partición es RELOPT_OTHER_MEMBER_REL, no RELOPT_BASEREL.  El hook
+-- las trata igual: el reltarget y el baserestrictinfo del hijo ya vienen
+-- traducidos a SUS números de columna.
+-- ===========================================================================
+CREATE TABLE sp (id bigint, region text, nota text) PARTITION BY RANGE (id);
+CREATE TABLE sp1 PARTITION OF sp FOR VALUES FROM (0) TO (10000)
+	USING dbengine_columnar;
+CREATE TABLE sp2 PARTITION OF sp FOR VALUES FROM (10000) TO (20000)
+	USING dbengine_columnar;
+CREATE TABLE sp_heap (LIKE sp);
+INSERT INTO sp SELECT g, (ARRAY['norte','sur'])[1 + g % 2], 'nota-' || g
+	FROM generate_series(0, 19999) g;
+INSERT INTO sp_heap SELECT * FROM sp;
+ANALYZE sp;
+-- Cada partición recibe su propio nodo, con pruning y column pruning.
+EXPLAIN (COSTS OFF) SELECT id FROM sp WHERE region = 'norte';
+                      QUERY PLAN                      
+------------------------------------------------------
+ Append
+   ->  Custom Scan (DbengineColumnarScan) on sp1 sp_1
+         Columnas leídas: id, region
+         Filter: (sp_1.region = 'norte'::text)
+         Predicados sobre zone maps: 1
+   ->  Custom Scan (DbengineColumnarScan) on sp2 sp_2
+         Columnas leídas: id, region
+         Filter: (sp_2.region = 'norte'::text)
+         Predicados sobre zone maps: 1
+(9 rows)
+
+-- Con poda de particiones queda una sola.
+EXPLAIN (COSTS OFF) SELECT id, nota FROM sp WHERE id BETWEEN 15000 AND 15010;
+                    QUERY PLAN                     
+---------------------------------------------------
+ Custom Scan (DbengineColumnarScan) on sp2 sp
+   Columnas leídas: id, nota
+   Filter: ((sp.id >= 15000) AND (sp.id <= 15010))
+   Predicados sobre zone maps: 2
+(4 rows)
+
+CREATE FUNCTION igual_part(q text) RETURNS text AS $$
+DECLARE
+	col text;
+	hea text;
+BEGIN
+	EXECUTE 'SELECT (' || replace(q, '@', 'sp') || ')::text' INTO col;
+	EXECUTE 'SELECT (' || replace(q, '@', 'sp_heap') || ')::text' INTO hea;
+	IF col IS NOT DISTINCT FROM hea THEN
+		RETURN 'igual: ' || coalesce(col, 'NULL');
+	END IF;
+	RETURN 'DIFIERE columnar=' || coalesce(col, 'NULL') ||
+		   ' heap=' || coalesce(hea, 'NULL');
+END
+$$ LANGUAGE plpgsql;
+SELECT igual_part('SELECT count(*) FROM @');
+  igual_part  
+--------------
+ igual: 20000
+(1 row)
+
+SELECT igual_part('SELECT count(*) FROM @ WHERE region = ''norte''');
+  igual_part  
+--------------
+ igual: 10000
+(1 row)
+
+SELECT igual_part('SELECT sum(id) FROM @ WHERE id BETWEEN 15000 AND 15010');
+  igual_part   
+---------------
+ igual: 165055
+(1 row)
+
+SELECT igual_part('SELECT max(nota) FROM @ WHERE region = ''sur''');
+    igual_part    
+------------------
+ igual: nota-9999
+(1 row)
+
+SELECT igual_part('SELECT md5(string_agg(x.*::text, ''|'' ORDER BY x.id))
+                   FROM (SELECT * FROM @ WHERE id < 100) x');
+               igual_part                
+-----------------------------------------
+ igual: 28f2337948aeac478f9619fb509ef960
+(1 row)
+
+-- Predicado que no deja pasar nada en una partición y sí en la otra.
+SELECT igual_part('SELECT count(*) FROM @ WHERE id > 19990');
+ igual_part 
+------------
+ igual: 9
+(1 row)
+
+DROP FUNCTION igual_part(text);
+DROP TABLE sp, sp_heap;
+-- ===========================================================================
+-- Agregación empujada al scan
+--
+-- El nodo Agg pide una fila por vez; para agregar hay que construir una
+-- tupla por fila y tirarla.  Este nodo alimenta las funciones de transición
+-- del propio catálogo directamente, sin armar tuplas intermedias.
+-- ===========================================================================
+EXPLAIN (COSTS OFF) SELECT count(*) FROM s;
+              QUERY PLAN              
+--------------------------------------
+ Custom Scan (DbengineVectorAgg) on s
+   Agregados empujados al scan: 1
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT sum(monto), min(id), max(id) FROM s;
+              QUERY PLAN              
+--------------------------------------
+ Custom Scan (DbengineVectorAgg) on s
+   Agregados empujados al scan: 3
+(2 rows)
+
+-- Los agregados tienen que dar EXACTAMENTE lo mismo que el plan normal:
+-- se usan las funciones de transición de pg_aggregate, así que sum(int4)
+-- desborda igual y avg(numeric) redondea igual.
+SELECT igual('SELECT count(*) FROM s');
+    igual     
+--------------
+ igual: 20000
+(1 row)
+
+SELECT igual('SELECT count(id) FROM s');
+    igual     
+--------------
+ igual: 20000
+(1 row)
+
+SELECT igual('SELECT sum(id) FROM s');
+      igual       
+------------------
+ igual: 200010000
+(1 row)
+
+SELECT igual('SELECT sum(monto) FROM s');
+      igual       
+------------------
+ igual: 999000.00
+(1 row)
+
+SELECT igual('SELECT avg(monto) FROM s');
+           igual            
+----------------------------
+ igual: 49.9500000000000000
+(1 row)
+
+SELECT igual('SELECT min(id) FROM s');
+  igual   
+----------
+ igual: 1
+(1 row)
+
+SELECT igual('SELECT max(nota) FROM s');
+      igual       
+------------------
+ igual: nota-9999
+(1 row)
+
+SELECT igual('SELECT min(ts) FROM s');
+                igual                
+-------------------------------------
+ igual: Mon Jan 01 00:01:00 2024 PST
+(1 row)
+
+SELECT igual('SELECT count(region) FROM s');
+    igual     
+--------------
+ igual: 20000
+(1 row)
+
+-- Tabla vacía: sum() da NULL y count() da 0, igual que siempre.
+CREATE TABLE svacia (a int, b numeric) USING dbengine_columnar;
+SELECT igual('SELECT count(*) FROM svacia');
+  igual   
+----------
+ igual: 0
+(1 row)
+
+SELECT igual('SELECT sum(a) FROM svacia');
+    igual    
+-------------
+ igual: NULL
+(1 row)
+
+SELECT igual('SELECT avg(b) FROM svacia');
+    igual    
+-------------
+ igual: NULL
+(1 row)
+
+SELECT igual('SELECT min(a) FROM svacia');
+    igual    
+-------------
+ igual: NULL
+(1 row)
+
+-- Todo nulo: los nulos no entran en la transición.
+CREATE TABLE snulos (a int, b numeric) USING dbengine_columnar;
+INSERT INTO snulos SELECT NULL, NULL FROM generate_series(1, 100);
+SELECT igual('SELECT count(*) FROM snulos');
+   igual    
+------------
+ igual: 100
+(1 row)
+
+SELECT igual('SELECT count(a) FROM snulos');
+  igual   
+----------
+ igual: 0
+(1 row)
+
+SELECT igual('SELECT sum(a) FROM snulos');
+    igual    
+-------------
+ igual: NULL
+(1 row)
+
+SELECT igual('SELECT avg(b) FROM snulos');
+    igual    
+-------------
+ igual: NULL
+(1 row)
+
+-- GROUP BY sí se empuja, pero a esta escala el plan normal cuesta menos y
+-- gana; lo que se prueba en test/regress/sql/grouped.sql.
+EXPLAIN (COSTS OFF) SELECT region, count(*) FROM s GROUP BY region;
+                  QUERY PLAN                   
+-----------------------------------------------
+ HashAggregate
+   Group Key: region
+   ->  Custom Scan (DbengineColumnarScan) on s
+         Columnas leídas: region
+(4 rows)
+
+-- count(DISTINCT) sin GROUP BY sí: un conjunto de hash sobre la columna.
+EXPLAIN (COSTS OFF) SELECT count(DISTINCT region) FROM s;
+              QUERY PLAN              
+--------------------------------------
+ Custom Scan (DbengineVectorAgg) on s
+   Agregados empujados al scan: 1
+(2 rows)
+
+-- FILTER sigue cayendo al plan normal.
+EXPLAIN (COSTS OFF) SELECT count(*) FILTER (WHERE id < 100) FROM s;
+                  QUERY PLAN                   
+-----------------------------------------------
+ Aggregate
+   ->  Custom Scan (DbengineColumnarScan) on s
+         Columnas leídas: id
+(3 rows)
+
+SELECT igual('SELECT count(DISTINCT region) FROM s');
+  igual   
+----------
+ igual: 4
+(1 row)
+
+SELECT igual('SELECT count(*) FILTER (WHERE id < 100) FROM s');
+   igual   
+-----------
+ igual: 99
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- Agregación CON predicado
+--
+-- El WHERE se evalúa adentro del nodo, contra un slot que trae solo las
+-- columnas que el predicado mira.  Los stripes que el zone map descarta no
+-- llegan a evaluarse.
+-- ---------------------------------------------------------------------------
+EXPLAIN (COSTS OFF) SELECT count(*) FROM s WHERE id < 100;
+              QUERY PLAN              
+--------------------------------------
+ Custom Scan (DbengineVectorAgg) on s
+   Agregados empujados al scan: 1
+   Filtro: (s.id < 100)
+   Predicados sobre zone maps: 1
+(4 rows)
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT sum(monto) FROM s WHERE id BETWEEN 100 AND 200;
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Custom Scan (DbengineVectorAgg) on s (actual rows=1.00 loops=1)
+   Agregados empujados al scan: 1
+   Filtro: ((s.id >= 100) AND (s.id <= 200))
+   Predicados sobre zone maps: 2
+   Filas agregadas: 101
+   Filas descartadas por el filtro: 1899
+   Stripes descartados: 9
+(7 rows)
+
+SELECT igual('SELECT count(*) FROM s WHERE id < 100');
+   igual   
+-----------
+ igual: 99
+(1 row)
+
+SELECT igual('SELECT sum(id) FROM s WHERE id > 19500');
+     igual      
+----------------
+ igual: 9875250
+(1 row)
+
+SELECT igual('SELECT sum(monto) FROM s WHERE region = ''norte''');
+      igual       
+------------------
+ igual: 249000.00
+(1 row)
+
+SELECT igual('SELECT avg(monto) FROM s WHERE id BETWEEN 100 AND 200');
+           igual            
+----------------------------
+ igual: 15.0000000000000000
+(1 row)
+
+SELECT igual('SELECT min(ts) FROM s WHERE region <> ''norte''');
+                igual                
+-------------------------------------
+ igual: Mon Jan 01 00:01:00 2024 PST
+(1 row)
+
+SELECT igual('SELECT max(ts) FROM s WHERE region <> ''norte''');
+                igual                
+-------------------------------------
+ igual: Sun Jan 14 21:19:00 2024 PST
+(1 row)
+
+-- Predicado sobre una columna que ningún agregado lee.
+SELECT igual('SELECT count(*) FROM s WHERE region = ''sur''');
+    igual    
+-------------
+ igual: 5000
+(1 row)
+
+-- Predicado que no deja pasar ninguna fila.
+SELECT igual('SELECT count(*) FROM s WHERE id > 999999');
+  igual   
+----------
+ igual: 0
+(1 row)
+
+SELECT igual('SELECT sum(id) FROM s WHERE id > 999999');
+    igual    
+-------------
+ igual: NULL
+(1 row)
+
+-- Predicado sobre nulos, y una expresión que no es `columna OP constante`.
+SELECT igual('SELECT count(*) FROM s WHERE nota IS NULL');
+  igual   
+----------
+ igual: 0
+(1 row)
+
+SELECT igual('SELECT count(*) FROM s WHERE id % 7 = 0');
+    igual    
+-------------
+ igual: 2857
+(1 row)
+
+SELECT igual('SELECT sum(id) FROM s WHERE region || ''!'' = ''norte!''');
+      igual      
+-----------------
+ igual: 50010000
+(1 row)
+
+-- El predicado no cambia con la visibilidad: las filas de la propia
+-- transacción tienen que contarse igual que en el plan normal.
+BEGIN;
+INSERT INTO s(id, region, monto, nota, ts) VALUES (30000, 'norte', 1, 'x', now());
+SELECT igual('SELECT count(*) FROM s WHERE region = ''norte''');
+    igual    
+-------------
+ igual: 5001
+(1 row)
+
+SELECT igual('SELECT sum(monto) FROM s WHERE id >= 30000');
+    igual    
+-------------
+ igual: 1.00
+(1 row)
+
+ROLLBACK;
+SELECT igual('SELECT count(*) FROM s WHERE region = ''norte''');
+    igual    
+-------------
+ igual: 5000
+(1 row)
+
+-- ===========================================================================
+-- count(*), min y max se responden desde los metadatos
+--
+-- El row_count y el zone map de cada stripe alcanzan: no se lee un byte de
+-- datos.  Por eso mismo la visibilidad tiene que salir de ahí también, y un
+-- stripe con visibilidad parcial obliga a caer al recorrido normal — su
+-- zone map abarca filas que el snapshot todavía no ve.
+-- ===========================================================================
+CREATE FUNCTION igual_fila(q text) RETURNS text AS $$
+DECLARE
+	con text;
+	sin text;
+BEGIN
+	SET LOCAL dbengine.enable_agg_pushdown = on;
+	EXECUTE 'SELECT row(x.*)::text FROM (' || q || ') x' INTO con;
+	SET LOCAL dbengine.enable_agg_pushdown = off;
+	EXECUTE 'SELECT row(x.*)::text FROM (' || q || ') x' INTO sin;
+	IF con IS NOT DISTINCT FROM sin THEN
+		RETURN 'igual: ' || coalesce(con, 'NULL');
+	END IF;
+	RETURN 'DIFIERE push=' || coalesce(con, 'NULL') || ' normal=' || coalesce(sin, 'NULL');
+END
+$$ LANGUAGE plpgsql;
+EXPLAIN (COSTS OFF) SELECT min(id), max(id) FROM s;
+              QUERY PLAN              
+--------------------------------------
+ Custom Scan (DbengineVectorAgg) on s
+   Agregados empujados al scan: 2
+(2 rows)
+
+SELECT igual_fila('SELECT min(id), max(id), count(*) FROM s');
+       igual_fila       
+------------------------
+ igual: (1,20000,20000)
+(1 row)
+
+SELECT igual_fila('SELECT min(ts), max(ts) FROM s');
+                               igual_fila                               
+------------------------------------------------------------------------
+ igual: ("Mon Jan 01 00:01:00 2024 PST","Sun Jan 14 21:20:00 2024 PST")
+(1 row)
+
+SELECT igual_fila('SELECT min(region), max(region) FROM s');
+    igual_fila     
+-------------------
+ igual: (este,sur)
+(1 row)
+
+SELECT igual_fila('SELECT min(monto), max(monto) FROM s');
+     igual_fila      
+---------------------
+ igual: (0.00,99.90)
+(1 row)
+
+CREATE TABLE smm (a int, t text, n numeric) USING dbengine_columnar;
+SELECT igual_fila('SELECT min(a), max(a) FROM smm') AS tabla_vacia;
+ tabla_vacia 
+-------------
+ igual: (,)
+(1 row)
+
+INSERT INTO smm SELECT NULL, NULL, NULL FROM generate_series(1, 50);
+SELECT igual_fila('SELECT min(a), max(t), min(n) FROM smm') AS todo_nulo;
+  todo_nulo  
+-------------
+ igual: (,,)
+(1 row)
+
+INSERT INTO smm SELECT g, 'v' || g, g / 7.0 FROM generate_series(1, 500) g;
+SELECT igual_fila('SELECT min(a), max(a), min(t), max(t), min(n), max(n) FROM smm')
+	AS con_nulos_y_valores;
+                       con_nulos_y_valores                        
+------------------------------------------------------------------
+ igual: (1,500,v1,v99,0.14285714285714285714,71.4285714285714286)
+(1 row)
+
+-- Adentro de la transacción el stripe queda parcialmente visible y el
+-- atajo no aplica; el resultado tiene que ser el mismo igual.
+BEGIN;
+INSERT INTO smm VALUES (-99, 'aaa', -1);
+SELECT igual_fila('SELECT min(a), max(t) FROM smm') AS dentro_de_txn;
+  dentro_de_txn   
+------------------
+ igual: (-99,v99)
+(1 row)
+
+ROLLBACK;
+SELECT igual_fila('SELECT min(a), max(t) FROM smm') AS tras_rollback;
+ tras_rollback  
+----------------
+ igual: (1,v99)
+(1 row)
+
+-- Valores demasiado largos para guardar un zone map: sin atajo, mismo
+-- resultado.
+CREATE TABLE slargo (t text) USING dbengine_columnar;
+INSERT INTO slargo SELECT repeat('z', 300) || g FROM generate_series(1, 100) g;
+SELECT igual_fila('SELECT length(min(t)), length(max(t)) FROM slargo') AS sin_zonemap;
+   sin_zonemap    
+------------------
+ igual: (301,302)
+(1 row)
+
+DROP TABLE smm, slargo;
+-- ===========================================================================
+-- Agregación parcial en paralelo
+--
+-- Con workers disponibles el nodo hace de Partial Agg: entrega el estado de
+-- transición (serializado si es `internal`) y el Finalize Agg de arriba lo
+-- combina.  Es la misma forma que arma el planner, pero sin construir una
+-- tupla por fila en cada worker.
+-- ===========================================================================
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+CREATE TABLE spar (a bigint, n numeric, t text) USING dbengine_columnar;
+SET dbengine.staging_threshold_rows = 2000;
+INSERT INTO spar SELECT g, g / 3.0, 'v' || g FROM generate_series(1, 20000) g;
+INSERT INTO spar SELECT NULL, NULL, NULL FROM generate_series(1, 100) g;
+RESET dbengine.staging_threshold_rows;
+ANALYZE spar;
+EXPLAIN (COSTS OFF) SELECT sum(a) FROM spar;
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather
+         Workers Planned: 2
+         ->  Parallel Custom Scan (DbengineVectorAgg) on spar
+               Agregados empujados al scan: 1
+(5 rows)
+
+-- Los estados parciales se combinan sin perder nada: sum(bigint) y
+-- avg(numeric) llevan estado `internal` y tienen que viajar serializados.
+SELECT igual_fila('SELECT sum(a), count(a), count(*) FROM spar');
+           igual_fila           
+--------------------------------
+ igual: (200010000,20000,20100)
+(1 row)
+
+SELECT igual_fila('SELECT sum(n), avg(n) FROM spar');
+                            igual_fila                            
+------------------------------------------------------------------
+ igual: (66670000.00000000000000000000,3333.50000000000000000000)
+(1 row)
+
+SELECT igual_fila('SELECT avg(a), min(a), max(a) FROM spar');
+               igual_fila                
+-----------------------------------------
+ igual: (10000.5000000000000000,1,20000)
+(1 row)
+
+SELECT igual_fila('SELECT min(t), max(t), count(t) FROM spar');
+       igual_fila        
+-------------------------
+ igual: (v1,v9999,20000)
+(1 row)
+
+DROP TABLE spar;
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+SET max_parallel_workers_per_gather = 0;
+-- count(*) se responde desde los metadatos, así que la visibilidad tiene
+-- que salir de ahí también.
+CREATE TABLE svis (a int) USING dbengine_columnar;
+INSERT INTO svis SELECT generate_series(1, 50);
+BEGIN;
+INSERT INTO svis VALUES (99);
+SELECT igual('SELECT count(*) FROM svis');
+   igual   
+-----------
+ igual: 51
+(1 row)
+
+INSERT INTO svis VALUES (98);
+SELECT igual('SELECT count(*) FROM svis');
+   igual   
+-----------
+ igual: 52
+(1 row)
+
+SAVEPOINT sp;
+INSERT INTO svis VALUES (97);
+ROLLBACK TO sp;
+SELECT igual('SELECT count(*) FROM svis');
+   igual   
+-----------
+ igual: 52
+(1 row)
+
+COMMIT;
+SELECT igual('SELECT count(*) FROM svis');
+   igual   
+-----------
+ igual: 52
+(1 row)
+
+DROP TABLE svacia, snulos, svis;
+RESET ALL;
+DROP FUNCTION igual(text);
+DROP FUNCTION igual_fila(text);
+DROP TABLE s;
+DROP EXTENSION dbengine CASCADE;

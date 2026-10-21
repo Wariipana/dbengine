@@ -1,0 +1,110 @@
+-- F0: la extensión se crea, se identifica y se puede eliminar limpiamente.
+CREATE EXTENSION dbengine;
+SELECT dbengine.version();
+ version 
+---------
+ 0.1.0
+(1 row)
+
+-- dbengine.preloaded() tiene que coincidir con la realidad del cluster,
+-- corra installcheck con o sin shared_preload_libraries.
+SELECT dbengine.preloaded()
+	 = (current_setting('shared_preload_libraries') LIKE '%dbengine%')
+	AS preload_coherente;
+ preload_coherente 
+-------------------
+ t
+(1 row)
+
+-- Las GUCs quedan definidas y con sus valores por defecto.
+SELECT name, setting, unit, context
+FROM pg_settings
+WHERE name LIKE 'dbengine.%'
+ORDER BY name;
+                name                 | setting | unit |  context  
+-------------------------------------+---------+------+-----------
+ dbengine.batch_size                 | 1024    |      | user
+ dbengine.block_rows                 | 65536   |      | superuser
+ dbengine.bloom_bits_per_row         | 0       |      | user
+ dbengine.debug_backtrace            | off     |      | sighup
+ dbengine.enable_adaptive_clustering | off     |      | sighup
+ dbengine.enable_agg_pushdown        | on      |      | user
+ dbengine.enable_compression         | on      |      | user
+ dbengine.enable_granule_pruning     | on      |      | user
+ dbengine.enable_learned_zonemaps    | off     |      | user
+ dbengine.enable_vectorized          | on      |      | user
+ dbengine.enable_zonemap_pruning     | on      |      | user
+ dbengine.max_blocks_per_compaction  | 64      |      | sighup
+ dbengine.retention_window           | 86400   | s    | user
+ dbengine.staging_threshold_rows     | 65536   |      | user
+ dbengine.worker_naptime             | 60      | s    | sighup
+(15 rows)
+
+-- El prefijo está reservado: una GUC inventada bajo dbengine.* falla.
+DO $$
+BEGIN
+	PERFORM set_config('dbengine.no_existe', 'x', false);
+	RAISE EXCEPTION 'se esperaba un error: el prefijo dbengine no está reservado';
+EXCEPTION WHEN OTHERS THEN
+	RAISE NOTICE 'prefijo dbengine reservado (SQLSTATE %)', SQLSTATE;
+END
+$$;
+NOTICE:  prefijo dbengine reservado (SQLSTATE 42602)
+-- Objetos que instala la extensión.
+SELECT p.proname, pg_get_function_result(p.oid) AS returns
+FROM pg_depend d
+JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'dbengine'
+JOIN pg_proc p ON p.oid = d.objid
+WHERE d.classid = 'pg_proc'::regclass
+ORDER BY p.proname;
+      proname      |     returns      
+-------------------+------------------
+ bridge_selftest   | SETOF record
+ cluster_advice    | SETOF record
+ columnar_handler  | table_am_handler
+ merge_stripes     | bigint
+ pgm_handler       | index_am_handler
+ preloaded         | boolean
+ raise_from_engine | integer
+ stripe_timeline   | SETOF record
+ time_travel       | SETOF record
+ version           | text
+ workload_reset    | void
+ workload_stats    | SETOF record
+(12 rows)
+
+SELECT c.relname FROM pg_depend d
+JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'dbengine'
+JOIN pg_class c ON c.oid = d.objid
+WHERE d.classid = 'pg_class'::regclass AND c.relkind = 'r'
+ORDER BY c.relname;
+    relname     
+----------------
+ relation_order
+ stripe
+ stripe_column
+(3 rows)
+
+SELECT amname, amtype FROM pg_am WHERE amname LIKE 'dbengine%' ORDER BY amname;
+      amname       | amtype 
+-------------------+--------
+ dbengine_columnar | t
+ dbengine_pgm      | i
+(2 rows)
+
+DROP EXTENSION dbengine;
+-- No queda nada colgado: ni el esquema, ni el access method.
+SELECT count(*) AS esquemas_huerfanos
+FROM pg_namespace WHERE nspname = 'dbengine';
+ esquemas_huerfanos 
+--------------------
+                  1
+(1 row)
+
+SELECT count(*) AS ams_huerfanos
+FROM pg_am WHERE amname LIKE 'dbengine%';
+ ams_huerfanos 
+---------------
+             0
+(1 row)
+

@@ -1,0 +1,62 @@
+=== ClickBench / 10M filas — dbengine vs heap ===
+datos: /config/.dbengine/clickbench/hits10m.tsv
+NOTICE:  extension "dbengine" already exists, skipping
+(carga salteada: SKIP_LOAD=1)
+
+--- tamaño en disco ---
+    am    |   tam   
+----------+---------
+ heap     | 7305 MB
+ dbengine | 3206 MB
+(2 rows)
+
+
+--- correctitud: heap vs dbengine, 43 queries ---
+  q32: DIFIERE
+  q33: DIFIERE
+  2 queries difieren — los tiempos de abajo no significan nada
+
+q      heap(ms)    dbe(ms)    ratio  plan dbengine
+1         267.2        2.3  118.28x  agg pushdown
+2         227.5      122.6    1.86x  agg pushdown
+3        1913.1      457.2    4.18x  agg pushdown
+4         422.3       86.7    4.87x  agg pushdown
+5         912.9     1044.8    0.87x  custom scan
+6        6341.5     4702.0    1.35x  custom scan
+7         308.5       15.4   20.03x  agg pushdown
+8         231.6      253.6    0.91x  custom scan
+9        7224.1     5994.4    1.21x  custom scan
+10       8180.8     6960.1    1.18x  custom scan
+11       1970.9      477.0    4.13x  custom scan
+12       2041.3      552.3    3.70x  custom scan
+13       3360.7     1593.7    2.11x  custom scan
+14       2713.6     1280.7    2.12x  custom scan
+15       3703.1     2217.8    1.67x  custom scan
+16       1661.4      537.8    3.09x  agg pushdown
+17       7302.5     4487.3    1.63x  custom scan
+18          1.8        4.0    0.44x  custom scan
+19       8070.2    10185.2    0.79x  custom scan
+20          1.1        2.4    0.47x  ?
+21       2095.5      939.1    2.23x  agg pushdown
+22       2427.6     1122.8    2.16x  custom scan
+23       2708.0     1802.5    1.50x  custom scan
+24       2145.4     2824.0    0.76x  custom scan
+25       1910.5      432.3    4.42x  custom scan
+26       1842.5      334.6    5.51x  custom scan
+27       1903.6      418.4    4.55x  custom scan
+28       2707.9     1721.2    1.57x  custom scan
+29      21481.4    20360.6    1.06x  custom scan
+30       6104.5     5138.8    1.19x  custom scan
+31       5353.5     2488.6    2.15x  custom scan
+32       5717.2     2879.0    1.99x  custom scan
+33      22467.6    12748.2    1.76x  custom scan
+34      12080.2     5734.8    2.11x  custom scan
+35      12218.6     5732.2    2.13x  custom scan
+36       3520.4     2658.9    1.32x  custom scan
+37        854.5     1318.1    0.65x  custom scan
+38        702.9     1122.6    0.63x  custom scan
+39        482.2      798.1    0.60x  custom scan
+40       1255.8     1659.4    0.76x  custom scan
+41        201.9      793.3    0.25x  custom scan
+42        184.4      751.8    0.25x  custom scan
+43        741.2      668.6    1.11x  custom scan

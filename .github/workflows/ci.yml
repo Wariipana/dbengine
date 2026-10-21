@@ -1,0 +1,146 @@
+name: build & test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # --- PostgreSQL estable, desde los paquetes de PGDG --------------------
+  stable:
+    name: PostgreSQL ${{ matrix.pg }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [18]
+    env:
+      PG_MAJOR: ${{ matrix.pg }}
+      PGBIN: /usr/lib/postgresql/${{ matrix.pg }}/bin
+      PGPORT: 54318
+      PGHOST: /home/runner/.dbengine/pg${{ matrix.pg }}/run
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Instalar PostgreSQL ${{ matrix.pg }} desde PGDG
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          . /etc/os-release
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-${PG_MAJOR} postgresql-server-dev-${PG_MAJOR} postgresql-client-${PG_MAJOR}
+          # El runner trae su propio cluster en 5432; el nuestro usa 54318.
+          sudo systemctl stop postgresql || true
+
+      - name: Guarda de la frontera C/C++ (R2)
+        run: python3 tools/check_layering.py
+
+      - name: Build
+        run: make PG_CONFIG=${PGBIN}/pg_config
+
+      - name: Install
+        run: sudo make PG_CONFIG=${PGBIN}/pg_config install
+
+      - name: Levantar cluster de test
+        run: |
+          ./tools/devcluster.sh init
+          ./tools/devcluster.sh start
+
+      # Las dos configuraciones que importan: con la biblioteca precargada
+      # (background worker y, desde F3, hooks del planner) y sin ella.
+      - name: installcheck (con shared_preload_libraries)
+        run: make PG_CONFIG=${PGBIN}/pg_config installcheck
+
+      - name: installcheck (sin shared_preload_libraries)
+        run: |
+          PGDATA=${HOME}/.dbengine/pg${PG_MAJOR}/data
+          ./tools/devcluster.sh stop
+          sed -i "s/^shared_preload_libraries/#shared_preload_libraries/" "$PGDATA/postgresql.conf"
+          ./tools/devcluster.sh start
+          make PG_CONFIG=${PGBIN}/pg_config installcheck
+
+      - name: Diagnóstico del fallo
+        if: failure()
+        run: |
+          echo '--- regression.diffs ---'; cat test/regress/regression.diffs || true
+          echo '--- server.log ---';       tail -100 ${HOME}/.dbengine/pg${PG_MAJOR}/server.log || true
+
+      - name: Artefactos del fallo
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regress-pg${{ matrix.pg }}
+          path: |
+            test/regress/regression.diffs
+            test/regress/results/
+          if-no-files-found: ignore
+
+  # --- PostgreSQL 19 beta: no está empaquetado en PGDG, se compila --------
+  #
+  # No bloquea el merge (es una beta en movimiento), pero avisa temprano si
+  # una API que usamos cambió.  Cuando PGDG publique postgresql-19, esto se
+  # reemplaza por una entrada más en la matriz de `stable`.
+  beta:
+    name: PostgreSQL ${{ matrix.pg_version }} (desde fuente)
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pg_version: 19beta3
+            pg_major: 19
+    env:
+      PG_MAJOR: ${{ matrix.pg_major }}
+      PGPREFIX: /home/runner/.dbengine/pg${{ matrix.pg_major }}-install
+      PGPORT: 54319
+      PGHOST: /home/runner/.dbengine/pg${{ matrix.pg_major }}/run
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Cache de PostgreSQL ${{ matrix.pg_version }}
+        id: pgcache
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/.dbengine/pg${{ matrix.pg_major }}-install
+          key: pgsrc-${{ runner.os }}-${{ matrix.pg_version }}
+
+      - name: Compilar PostgreSQL ${{ matrix.pg_version }}
+        if: steps.pgcache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends build-essential bison flex libreadline-dev
+          curl -fsSL -O https://ftp.postgresql.org/pub/source/v${{ matrix.pg_version }}/postgresql-${{ matrix.pg_version }}.tar.bz2
+          tar xf postgresql-${{ matrix.pg_version }}.tar.bz2
+          cd postgresql-${{ matrix.pg_version }}
+          ./configure --prefix="${PGPREFIX}" --without-icu --without-zlib \
+                      --without-zstd --without-lz4 --without-llvm --enable-debug
+          make -j"$(nproc)" -s
+          make -s install
+
+      - name: Guarda de la frontera C/C++ (R2)
+        run: python3 tools/check_layering.py
+
+      - name: Build
+        run: make PG_CONFIG=${PGPREFIX}/bin/pg_config
+
+      - name: Install
+        run: make PG_CONFIG=${PGPREFIX}/bin/pg_config install
+
+      - name: installcheck
+        run: |
+          PGBIN=${PGPREFIX}/bin ./tools/devcluster.sh init
+          PGBIN=${PGPREFIX}/bin ./tools/devcluster.sh start
+          make PG_CONFIG=${PGPREFIX}/bin/pg_config installcheck
+
+      - name: Diagnóstico del fallo
+        if: failure()
+        run: |
+          echo '--- regression.diffs ---'; cat test/regress/regression.diffs || true
+          echo '--- server.log ---';       tail -100 ${HOME}/.dbengine/pg${PG_MAJOR}/server.log || true

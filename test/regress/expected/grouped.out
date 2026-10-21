@@ -1,0 +1,527 @@
+-- Orden físico declarado al planner, y GROUP BY empujado al scan.
+--
+-- Las dos cosas dependen de lo mismo: que las filas estén realmente
+-- ordenadas por la columna. Lo que se prueba acá es sobre todo lo que NO
+-- tiene que pasar — que la marca de orden sobreviva a un INSERT, o que se
+-- agrupe por una columna que no está ordenada.
+CREATE EXTENSION dbengine;
+SET max_parallel_workers_per_gather = 0;
+SET enable_indexscan = off;
+SET enable_indexonlyscan = off;
+SET enable_bitmapscan = off;
+SET dbengine.staging_threshold_rows = 2000;
+CREATE TABLE g (k bigint, s text, n int) USING dbengine_columnar;
+INSERT INTO g SELECT (g * 7919) % 500, 'v' || (g % 7), g
+	FROM generate_series(1, 20000) g;
+CREATE INDEX g_k ON g (k);
+ANALYZE g;
+-- Copia en heap: es contra esto que se comparan todos los resultados.
+CREATE TABLE gh AS SELECT * FROM g;
+-- ===========================================================================
+-- Sin CLUSTER no hay orden que declarar
+-- ===========================================================================
+SELECT count(*) AS marcas FROM dbengine.relation_order
+WHERE relfilenode = pg_relation_filenode('g');
+ marcas 
+--------
+      0
+(1 row)
+
+EXPLAIN (COSTS off) SELECT k, count(*) FROM g GROUP BY k;
+                  QUERY PLAN                   
+-----------------------------------------------
+ HashAggregate
+   Group Key: k
+   ->  Custom Scan (DbengineColumnarScan) on g
+         Columnas leídas: k
+(4 rows)
+
+-- ===========================================================================
+-- Después de CLUSTER: el orden se declara y el GROUP BY se empuja
+-- ===========================================================================
+CLUSTER g USING g_k;
+ANALYZE g;
+SELECT count(*) AS marcas FROM dbengine.relation_order
+WHERE relfilenode = pg_relation_filenode('g');
+ marcas 
+--------
+      1
+(1 row)
+
+EXPLAIN (COSTS off) SELECT k, count(*) FROM g GROUP BY k;
+              QUERY PLAN              
+--------------------------------------
+ Custom Scan (DbengineVectorAgg) on g
+   Agregados empujados al scan: 2
+(2 rows)
+
+EXPLAIN (COSTS off) SELECT k FROM g ORDER BY k LIMIT 5;
+                  QUERY PLAN                   
+-----------------------------------------------
+ Limit
+   ->  Custom Scan (DbengineColumnarScan) on g
+         Columnas leídas: k
+(3 rows)
+
+-- Y los resultados tienen que ser los mismos que en heap.
+SELECT (SELECT md5(string_agg(k || ':' || c, ',' ORDER BY k))
+		FROM (SELECT k, count(*) c FROM g GROUP BY k) a)
+	 = (SELECT md5(string_agg(k || ':' || c, ',' ORDER BY k))
+		FROM (SELECT k, count(*) c FROM gh GROUP BY k) b) AS count_igual;
+ count_igual 
+-------------
+ t
+(1 row)
+
+-- ===========================================================================
+-- El mismo camino ordenado, pero en paralelo
+--
+-- Los stripes se reparten entre los participantes con un contador atómico
+-- compartido.  El camino de agrupación ORDENADA no hacía ese reparto: cada
+-- worker recorría la tabla entera y los conteos salían multiplicados por la
+-- cantidad de participantes.  Sobre ClickBench, `count(*)` daba 10.000.000 y
+-- el mismo `GROUP BY UserID` sumaba 30.000.000 — el líder más dos workers.
+--
+-- No lo agarraba nada porque todo este archivo corría con
+-- max_parallel_workers_per_gather = 0.
+-- ===========================================================================
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 2;
+-- Qué plan se está midiendo.  Si esto deja de decir "Parallel Custom Scan",
+-- las dos comprobaciones de abajo pasan a probar el plan de Postgres y no
+-- el nuestro, o sea nada.
+EXPLAIN (COSTS off) SELECT k, count(*) FROM g GROUP BY k;
+                        QUERY PLAN                         
+-----------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: k
+   ->  Gather
+         Workers Planned: 2
+         ->  Parallel Custom Scan (DbengineVectorAgg) on g
+               Agregados empujados al scan: 2
+(6 rows)
+
+-- La suma de los conteos por grupo es la cantidad de filas.  Si algún
+-- participante recorre de más, esto se va por arriba.
+SELECT (SELECT sum(c) FROM (SELECT k, count(*) c FROM g GROUP BY k) x)
+	 = (SELECT count(*) FROM g) AS suma_paralela_igual;
+ suma_paralela_igual 
+---------------------
+ t
+(1 row)
+
+-- Y grupo por grupo, contra heap.
+SELECT (SELECT md5(string_agg(k || ':' || c, ',' ORDER BY k))
+		FROM (SELECT k, count(*) c FROM g GROUP BY k) a)
+	 = (SELECT md5(string_agg(k || ':' || c, ',' ORDER BY k))
+		FROM (SELECT k, count(*) c FROM gh GROUP BY k) b)
+	AS count_paralelo_igual;
+ count_paralelo_igual 
+----------------------
+ t
+(1 row)
+
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather;
+SELECT (SELECT md5(string_agg(k || ':' || s || ':' || mn || ':' || mx, ',' ORDER BY k))
+		FROM (SELECT k, sum(n) s, min(n) mn, max(n) mx FROM g GROUP BY k) a)
+	 = (SELECT md5(string_agg(k || ':' || s || ':' || mn || ':' || mx, ',' ORDER BY k))
+		FROM (SELECT k, sum(n) s, min(n) mn, max(n) mx FROM gh GROUP BY k) b)
+	AS sum_min_max_igual;
+ sum_min_max_igual 
+-------------------
+ t
+(1 row)
+
+SELECT (SELECT md5(string_agg(k || ':' || a, ',' ORDER BY k))
+		FROM (SELECT k, avg(n) a FROM g GROUP BY k) x)
+	 = (SELECT md5(string_agg(k || ':' || a, ',' ORDER BY k))
+		FROM (SELECT k, avg(n) a FROM gh GROUP BY k) y) AS avg_igual;
+ avg_igual 
+-----------
+ t
+(1 row)
+
+-- Con WHERE: el filtro se evalúa adentro del nodo, antes de agrupar.
+SELECT (SELECT md5(string_agg(k || ':' || c, ',' ORDER BY k))
+		FROM (SELECT k, count(*) c FROM g WHERE n % 3 = 0 GROUP BY k) a)
+	 = (SELECT md5(string_agg(k || ':' || c, ',' ORDER BY k))
+		FROM (SELECT k, count(*) c FROM gh WHERE n % 3 = 0 GROUP BY k) b)
+	AS con_where_igual;
+ con_where_igual 
+-----------------
+ t
+(1 row)
+
+-- ===========================================================================
+-- Agrupar por una columna que NO está ordenada: al plan normal
+-- ===========================================================================
+EXPLAIN (COSTS off) SELECT s, count(*) FROM g GROUP BY s;
+                  QUERY PLAN                   
+-----------------------------------------------
+ HashAggregate
+   Group Key: s
+   ->  Custom Scan (DbengineColumnarScan) on g
+         Columnas leídas: s
+(4 rows)
+
+SELECT (SELECT md5(string_agg(s || ':' || c, ',' ORDER BY s))
+		FROM (SELECT s, count(*) c FROM g GROUP BY s) a)
+	 = (SELECT md5(string_agg(s || ':' || c, ',' ORDER BY s))
+		FROM (SELECT s, count(*) c FROM gh GROUP BY s) b) AS otra_columna_igual;
+ otra_columna_igual 
+--------------------
+ t
+(1 row)
+
+-- ===========================================================================
+-- Un INSERT rompe el orden: la marca se borra
+-- ===========================================================================
+-- pg_index.indisclustered sigue diciendo que se clusterizó por g_k, que es
+-- justamente por lo que no alcanza con mirarlo.
+INSERT INTO g VALUES (0, 'nuevo', 0);
+ANALYZE g;
+SELECT indisclustered FROM pg_index WHERE indexrelid = 'g_k'::regclass;
+ indisclustered 
+----------------
+ t
+(1 row)
+
+SELECT count(*) AS marcas FROM dbengine.relation_order
+WHERE relfilenode = pg_relation_filenode('g');
+ marcas 
+--------
+      0
+(1 row)
+
+EXPLAIN (COSTS off) SELECT k, count(*) FROM g GROUP BY k;
+                  QUERY PLAN                   
+-----------------------------------------------
+ HashAggregate
+   Group Key: k
+   ->  Custom Scan (DbengineColumnarScan) on g
+         Columnas leídas: k
+(4 rows)
+
+-- ===========================================================================
+-- Y las filas siguen siendo las mismas
+-- ===========================================================================
+INSERT INTO gh VALUES (0, 'nuevo', 0);
+SELECT (SELECT md5(string_agg(k || ':' || c, ',' ORDER BY k))
+		FROM (SELECT k, count(*) c FROM g GROUP BY k) a)
+	 = (SELECT md5(string_agg(k || ':' || c, ',' ORDER BY k))
+		FROM (SELECT k, count(*) c FROM gh GROUP BY k) b) AS tras_insert_igual;
+ tras_insert_igual 
+-------------------
+ t
+(1 row)
+
+-- ===========================================================================
+-- La fusión de stripes NO rompe el orden
+-- ===========================================================================
+-- Es la excepción a "cualquier escritura borra la marca": la fusión reescribe
+-- stripes pero respeta el orden de las filas, así que la conserva. Si eso
+-- dejara de ser cierto, este test agruparía mal.
+SET dbengine.retention_window = 0;
+CREATE TABLE f (k bigint, n int) USING dbengine_columnar;
+CREATE INDEX f_k ON f (k);
+-- Un stripe por transacción, que es la forma que la fusión sabe juntar.
+DO $$
+BEGIN
+	FOR i IN 1..200 LOOP
+		INSERT INTO f VALUES ((i * 7919) % 50, i);
+		COMMIT;
+	END LOOP;
+END
+$$;
+CLUSTER f USING f_k;
+ANALYZE f;
+CREATE TABLE fh AS SELECT * FROM f;
+SELECT count(*) AS marca_antes FROM dbengine.relation_order
+WHERE relfilenode = pg_relation_filenode('f');
+ marca_antes 
+-------------
+           1
+(1 row)
+
+-- No se comprueba QUE haya fusionado: dbe_stripe_mergeable() exige que el
+-- stripe preceda al xmin global, así que con otra sesión de por medio la
+-- fusión no ocurre y el test sería intermitente. Lo que se comprueba es el
+-- invariante, que tiene que valer haya fusionado o no.
+SELECT dbengine.merge_stripes('f') >= 0 AS fusion_sin_error;
+ fusion_sin_error 
+------------------
+ t
+(1 row)
+
+SELECT count(*) AS marca_despues FROM dbengine.relation_order
+WHERE relfilenode = pg_relation_filenode('f');
+ marca_despues 
+---------------
+             1
+(1 row)
+
+-- El orden tiene que seguir siendo real, no solo declarado.
+SELECT count(*) AS fuera_de_orden
+FROM (SELECT k, lag(k) OVER () AS prev FROM f) s
+WHERE prev IS NOT NULL AND k < prev;
+ fuera_de_orden 
+----------------
+              0
+(1 row)
+
+SELECT (SELECT md5(string_agg(k || ':' || c, ',' ORDER BY k))
+		FROM (SELECT k, count(*) c FROM f GROUP BY k) a)
+	 = (SELECT md5(string_agg(k || ':' || c, ',' ORDER BY k))
+		FROM (SELECT k, count(*) c FROM fh GROUP BY k) b) AS tras_fusion_igual;
+ tras_fusion_igual 
+-------------------
+ t
+(1 row)
+
+-- ===========================================================================
+-- GROUP BY por hash: la columna NO tiene que estar ordenada
+-- ===========================================================================
+-- La versión de grupos contiguos necesita clustering y una tabla se ordena
+-- por una sola cosa. Esta aplica a cualquier columna, pagando un hash por
+-- fila. Se compara contra heap, que es la referencia.
+SET work_mem = '64MB';
+CREATE TABLE hh (a int, b text, n int) USING dbengine_columnar;
+INSERT INTO hh SELECT i % 97, 'x' || (i % 53), i FROM generate_series(1, 50000) i;
+ANALYZE hh;
+CREATE TABLE hhh AS SELECT * FROM hh;
+-- El camino serial con hash NO se ofrece: es el único sin un Finalize
+-- arriba, así que no puede emitir la misma clave dos veces y por lo tanto no
+-- puede volcar cuando se queda sin memoria. Con una estimación de grupos
+-- mala eso no degrada, revienta. El que se ofrece es el paralelo, que sí
+-- entrega parciales y puede volcar.
+--
+-- A esta escala el plan normal cuesta menos y gana, con razón; para que el
+-- test pruebe el nodo se le sacan las alternativas y se abarata el
+-- paralelismo.
+SET enable_hashagg = off;
+SET enable_sort = off;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 2;
+EXPLAIN (COSTS off) SELECT b, count(*) FROM hh GROUP BY b;
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Finalize HashAggregate
+   Disabled: true
+   Group Key: b
+   ->  Gather
+         Workers Planned: 2
+         ->  Parallel Custom Scan (DbengineVectorAgg) on hh
+               Agregados empujados al scan: 2
+(7 rows)
+
+-- Checksum independiente del orden: con muchos grupos, comparar
+-- md5(string_agg(...)) no es fiable.
+SELECT (SELECT sum(hashtext(b || ':' || c)::bigint)
+		FROM (SELECT b, count(*) c FROM hh GROUP BY b) x)
+	 = (SELECT sum(hashtext(b || ':' || c)::bigint)
+		FROM (SELECT b, count(*) c FROM hhh GROUP BY b) y) AS hash_count_igual;
+ hash_count_igual 
+------------------
+ t
+(1 row)
+
+SELECT (SELECT sum(hashtext(b || ':' || s || ':' || mn || ':' || mx || ':' || av)::bigint)
+		FROM (SELECT b, sum(n) s, min(n) mn, max(n) mx, avg(n) av
+			  FROM hh GROUP BY b) x)
+	 = (SELECT sum(hashtext(b || ':' || s || ':' || mn || ':' || mx || ':' || av)::bigint)
+		FROM (SELECT b, sum(n) s, min(n) mn, max(n) mx, avg(n) av
+			  FROM hhh GROUP BY b) y) AS hash_todos_igual;
+ hash_todos_igual 
+------------------
+ t
+(1 row)
+
+-- Dos columnas, y con WHERE.
+SELECT (SELECT sum(hashtext(a || '/' || b || ':' || c)::bigint)
+		FROM (SELECT a, b, count(*) c FROM hh WHERE n % 3 = 0 GROUP BY a, b) x)
+	 = (SELECT sum(hashtext(a || '/' || b || ':' || c)::bigint)
+		FROM (SELECT a, b, count(*) c FROM hhh WHERE n % 3 = 0 GROUP BY a, b) y)
+	AS hash_dos_cols_igual;
+ hash_dos_cols_igual 
+---------------------
+ t
+(1 row)
+
+-- Agrupar por una columna de texto con diccionario: el string se resuelve una
+-- vez por entrada del diccionario y no una por fila. El resultado tiene que
+-- ser el mismo; lo que cambia es cuántas búsquedas de hash se hacen.
+SELECT (SELECT sum(hashtext(b || ':' || c)::bigint)
+		FROM (SELECT b, count(*) c FROM hh GROUP BY b) x)
+	 = (SELECT sum(hashtext(b || ':' || c)::bigint)
+		FROM (SELECT b, count(*) c FROM hhh GROUP BY b) y) AS dict_igual;
+ dict_igual 
+------------
+ t
+(1 row)
+
+-- Con nulos en la columna de agrupación: el NULL es un grupo más, y en el
+-- cache del diccionario ocupa una ranura aparte.
+CREATE TABLE dn (b text, n int) USING dbengine_columnar;
+INSERT INTO dn SELECT CASE WHEN i % 11 = 0 THEN NULL ELSE 'y' || (i % 31) END, i
+	FROM generate_series(1, 30000) i;
+ANALYZE dn;
+CREATE TABLE dnh AS SELECT * FROM dn;
+SELECT (SELECT count(*) FROM (SELECT b FROM dn GROUP BY b) x)
+	 = (SELECT count(*) FROM (SELECT b FROM dnh GROUP BY b) y) AS dict_nulos_grupos;
+ dict_nulos_grupos 
+-------------------
+ t
+(1 row)
+
+SELECT (SELECT sum(hashtext(coalesce(b, '<nulo>') || ':' || c)::bigint)
+		FROM (SELECT b, count(*) c FROM dn GROUP BY b) x)
+	 = (SELECT sum(hashtext(coalesce(b, '<nulo>') || ':' || c)::bigint)
+		FROM (SELECT b, count(*) c FROM dnh GROUP BY b) y) AS dict_nulos_igual;
+ dict_nulos_igual 
+------------------
+ t
+(1 row)
+
+DROP TABLE dn, dnh;
+-- ===========================================================================
+-- Volcado por memoria
+-- ===========================================================================
+-- La tabla de hash tiene un presupuesto de work_mem; al pasarse emite lo
+-- acumulado y sigue con la tabla vacía, que es válido porque el nodo entrega
+-- parciales y hay un Finalize arriba.
+--
+-- Con work_mem al mínimo esto vuelca muchas veces, que es lo que hace falta
+-- para probarlo. La primera versión de la guarda estaba puesta DESPUÉS de
+-- tomar el stripe, así que al cortar lo salteaba entero y perdía filas: sobre
+-- ClickBench daba 4947 donde heap daba 4948. Nada en la suite lo detectaba.
+-- No se puede provocar bajando work_mem: la guarda del planner y el
+-- presupuesto de ejecución miran la MISMA variable, así que con work_mem
+-- chico el nodo no se ofrece y el test no prueba nada. Hay que reproducir la
+-- situación real, que es una estimación mala: se analiza con pocos valores
+-- distintos y después se insertan muchos más sin volver a analizar.
+SET work_mem = '1MB';
+CREATE TABLE sp (b text, n int) USING dbengine_columnar;
+INSERT INTO sp SELECT 'k' || (i % 50), i FROM generate_series(1, 5000) i;
+ANALYZE sp;
+INSERT INTO sp SELECT 'k' || i, i FROM generate_series(1, 200000) i;
+CREATE TABLE sph AS SELECT * FROM sp;
+-- El planner sigue creyendo que hay ~50 grupos; hay más de 200.000.
+EXPLAIN (COSTS off) SELECT b, count(*) FROM sp GROUP BY b;
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Finalize HashAggregate
+   Disabled: true
+   Group Key: b
+   ->  Gather
+         Workers Planned: 2
+         ->  Parallel Custom Scan (DbengineVectorAgg) on sp
+               Agregados empujados al scan: 2
+(7 rows)
+
+-- Sin filas perdidas: el total tiene que dar las 200.000.
+SELECT sum(c) AS filas_totales FROM (SELECT b, count(*) c FROM sp GROUP BY b) t;
+ filas_totales 
+---------------
+        205000
+(1 row)
+
+SELECT count(*) AS filas_en_la_tabla FROM sph;
+ filas_en_la_tabla 
+-------------------
+            205000
+(1 row)
+
+SELECT (SELECT sum(hashtext(b || ':' || c)::bigint)
+		FROM (SELECT b, count(*) c FROM sp GROUP BY b) x)
+	 = (SELECT sum(hashtext(b || ':' || c)::bigint)
+		FROM (SELECT b, count(*) c FROM sph GROUP BY b) y) AS volcado_igual;
+ volcado_igual 
+---------------
+ t
+(1 row)
+
+SELECT (SELECT sum(hashtext(b || ':' || s || ':' || mx)::bigint)
+		FROM (SELECT b, sum(n) s, max(n) mx FROM sp GROUP BY b) x)
+	 = (SELECT sum(hashtext(b || ':' || s || ':' || mx)::bigint)
+		FROM (SELECT b, sum(n) s, max(n) mx FROM sph GROUP BY b) y)
+	AS volcado_sum_max_igual;
+ volcado_sum_max_igual 
+-----------------------
+ t
+(1 row)
+
+DROP TABLE sp, sph;
+RESET work_mem;
+-- ===========================================================================
+-- count(DISTINCT)
+-- ===========================================================================
+-- Se cuenta con un conjunto de hash sobre la columna, sin pasar por la
+-- función de transición. Los nulos no cuentan, igual que count().
+EXPLAIN (COSTS off) SELECT count(DISTINCT b) FROM hh;
+              QUERY PLAN               
+---------------------------------------
+ Custom Scan (DbengineVectorAgg) on hh
+   Agregados empujados al scan: 1
+(2 rows)
+
+SELECT (SELECT count(DISTINCT b) FROM hh) = (SELECT count(DISTINCT b) FROM hhh)
+	AS distinct_texto_igual;
+ distinct_texto_igual 
+----------------------
+ t
+(1 row)
+
+SELECT (SELECT count(DISTINCT a) FROM hh) = (SELECT count(DISTINCT a) FROM hhh)
+	AS distinct_int_igual;
+ distinct_int_igual 
+--------------------
+ t
+(1 row)
+
+SELECT (SELECT count(DISTINCT n) FROM hh WHERE n % 7 = 0)
+	 = (SELECT count(DISTINCT n) FROM hhh WHERE n % 7 = 0) AS distinct_where_igual;
+ distinct_where_igual 
+----------------------
+ t
+(1 row)
+
+CREATE TABLE nulos (x int) USING dbengine_columnar;
+INSERT INTO nulos SELECT CASE WHEN i % 3 = 0 THEN NULL ELSE i % 10 END
+	FROM generate_series(1, 1000) i;
+CREATE TABLE nulosh AS SELECT * FROM nulos;
+SELECT (SELECT count(DISTINCT x) FROM nulos) = (SELECT count(DISTINCT x) FROM nulosh)
+	AS distinct_con_nulos_igual;
+ distinct_con_nulos_igual 
+--------------------------
+ t
+(1 row)
+
+-- Con GROUP BY no se empuja: haría falta un conjunto por grupo.
+RESET enable_hashagg;
+RESET enable_sort;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather;
+EXPLAIN (COSTS off) SELECT a, count(DISTINCT b) FROM hh GROUP BY a;
+                      QUERY PLAN                      
+------------------------------------------------------
+ GroupAggregate
+   Group Key: a
+   ->  Sort
+         Sort Key: a, b
+         ->  Custom Scan (DbengineColumnarScan) on hh
+               Columnas leídas: a, b
+(6 rows)
+
+DROP TABLE hh, hhh, nulos, nulosh;
+DROP TABLE f, fh;
+DROP TABLE g, gh;
+DROP EXTENSION dbengine;

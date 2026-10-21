@@ -1,0 +1,11 @@
+# dbengine — storage columnar, ejecución vectorizada, índices aprendidos y
+# time travel para PostgreSQL.
+comment = 'Columnar storage, vectorized execution, learned indexes and time travel'
+default_version = '0.1.0'
+module_pathname = '$libdir/dbengine'
+# No relocalizable: la extensión tiene catálogos internos que se buscan
+# por nombre calificado (dbengine.stripe, dbengine.stripe_column).
+relocatable = false
+schema = dbengine
+superuser = true
+trusted = false

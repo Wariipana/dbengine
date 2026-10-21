@@ -1,0 +1,19 @@
+# Artefactos de build
+*.o
+*.so
+*.bc
+*.d
+dbengine.so
+
+# Salidas de pg_regress
+test/regress/results/
+test/regress/regression.diffs
+test/regress/regression.out
+test/regress/tmp_check/
+test/isolation/results/
+test/isolation/output_iso/
+test/tap/tmp_check/
+log/
+
+# Cluster de desarrollo (vive en $HOME, pero por las dudas)
+.dbengine/
