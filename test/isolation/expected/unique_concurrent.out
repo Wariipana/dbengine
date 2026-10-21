@@ -1,0 +1,65 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1b s1i s2i s1c s2s
+step s1b: BEGIN;
+step s1i: INSERT INTO uq VALUES (1, 's1');
+step s2i: INSERT INTO uq VALUES (1, 's2'); <waiting ...>
+step s1c: COMMIT;
+step s2i: <... completed>
+ERROR:  duplicate key value violates unique constraint "uq_pkey"
+step s2s: SELECT id, v FROM uq ORDER BY id, v;
+id|v 
+--+--
+ 1|s1
+(1 row)
+
+
+starting permutation: s1b s1i s2i s1a s2s
+step s1b: BEGIN;
+step s1i: INSERT INTO uq VALUES (1, 's1');
+step s2i: INSERT INTO uq VALUES (1, 's2'); <waiting ...>
+step s1a: ROLLBACK;
+step s2i: <... completed>
+step s2s: SELECT id, v FROM uq ORDER BY id, v;
+id|v 
+--+--
+ 1|s2
+(1 row)
+
+
+starting permutation: s1b s1m s2k s1c s2s
+step s1b: BEGIN;
+step s1m: INSERT INTO uq SELECT g, 's1' FROM generate_series(10, 20) g;
+step s2k: INSERT INTO uq VALUES (15, 's2'); <waiting ...>
+step s1c: COMMIT;
+step s2k: <... completed>
+ERROR:  duplicate key value violates unique constraint "uq_pkey"
+step s2s: SELECT id, v FROM uq ORDER BY id, v;
+id|v 
+--+--
+10|s1
+11|s1
+12|s1
+13|s1
+14|s1
+15|s1
+16|s1
+17|s1
+18|s1
+19|s1
+20|s1
+(11 rows)
+
+
+starting permutation: s1b s1i s2o s1c s2s
+step s1b: BEGIN;
+step s1i: INSERT INTO uq VALUES (1, 's1');
+step s2o: INSERT INTO uq VALUES (2, 's2');
+step s1c: COMMIT;
+step s2s: SELECT id, v FROM uq ORDER BY id, v;
+id|v 
+--+--
+ 1|s1
+ 2|s2
+(2 rows)
+

@@ -17,3 +17,5 @@ log/
 
 # Cluster de desarrollo (vive en $HOME, pero por las dudas)
 .dbengine/
+test/isolation/regression.diffs
+test/isolation/regression.out

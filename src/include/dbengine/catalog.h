@@ -208,11 +208,16 @@ extern void dbe_catalog_load_segments(RelFileNumber relnumber, uint64 stripe_id,
  * `want_zone` (NULL = ninguna).  Se separa del anterior porque el filtro
  * es grande: solo lo pide quien tiene un predicado de igualdad que podría
  * usarlo.
+ *
+ * `fallback` (puede ser NULL) es un snapshot MVCC tomado antes de listar
+ * los stripes.  Se usa si los metadatos del stripe ya no están para
+ * SnapshotSelf porque una fusión concurrente los borró; ver catalog.c.
  */
 extern void dbe_catalog_load_segments_ext(RelFileNumber relnumber,
 										  uint64 stripe_id, int natts,
 										  const bool *wanted,
 										  const bool *want_zone,
+										  Snapshot fallback,
 										  DbeSegDesc *out, bool *found);
 
 /* Copia los metadatos a otro relfilenode (ALTER TABLE ... SET TABLESPACE). */
@@ -226,6 +231,19 @@ extern void dbe_catalog_delete_stripe(RelFileNumber relnumber, uint64 stripe_id)
 
 /* Borra todos los metadatos de un relfilenode (rewrite / TRUNCATE). */
 extern void dbe_catalog_drop_relation(RelFileNumber relnumber);
+
+/*
+ * Reservas de números de fila de un buffer de escritura todavía no
+ * flusheado.  Hacen que el chequeo de unicidad de otra sesión espere a la
+ * transacción dueña en vez de no ver la fila.  Ver catalog.c.
+ */
+extern void dbe_catalog_insert_reservation(RelFileNumber relnumber,
+										   uint64 first_row, uint64 row_count);
+extern void dbe_catalog_delete_reservation(RelFileNumber relnumber,
+										   uint64 first_row);
+extern TransactionId dbe_catalog_reservation_in_progress(RelFileNumber relnumber,
+														 uint64 rownum);
+extern void dbe_catalog_drop_reservations(RelFileNumber relnumber);
 
 /*
  * DROP TABLE no pasa por el Table AM, así que la limpieza del catálogo se

@@ -494,20 +494,27 @@ dbe_catalog_load_segments(RelFileNumber relnumber, uint64 stripe_id, int natts,
 						  const bool *wanted, DbeSegDesc *out, bool *found)
 {
 	dbe_catalog_load_segments_ext(relnumber, stripe_id, natts, wanted, NULL,
-								  out, found);
+								  NULL, out, found);
 }
 
-void
-dbe_catalog_load_segments_ext(RelFileNumber relnumber, uint64 stripe_id,
-							  int natts, const bool *wanted,
-							  const bool *want_zone, DbeSegDesc *out,
-							  bool *found)
+/*
+ * Recorre las filas de dbengine.stripe_column de un stripe bajo `snapshot`.
+ * Devuelve cuántas vio, de cualquier attnum: es lo que permite distinguir
+ * "el stripe no tiene segmentos para lo pedido" de "los metadatos del
+ * stripe ya no están".
+ */
+static int
+dbe_catalog_scan_segments(RelFileNumber relnumber, uint64 stripe_id,
+						  int natts, const bool *wanted,
+						  const bool *want_zone, Snapshot snapshot,
+						  DbeSegDesc *out, bool *found)
 {
 	Relation	rel;
 	SysScanDesc scan;
 	ScanKeyData key[2];
 	HeapTuple	tup;
 	int			i;
+	int			seen = 0;
 
 	for (i = 0; i < natts; i++)
 		found[i] = false;
@@ -520,7 +527,7 @@ dbe_catalog_load_segments_ext(RelFileNumber relnumber, uint64 stripe_id,
 	rel = table_open(dbe_stripe_column_relid(), AccessShareLock);
 	dbe_check_catalog_shape(rel, Natts_seg);
 	scan = systable_beginscan(rel, dbe_stripe_column_pkey_relid(), true,
-							  SnapshotSelf, 2, key);
+							  snapshot, 2, key);
 
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
 	{
@@ -528,6 +535,7 @@ dbe_catalog_load_segments_ext(RelFileNumber relnumber, uint64 stripe_id,
 		bool		nulls[Natts_seg];
 		AttrNumber	attnum;
 
+		seen++;
 		heap_deform_tuple(tup, RelationGetDescr(rel), values, nulls);
 		attnum = DatumGetInt16(values[Anum_seg_attnum - 1]);
 
@@ -597,6 +605,39 @@ dbe_catalog_load_segments_ext(RelFileNumber relnumber, uint64 stripe_id,
 
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
+
+	return seen;
+}
+
+/*
+ * Segmentos de un stripe, con SnapshotSelf como siempre (ADR-002).
+ *
+ * `fallback` cubre la carrera con la fusión de stripes.  El cursor lista
+ * los stripes al empezar pero carga los segmentos de cada uno recién cuando
+ * llega a él.  Si en el medio commitea una fusión, las filas de
+ * stripe_column del stripe viejo ya están borradas para SnapshotSelf y el
+ * stripe se leía entero como NULL.  Un snapshot MVCC tomado ANTES de listar
+ * todavía las ve, y VACUUM no las puede haber limpiado: ese mismo snapshot
+ * retiene el horizonte.
+ *
+ * Se consulta solo si SnapshotSelf no vio ninguna fila del stripe.  Todo
+ * stripe escrito tiene al menos un segmento salvo en una tabla sin
+ * columnas, y ahí el segundo intento tampoco encuentra nada, que es lo
+ * correcto.
+ */
+void
+dbe_catalog_load_segments_ext(RelFileNumber relnumber, uint64 stripe_id,
+							  int natts, const bool *wanted,
+							  const bool *want_zone, Snapshot fallback,
+							  DbeSegDesc *out, bool *found)
+{
+	if (dbe_catalog_scan_segments(relnumber, stripe_id, natts, wanted,
+								  want_zone, SnapshotSelf, out, found) > 0 ||
+		fallback == NULL)
+		return;
+
+	(void) dbe_catalog_scan_segments(relnumber, stripe_id, natts, wanted,
+									 want_zone, fallback, out, found);
 }
 
 /*
@@ -862,6 +903,165 @@ dbe_catalog_drop_relation(RelFileNumber relnumber)
 	table_close(rel, RowExclusiveLock);
 
 	dbe_catalog_clear_order(relnumber);
+	dbe_catalog_drop_reservations(relnumber);
+}
+
+/* ------------------------------------------------------------------------
+ * Reservas de números de fila (dbengine.row_reservation)
+ *
+ * El índice recibe el TID de una fila apenas se inserta, pero la fila vive
+ * en el buffer de escritura del backend hasta el flush.  Mientras tanto,
+ * otra sesión que chequea unicidad encuentra la entrada del índice, pide la
+ * fila con SnapshotDirty, no la encuentra en ningún stripe y concluye que
+ * no hay conflicto: dos commits después, la PRIMARY KEY tiene dos filas
+ * iguales.
+ *
+ * La reserva es la forma de que esa sesión se entere.  Es una fila
+ * transaccional que se escribe al abrir el buffer; con SnapshotDirty su
+ * xmin en curso dice a qué transacción hay que esperar, exactamente como
+ * heap informa el xmin de una tupla todavía no commiteada.
+ * ------------------------------------------------------------------------ */
+
+#define Anum_resv_relfilenode	1
+#define Anum_resv_first_row		2
+#define Anum_resv_row_count		3
+#define Natts_resv				3
+
+void
+dbe_catalog_insert_reservation(RelFileNumber relnumber, uint64 first_row,
+							   uint64 row_count)
+{
+	Relation	rel;
+	Datum		values[Natts_resv];
+	bool		nulls[Natts_resv] = {false, false, false};
+	HeapTuple	tup;
+
+	values[Anum_resv_relfilenode - 1] = ObjectIdGetDatum(relnumber);
+	values[Anum_resv_first_row - 1] = Int64GetDatum((int64) first_row);
+	values[Anum_resv_row_count - 1] = Int64GetDatum((int64) row_count);
+
+	rel = table_open(dbe_lookup_relid("row_reservation"), RowExclusiveLock);
+	dbe_check_catalog_shape(rel, Natts_resv);
+	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+	CatalogTupleInsert(rel, tup);
+	heap_freetuple(tup);
+	table_close(rel, RowExclusiveLock);
+}
+
+/*
+ * Borra una reserva propia.  Con SnapshotSelf, que ve lo que insertó esta
+ * transacción sin importar el command id; el caller tiene que haber hecho
+ * CommandCounterIncrement() si la reserva es del comando actual, porque
+ * heap no deja borrar una tupla insertada por el mismo comando.
+ */
+void
+dbe_catalog_delete_reservation(RelFileNumber relnumber, uint64 first_row)
+{
+	Relation	rel;
+	SysScanDesc scan;
+	ScanKeyData key[2];
+	HeapTuple	tup;
+
+	ScanKeyInit(&key[0], Anum_resv_relfilenode, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(relnumber));
+	ScanKeyInit(&key[1], Anum_resv_first_row, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) first_row));
+
+	rel = table_open(dbe_lookup_relid("row_reservation"), RowExclusiveLock);
+	scan = systable_beginscan(rel, dbe_lookup_relid("row_reservation_pkey"),
+							  true, SnapshotSelf, 2, key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+		CatalogTupleDelete(rel, &tup->t_self);
+	systable_endscan(scan);
+	table_close(rel, RowExclusiveLock);
+}
+
+/*
+ * ¿Hay una transacción en curso, que no sea la nuestra, con una reserva que
+ * cubre `rownum`?  Devuelve su xid, o InvalidTransactionId.
+ *
+ * SnapshotDirty ve las reservas no commiteadas de otros y, para cada fila
+ * que devuelve, deja en su xmin el xid que la insertó si todavía está en
+ * curso.  Las reservas de transacciones terminadas no dicen nada: si la
+ * dueña commiteó, las filas ya están en un stripe; si abortó, no existen.
+ */
+TransactionId
+dbe_catalog_reservation_in_progress(RelFileNumber relnumber, uint64 rownum)
+{
+	Relation	rel;
+	SysScanDesc scan;
+	ScanKeyData key[1];
+	HeapTuple	tup;
+	SnapshotData dirty;
+	TransactionId result = InvalidTransactionId;
+	Oid			relid;
+
+	relid = get_relname_relid("row_reservation", dbe_namespace_oid());
+	if (!OidIsValid(relid))
+		return InvalidTransactionId;
+
+	InitDirtySnapshot(dirty);
+	ScanKeyInit(&key[0], Anum_resv_relfilenode, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(relnumber));
+
+	rel = table_open(relid, AccessShareLock);
+	dbe_check_catalog_shape(rel, Natts_resv);
+	scan = systable_beginscan(rel, dbe_lookup_relid("row_reservation_pkey"),
+							  true, &dirty, 1, key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Datum		values[Natts_resv];
+		bool		nulls[Natts_resv];
+		uint64		first;
+		uint64		count;
+
+		/* Solo el xmin en curso importa; el de un xid propio no se llena. */
+		if (!TransactionIdIsValid(dirty.xmin))
+			continue;
+
+		heap_deform_tuple(tup, RelationGetDescr(rel), values, nulls);
+		first = (uint64) DatumGetInt64(values[Anum_resv_first_row - 1]);
+		count = (uint64) DatumGetInt64(values[Anum_resv_row_count - 1]);
+
+		if (rownum >= first && rownum < first + count)
+		{
+			result = dirty.xmin;
+			break;
+		}
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	return result;
+}
+
+/*
+ * Todas las reservas de un relfilenode, en DROP y TRUNCATE.  Tolera que el
+ * catálogo no exista: una instalación vieja de la extensión no tiene que
+ * impedir un DROP TABLE.
+ */
+void
+dbe_catalog_drop_reservations(RelFileNumber relnumber)
+{
+	Relation	rel;
+	SysScanDesc scan;
+	ScanKeyData key[1];
+	HeapTuple	tup;
+	Oid			relid;
+
+	relid = get_relname_relid("row_reservation", dbe_namespace_oid());
+	if (!OidIsValid(relid))
+		return;
+
+	ScanKeyInit(&key[0], Anum_resv_relfilenode, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(relnumber));
+	rel = table_open(relid, RowExclusiveLock);
+	scan = systable_beginscan(rel, dbe_lookup_relid("row_reservation_pkey"),
+							  true, NULL, 1, key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+		CatalogTupleDelete(rel, &tup->t_self);
+	systable_endscan(scan);
+	table_close(rel, RowExclusiveLock);
 }
 
 /* ------------------------------------------------------------------------

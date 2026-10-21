@@ -78,12 +78,13 @@ JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'dbengine'
 JOIN pg_class c ON c.oid = d.objid
 WHERE d.classid = 'pg_class'::regclass AND c.relkind = 'r'
 ORDER BY c.relname;
-    relname     
-----------------
+     relname     
+-----------------
  relation_order
+ row_reservation
  stripe
  stripe_column
-(3 rows)
+(4 rows)
 
 SELECT amname, amtype FROM pg_am WHERE amname LIKE 'dbengine%' ORDER BY amname;
       amname       | amtype 

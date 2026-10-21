@@ -19,16 +19,35 @@
  * Ante cualquier duda se anota "todas": perder pruning cuesta I/O, pero
  * podar de más devuelve NULL donde había un valor.
  *
+ * QUIÉN PUEDE USAR EL MAPA
+ *
+ * El mapa describe los scans del PLAN, pero el Table AM también recibe
+ * scans que no salen de ningún plan: la construcción de un índice, la
+ * reescritura de ALTER TABLE, ANALYZE, COPY ... TO.  Esos necesitan todas
+ * las columnas.  Antes los separaba solo la profundidad del executor: con
+ * un cursor abierto la profundidad no volvía a cero, el mapa sobrevivía, y
+ * un CREATE INDEX o un ALTER TABLE ... TYPE posteriores leían las columnas
+ * no anotadas como NULL — un índice lleno de NULL, o una columna borrada
+ * para siempre.
+ *
+ * Ahora el mapa solo vale si el contexto más interno es un ExecutorRun.
+ * Un comando utilitario, aunque esté anidado adentro de una query (una
+ * función que corre DDL), lo apaga para todo lo que ocurra adentro suyo; un
+ * executor anidado adentro del utilitario (CREATE TABLE AS, EXPLAIN
+ * ANALYZE) lo vuelve a prender, con sus propias columnas ya anotadas.
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/xact.h"
 #include "executor/executor.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/plannodes.h"
 #include "optimizer/optimizer.h"
 #include "parser/parsetree.h"
+#include "tcop/utility.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -46,7 +65,19 @@ typedef struct DbeScanColsEntry
 static HTAB *dbe_scan_cols = NULL;
 static int	dbe_exec_depth = 0;
 static ExecutorStart_hook_type prev_executor_start = NULL;
+static ExecutorRun_hook_type prev_executor_run = NULL;
 static ExecutorEnd_hook_type prev_executor_end = NULL;
+static ProcessUtility_hook_type prev_process_utility = NULL;
+
+/* Contexto más interno en el que se está ejecutando; ver arriba. */
+typedef enum DbeScanContext
+{
+	DBE_CTX_NONE = 0,
+	DBE_CTX_EXECUTOR,
+	DBE_CTX_UTILITY
+} DbeScanContext;
+
+static DbeScanContext dbe_scan_context = DBE_CTX_NONE;
 
 static void
 dbe_scan_cols_reset(void)
@@ -197,6 +228,75 @@ dbe_executor_start(QueryDesc *queryDesc, int eflags)
 }
 
 static void
+dbe_executor_run(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
+{
+	DbeScanContext saved = dbe_scan_context;
+
+	dbe_scan_context = DBE_CTX_EXECUTOR;
+	PG_TRY();
+	{
+		if (prev_executor_run)
+			prev_executor_run(queryDesc, direction, count);
+		else
+			standard_ExecutorRun(queryDesc, direction, count);
+	}
+	PG_FINALLY();
+	{
+		dbe_scan_context = saved;
+	}
+	PG_END_TRY();
+}
+
+static void
+dbe_process_utility(PlannedStmt *pstmt, const char *queryString,
+					bool readOnlyTree, ProcessUtilityContext context,
+					ParamListInfo params, QueryEnvironment *queryEnv,
+					DestReceiver *dest, QueryCompletion *qc)
+{
+	DbeScanContext saved = dbe_scan_context;
+
+	dbe_scan_context = DBE_CTX_UTILITY;
+	PG_TRY();
+	{
+		if (prev_process_utility)
+			prev_process_utility(pstmt, queryString, readOnlyTree, context,
+								 params, queryEnv, dest, qc);
+		else
+			standard_ProcessUtility(pstmt, queryString, readOnlyTree,
+									context, params, queryEnv, dest, qc);
+	}
+	PG_FINALLY();
+	{
+		dbe_scan_context = saved;
+	}
+	PG_END_TRY();
+}
+
+/*
+ * Al terminar la transacción no queda ningún executor vivo: los cursores
+ * WITH HOLD ya se materializaron en el pre-commit.  Si un error se salteó
+ * ExecutorEnd, la profundidad quedaba arriba de cero para siempre y el mapa
+ * no se volvía a limpiar en todo el resto de la sesión.
+ */
+static void
+dbe_scancols_xact_callback(XactEvent event, void *arg)
+{
+	switch (event)
+	{
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PREPARE:
+		case XACT_EVENT_PARALLEL_COMMIT:
+		case XACT_EVENT_PARALLEL_ABORT:
+			dbe_exec_depth = 0;
+			dbe_scan_cols_reset();
+			break;
+		default:
+			break;
+	}
+}
+
+static void
 dbe_executor_end(QueryDesc *queryDesc)
 {
 	if (dbe_exec_depth > 0)
@@ -215,8 +315,13 @@ dbe_scancols_init(void)
 {
 	prev_executor_start = ExecutorStart_hook;
 	ExecutorStart_hook = dbe_executor_start;
+	prev_executor_run = ExecutorRun_hook;
+	ExecutorRun_hook = dbe_executor_run;
 	prev_executor_end = ExecutorEnd_hook;
 	ExecutorEnd_hook = dbe_executor_end;
+	prev_process_utility = ProcessUtility_hook;
+	ProcessUtility_hook = dbe_process_utility;
+	RegisterXactCallback(dbe_scancols_xact_callback, NULL);
 }
 
 /*
@@ -231,6 +336,10 @@ dbe_scan_columns_for(Oid relid, int natts, bool *wanted)
 	bool		any = false;
 
 	if (dbe_scan_cols == NULL)
+		return false;
+
+	/* Solo los scans de un plan en ejecución: ver el comentario de arriba. */
+	if (dbe_scan_context != DBE_CTX_EXECUTOR)
 		return false;
 
 	e = (DbeScanColsEntry *) hash_search(dbe_scan_cols, &relid, HASH_FIND,

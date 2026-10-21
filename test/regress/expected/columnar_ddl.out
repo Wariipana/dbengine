@@ -1,0 +1,169 @@
+--
+-- DDL en el medio de una transacción que ya escribió o leyó la tabla.
+--
+-- Son dos bugs distintos con el mismo síntoma: valores que se convierten
+-- en NULL (o en el default) sin ningún error.
+--
+CREATE EXTENSION dbengine;
+-- ------------------------------------------------------------------------
+-- ALTER TABLE ADD COLUMN con filas todavía en el buffer de escritura.
+--
+-- El buffer se armaba con las columnas de ANTES del ALTER y la fila
+-- siguiente, de la misma transacción, perdía el valor de la columna nueva:
+-- se leía el default (5) en vez del 7 insertado.
+-- ------------------------------------------------------------------------
+CREATE TABLE ddl_add (a int) USING dbengine_columnar;
+BEGIN;
+INSERT INTO ddl_add VALUES (1);
+ALTER TABLE ddl_add ADD COLUMN b int DEFAULT 5;
+INSERT INTO ddl_add VALUES (2, 7);
+ALTER TABLE ddl_add ADD COLUMN c text;
+INSERT INTO ddl_add VALUES (3, 8, 'tres');
+-- Dentro de la misma transacción también tiene que verse bien.
+SELECT * FROM ddl_add ORDER BY a;
+ a | b |  c   
+---+---+------
+ 1 | 5 | 
+ 2 | 7 | 
+ 3 | 8 | tres
+(3 rows)
+
+COMMIT;
+SELECT * FROM ddl_add ORDER BY a;
+ a | b |  c   
+---+---+------
+ 1 | 5 | 
+ 2 | 7 | 
+ 3 | 8 | tres
+(3 rows)
+
+-- DROP COLUMN y ADD COLUMN seguidos: natts crece, y el attnum borrado deja
+-- de tener builder.
+CREATE TABLE ddl_drop (a int, c text) USING dbengine_columnar;
+BEGIN;
+INSERT INTO ddl_drop VALUES (1, 'x');
+ALTER TABLE ddl_drop DROP COLUMN c;
+INSERT INTO ddl_drop VALUES (2);
+ALTER TABLE ddl_drop ADD COLUMN d text;
+INSERT INTO ddl_drop VALUES (3, 'y');
+COMMIT;
+SELECT * FROM ddl_drop ORDER BY a;
+ a | d 
+---+---
+ 1 | 
+ 2 | 
+ 3 | y
+(3 rows)
+
+-- Con una subtransacción de por medio: el ALTER cierra el buffer adentro
+-- del savepoint y el ROLLBACK TO se lleva la fila del medio, no las otras.
+CREATE TABLE ddl_sub (a int) USING dbengine_columnar;
+BEGIN;
+INSERT INTO ddl_sub VALUES (1);
+SAVEPOINT sp;
+ALTER TABLE ddl_sub ADD COLUMN b int;
+INSERT INTO ddl_sub VALUES (2, 20);
+ROLLBACK TO sp;
+INSERT INTO ddl_sub VALUES (3);
+COMMIT;
+SELECT * FROM ddl_sub ORDER BY a;
+ a 
+---
+ 1
+ 3
+(2 rows)
+
+-- ------------------------------------------------------------------------
+-- Scans que no salen de un plan, con un executor todavía abierto.
+--
+-- La lista de columnas del plan (scancols.c) sobrevivía mientras hubiera un
+-- cursor abierto, y la usaban también los scans internos: CREATE INDEX
+-- armaba el índice con NULL, ALTER TABLE ... TYPE reescribía la tabla
+-- perdiendo todas las columnas que el último SELECT no había pedido, y
+-- ANALYZE calculaba estadísticas sobre NULL.
+--
+-- El Custom Scan se apaga para que el SELECT pase por el seq scan del
+-- Table AM, que es el que anota la lista.
+-- ------------------------------------------------------------------------
+SET dbengine.enable_vectorized = off;
+CREATE TABLE ddl_cols (a int, b text, c int) USING dbengine_columnar;
+INSERT INTO ddl_cols SELECT g, 'v' || g, g FROM generate_series(1, 1000) g;
+-- CREATE INDEX
+BEGIN;
+DECLARE abierto CURSOR FOR SELECT 1;
+SELECT a FROM ddl_cols WHERE a = 1;
+ a 
+---
+ 1
+(1 row)
+
+CREATE INDEX ddl_cols_b ON ddl_cols (b);
+COMMIT;
+SET enable_seqscan = off;
+SELECT * FROM ddl_cols WHERE b = 'v10';
+ a  |  b  | c  
+----+-----+----
+ 10 | v10 | 10
+(1 row)
+
+SELECT count(*) AS b_nulos_en_el_indice FROM ddl_cols WHERE b IS NULL;
+ b_nulos_en_el_indice 
+----------------------
+                    0
+(1 row)
+
+RESET enable_seqscan;
+-- ALTER TABLE ... TYPE, que reescribe la tabla entera.
+BEGIN;
+DECLARE abierto CURSOR FOR SELECT 1;
+SELECT a FROM ddl_cols WHERE a = 1;
+ a 
+---
+ 1
+(1 row)
+
+ALTER TABLE ddl_cols ALTER COLUMN c TYPE bigint;
+COMMIT;
+SELECT count(*), count(b) AS b_no_nulos, sum(c) AS suma_c FROM ddl_cols;
+ count | b_no_nulos | suma_c 
+-------+------------+--------
+  1000 |       1000 | 500500
+(1 row)
+
+-- ANALYZE
+BEGIN;
+DECLARE abierto CURSOR FOR SELECT 1;
+SELECT a FROM ddl_cols WHERE a = 1;
+ a 
+---
+ 1
+(1 row)
+
+ANALYZE ddl_cols;
+COMMIT;
+SELECT attname, null_frac
+FROM pg_stats
+WHERE schemaname = 'public' AND tablename = 'ddl_cols'
+ORDER BY attname;
+ attname | null_frac 
+---------+-----------
+ a       |         0
+ b       |         0
+ c       |         0
+(3 rows)
+
+-- El pruning por plan tiene que seguir andando para los scans del plan: un
+-- fetch por índice con el cursor abierto sigue devolviendo la fila entera.
+BEGIN;
+DECLARE abierto CURSOR FOR SELECT 1;
+SET LOCAL enable_seqscan = off;
+SELECT a, b, c FROM ddl_cols WHERE b = 'v20';
+ a  |  b  | c  
+----+-----+----
+ 20 | v20 | 20
+(1 row)
+
+COMMIT;
+RESET dbengine.enable_vectorized;
+DROP TABLE ddl_add, ddl_drop, ddl_sub, ddl_cols;
+DROP EXTENSION dbengine CASCADE;

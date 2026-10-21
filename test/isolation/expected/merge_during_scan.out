@@ -1,0 +1,63 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1tam s1d s2m s1f s2n
+step s1tam: SET dbengine.enable_vectorized = off;
+step s1d: BEGIN; DECLARE c CURSOR FOR SELECT a, b FROM mg; FETCH 2 FROM c;
+a|b 
+-+--
+1|v1
+2|v2
+(2 rows)
+
+step s2m: SELECT dbengine.merge_stripes('mg') AS fusionados;
+fusionados
+----------
+         6
+(1 row)
+
+step s1f: FETCH ALL FROM c; COMMIT;
+a|b 
+-+--
+3|v3
+4|v4
+5|v5
+6|v6
+(4 rows)
+
+step s2n: SELECT count(*) AS stripes FROM dbengine.stripe WHERE relfilenode = pg_relation_filenode('mg');
+stripes
+-------
+      1
+(1 row)
+
+
+starting permutation: s1cs s1d s2m s1f s2n
+step s1cs: SET dbengine.enable_vectorized = on;
+step s1d: BEGIN; DECLARE c CURSOR FOR SELECT a, b FROM mg; FETCH 2 FROM c;
+a|b 
+-+--
+1|v1
+2|v2
+(2 rows)
+
+step s2m: SELECT dbengine.merge_stripes('mg') AS fusionados;
+fusionados
+----------
+         6
+(1 row)
+
+step s1f: FETCH ALL FROM c; COMMIT;
+a|b 
+-+--
+3|v3
+4|v4
+5|v5
+6|v6
+(4 rows)
+
+step s2n: SELECT count(*) AS stripes FROM dbengine.stripe WHERE relfilenode = pg_relation_filenode('mg');
+stripes
+-------
+      1
+(1 row)
+

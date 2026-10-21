@@ -81,6 +81,15 @@ struct DbeRowCursor
 	MemoryContext cxt;			/* contexto del cursor */
 	MemoryContext stripe_cxt;	/* se resetea al cambiar de stripe */
 	bool		own_snapshot;
+
+	/*
+	 * Snapshot MVCC tomado antes de listar los stripes.  Con él se buscan
+	 * los segmentos de un stripe que una fusión concurrente borró después
+	 * de que el cursor lo listara; ver dbe_catalog_load_segments_ext().
+	 * NULL si no se pudo tomar, y ahí se usa solo SnapshotSelf.
+	 */
+	Snapshot	catalog_snapshot;
+	bool		own_catalog_snapshot;
 };
 
 static void dbe_cursor_unload_stripe(DbeRowCursor *cur);
@@ -171,6 +180,23 @@ dbe_cursor_begin(Relation rel, Snapshot snapshot, const bool *wanted)
 	MemoryContextSwitchTo(old);
 	dbe_staging_flush_relation(RelationGetRelid(rel));
 	MemoryContextSwitchTo(cxt);
+
+	/*
+	 * El snapshot de respaldo para los metadatos tiene que ser ANTERIOR a
+	 * la lista de stripes: es lo que garantiza que vea las filas de
+	 * stripe_column de todo stripe listado, aunque una fusión las borre
+	 * después.  Si el del cursor es MVCC ya cumple — el caller lo tomó
+	 * antes de llamarnos —; si no (SnapshotSelf, SnapshotDirty) se toma uno.
+	 * En modo paralelo no se puede tomar uno nuevo, pero ahí el del cursor
+	 * siempre es el MVCC compartido.
+	 */
+	if (IsMVCCSnapshot(snapshot))
+		cur->catalog_snapshot = snapshot;
+	else if (!IsInParallelMode())
+	{
+		cur->catalog_snapshot = RegisterSnapshot(GetLatestSnapshot());
+		cur->own_catalog_snapshot = true;
+	}
 
 	cur->stripes = dbe_catalog_list_stripes(rel->rd_locator.relNumber, snapshot);
 	cur->nstripes = list_length(cur->stripes);
@@ -345,8 +371,9 @@ dbe_cursor_stripe_zonemap(DbeRowCursor *cur, int stripe_index,
 	wanted = (bool *) palloc0(sizeof(bool) * cur->natts);
 	wanted[attnum - 1] = true;
 
-	dbe_catalog_load_segments(cur->rel->rd_locator.relNumber, stripe->stripe_id,
-							  cur->natts, wanted, segs, found);
+	dbe_catalog_load_segments_ext(cur->rel->rd_locator.relNumber,
+								  stripe->stripe_id, cur->natts, wanted, NULL,
+								  cur->catalog_snapshot, segs, found);
 
 	if (found[attnum - 1])
 	{
@@ -541,7 +568,8 @@ dbe_cursor_load_stripe(DbeRowCursor *cur, int index)
 	segs = (DbeSegDesc *) palloc0(sizeof(DbeSegDesc) * cur->natts);
 	dbe_catalog_load_segments_ext(cur->rel->rd_locator.relNumber,
 								  stripe->stripe_id, cur->natts, cur->wanted,
-								  cur->want_zone, segs, cur->seg_found);
+								  cur->want_zone, cur->catalog_snapshot,
+								  segs, cur->seg_found);
 
 	/*
 	 * Zone maps: se decide ANTES de tocar el storage.  Los descriptores de
@@ -983,12 +1011,16 @@ dbe_cursor_end(DbeRowCursor *cur)
 {
 	bool		own = cur->own_snapshot;
 	Snapshot	snap = cur->snapshot;
+	bool		own_catalog = cur->own_catalog_snapshot;
+	Snapshot	catalog_snap = cur->catalog_snapshot;
 
 	dbe_cursor_unload_stripe(cur);
 	MemoryContextDelete(cur->cxt);
 
 	if (own)
 		UnregisterSnapshot(snap);
+	if (own_catalog)
+		UnregisterSnapshot(catalog_snap);
 }
 
 /*

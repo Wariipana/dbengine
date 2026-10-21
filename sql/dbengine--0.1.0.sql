@@ -145,6 +145,23 @@ SELECT pg_catalog.pg_extension_config_dump('stripe', '');
 SELECT pg_catalog.pg_extension_config_dump('stripe_column', '');
 SELECT pg_catalog.pg_extension_config_dump('relation_order', '');
 
+CREATE TABLE row_reservation (
+	relfilenode oid    NOT NULL,
+	first_row   bigint NOT NULL,
+	row_count   bigint NOT NULL,
+	PRIMARY KEY (relfilenode, first_row)
+) USING heap;
+
+COMMENT ON TABLE row_reservation IS
+	'Números de fila reservados por un buffer de escritura que todavía no '
+	'llegó al storage. Solo se escribe en tablas con índices únicos o de '
+	'exclusión: el índice recibe el TID apenas se inserta la fila, pero la '
+	'fila vive en la memoria del backend hasta el flush, así que otra '
+	'sesión que chequea unicidad no la encontraba y dejaba pasar el '
+	'duplicado. Con esta fila, el xmin en curso le dice a quién esperar. '
+	'Se borra en el pre-commit de la transacción dueña; una reserva cuyo '
+	'dueño ya terminó no significa nada.';
+
 -- ===========================================================================
 -- Access method
 -- ===========================================================================

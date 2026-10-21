@@ -34,12 +34,20 @@ SHLIB_LINK   = -lstdc++
 DBE_CXX_STD ?= c++20
 
 # --- Tests -------------------------------------------------------------------
-REGRESS      = extension bridge columnar columnar_mvcc columnar_compress columnar_scan granule pgm workload bloom clustering grouped merge timetravel
+REGRESS      = extension bridge columnar columnar_mvcc columnar_compress columnar_scan columnar_ddl granule pgm workload bloom clustering grouped merge timetravel
 REGRESS_OPTS = --inputdir=test/regress --outputdir=test/regress
+
+# Concurrencia: dos sesiones intercaladas con isolationtester.  Corre en
+# `make installcheck` después de REGRESS.
+ISOLATION      = unique_concurrent merge_during_scan
+ISOLATION_OPTS = --inputdir=test/isolation --outputdir=test/isolation \
+                 --load-extension=dbengine
 
 EXTRA_CLEAN  = $(OBJS) $(OBJS:.o=.bc) .pgbuild-* \
                test/regress/results test/regress/regression.diffs \
-               test/regress/regression.out test/regress/tmp_check
+               test/regress/regression.out test/regress/tmp_check \
+               test/isolation/results test/isolation/regression.diffs \
+               test/isolation/regression.out test/isolation/output_iso
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

@@ -47,6 +47,7 @@
 #include "access/table.h"
 #include "access/tupmacs.h"
 #include "access/xact.h"
+#include "catalog/pg_index.h"
 #include "catalog/pg_type.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
@@ -159,6 +160,21 @@ static bool dbe_staging_callbacks_done = false;
 
 /* Buffers ya flusheados cuya fila de metadatos todavía puede desaparecer. */
 static List *dbe_retained = NIL;
+
+/*
+ * Reservas de números de fila escritas por esta transacción (ver
+ * dbengine.row_reservation).  Se borran en el pre-commit; hasta entonces
+ * son las que le avisan al chequeo de unicidad de otra sesión que hay filas
+ * en curso.  Vive en TopTransactionContext.
+ */
+typedef struct DbeReservation
+{
+	RelFileNumber relnumber;
+	uint64		first_row;
+	SubTransactionId subxid;	/* dónde se insertó la fila de la reserva */
+} DbeReservation;
+
+static List *dbe_reservations = NIL;
 
 static void dbe_staging_xact_callback(XactEvent event, void *arg);
 static void dbe_staging_subxact_callback(SubXactEvent event,
@@ -574,6 +590,113 @@ dbe_staging_register_callbacks(void)
 	dbe_staging_callbacks_done = true;
 }
 
+/*
+ * ¿El buffer se armó para esta forma de la tabla?
+ *
+ * Los builders se crean por columna al abrir el buffer.  Si desde entonces
+ * se agregó una columna, las filas nuevas traen un valor que el buffer no
+ * tiene dónde guardar; si se borró una, hay un builder de más.  En los dos
+ * casos hay que cerrar el stripe y abrir otro con la forma actual.  Las
+ * filas que ya estaban quedan en un stripe sin segmento para la columna
+ * nueva, y el lector las completa con attmissingval, que es exactamente la
+ * semántica de ADD COLUMN.
+ */
+static bool
+dbe_staging_desc_matches(DbeStagingBuffer *buf, TupleDesc desc)
+{
+	int			i;
+
+	if (buf->natts != desc->natts)
+		return false;
+
+	for (i = 0; i < desc->natts; i++)
+		if ((buf->builders[i] == NULL) != TupleDescAttr(desc, i)->attisdropped)
+			return false;
+
+	return true;
+}
+
+/*
+ * ¿Hace falta publicar la reserva?  Solo si algún índice puede rechazar una
+ * fila por otra: único o de exclusión.  Sin eso, nadie de afuera necesita
+ * saber de filas que todavía no están en el storage.
+ */
+static bool
+dbe_relation_needs_reservation(Relation rel)
+{
+	List	   *indexes;
+	ListCell   *lc;
+	bool		needed = false;
+
+	if (!rel->rd_rel->relhasindex)
+		return false;
+
+	indexes = RelationGetIndexList(rel);
+	foreach(lc, indexes)
+	{
+		HeapTuple	tup = SearchSysCache1(INDEXRELID,
+										  ObjectIdGetDatum(lfirst_oid(lc)));
+		Form_pg_index idx;
+
+		if (!HeapTupleIsValid(tup))
+			continue;
+		idx = (Form_pg_index) GETSTRUCT(tup);
+		needed = idx->indisunique || idx->indisexclusion;
+		ReleaseSysCache(tup);
+		if (needed)
+			break;
+	}
+	list_free(indexes);
+
+	return needed;
+}
+
+static void
+dbe_publish_reservation(Relation rel, uint64 first_row, uint64 row_count)
+{
+	DbeReservation *r;
+	MemoryContext old;
+
+	dbe_catalog_insert_reservation(rel->rd_locator.relNumber, first_row,
+								   row_count);
+
+	old = MemoryContextSwitchTo(TopTransactionContext);
+	r = (DbeReservation *) palloc(sizeof(DbeReservation));
+	r->relnumber = rel->rd_locator.relNumber;
+	r->first_row = first_row;
+	r->subxid = GetCurrentSubTransactionId();
+	dbe_reservations = lappend(dbe_reservations, r);
+	MemoryContextSwitchTo(old);
+}
+
+/*
+ * Borra las reservas propias.  Va DESPUÉS de vaciar los buffers: mientras
+ * la transacción no commitee, la fila borrada sigue siendo visible para
+ * SnapshotDirty con el xmin en curso, así que nadie deja de esperar antes
+ * de tiempo.
+ *
+ * El CommandCounterIncrement no es opcional.  En un INSERT o un COPY en
+ * autocommit la reserva se insertó en el mismo comando que está terminando,
+ * y heap no deja borrar una tupla insertada por el comando actual.
+ */
+static void
+dbe_drop_own_reservations(void)
+{
+	ListCell   *lc;
+
+	if (dbe_reservations == NIL)
+		return;
+
+	CommandCounterIncrement();
+	foreach(lc, dbe_reservations)
+	{
+		DbeReservation *r = (DbeReservation *) lfirst(lc);
+
+		dbe_catalog_delete_reservation(r->relnumber, r->first_row);
+	}
+	dbe_reservations = NIL;
+}
+
 static DbeStagingBuffer *
 dbe_staging_lookup(Oid relid, bool create, Relation rel, CommandId cid)
 {
@@ -606,9 +729,15 @@ dbe_staging_lookup(Oid relid, bool create, Relation rel, CommandId cid)
 			 * cambiar libremente porque el cid se guarda por fila.  Un xid
 			 * distinto (otra transacción, o una subtransacción nueva) sí
 			 * obliga a cerrar.
+			 *
+			 * También lo obliga un cambio de forma de la tabla en el medio
+			 * de la transacción.  Un ALTER TABLE ADD COLUMN no reescribe ni
+			 * pasa por el Table AM: el buffer seguía con los builders de
+			 * antes y el valor de la columna nueva se tiraba en silencio.
 			 */
 			if (FullTransactionIdEquals(buf->insert_xid,
-										GetCurrentFullTransactionId()))
+										GetCurrentFullTransactionId()) &&
+				dbe_staging_desc_matches(buf, RelationGetDescr(rel)))
 				return buf;
 
 			dbe_staging_flush_buffer(buf);
@@ -634,6 +763,14 @@ dbe_staging_lookup(Oid relid, bool create, Relation rel, CommandId cid)
 		 */
 		buf->reserved_rows = (uint64) dbe_staging_threshold_rows;
 		buf->base_rownum = dbe_storage_reserve_rows(rel, buf->reserved_rows);
+
+		/*
+		 * Antes de devolver el primer TID: el executor lo mete en el índice
+		 * apenas volvemos, y desde ese momento otra sesión puede tropezar
+		 * con él.
+		 */
+		if (dbe_relation_needs_reservation(rel))
+			dbe_publish_reservation(rel, buf->base_rownum, buf->reserved_rows);
 		buf->insert_xid = GetCurrentFullTransactionId();
 		buf->insert_cid = cid;
 		buf->cid_min = cid;
@@ -1412,6 +1549,24 @@ dbe_staging_discard_subxact(SubTransactionId mySubid)
 
 	list_free(dbe_retained);
 	dbe_retained = keep;
+
+	/* Las reservas insertadas en esta subtransacción murieron con ella. */
+	{
+		List	   *alive = NIL;
+
+		foreach(lc, dbe_reservations)
+		{
+			DbeReservation *r = (DbeReservation *) lfirst(lc);
+
+			if (r->subxid != mySubid)
+			{
+				old = MemoryContextSwitchTo(TopTransactionContext);
+				alive = lappend(alive, r);
+				MemoryContextSwitchTo(old);
+			}
+		}
+		dbe_reservations = alive;
+	}
 }
 
 /*
@@ -1461,6 +1616,14 @@ dbe_staging_promote_subxact(SubTransactionId mySubid,
 
 	list_free(dbe_retained);
 	dbe_retained = keep;
+
+	foreach(lc, dbe_reservations)
+	{
+		DbeReservation *r = (DbeReservation *) lfirst(lc);
+
+		if (r->subxid == mySubid)
+			r->subxid = parentSubid;
+	}
 }
 
 static void
@@ -1485,11 +1648,15 @@ dbe_staging_xact_callback(XactEvent event, void *arg)
 				list_free(dbe_retained);
 				dbe_retained = NIL;
 			}
+
+			dbe_drop_own_reservations();
 			break;
 
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
 			dbe_staging_discard_all();
+			/* Las filas de reserva mueren con la transacción. */
+			dbe_reservations = NIL;
 			break;
 
 		default:

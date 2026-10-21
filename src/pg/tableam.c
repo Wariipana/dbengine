@@ -212,7 +212,13 @@ dbe_scan_begin(Relation relation, Snapshot snapshot, int nkeys, ScanKey key,
 	 * bitmap scan esto es la diferencia entre cargar los segmentos de las
 	 * 105 columnas del stripe y cargar los dos que hacen falta.
 	 */
+	/*
+	 * ANALYZE necesita todas las columnas, venga de donde venga: con la
+	 * lista del plan de afuera las estadísticas de las demás saldrían
+	 * todas NULL.
+	 */
 	scan->cursor = dbe_cursor_begin(relation, snapshot,
+									(flags & SO_TYPE_ANALYZE) != 0 ? NULL :
 									dbe_wanted_for(relation));
 
 	if (parallel_scan != NULL)
@@ -415,7 +421,41 @@ dbe_index_fetch_tuple(struct IndexFetchTableData *scan, ItemPointer tid,
 		f->cursor_snapshot = snapshot;
 	}
 
-	return dbe_cursor_fetch_rownum(f->cursor, dbe_rownum_from_tid(tid), slot);
+	if (dbe_cursor_fetch_rownum(f->cursor, dbe_rownum_from_tid(tid), slot))
+		return true;
+
+	/*
+	 * Chequeo de unicidad o de exclusión: la fila puede existir y estar
+	 * todavía en el buffer de escritura de otra transacción en curso.  Si
+	 * una reserva suya la cubre, se contesta lo mismo que heap para una
+	 * tupla no commiteada: "existe, y su xmin está en curso".  Con eso
+	 * _bt_check_unique() suelta el lock de la página, espera a esa
+	 * transacción y vuelve a mirar, y para entonces la fila ya está en un
+	 * stripe o no existe.
+	 *
+	 * Los valores no se conocen; el slot va todo en NULL.  Al btree no le
+	 * importan: solo mira el xmin.
+	 */
+	if (snapshot->snapshot_type == SNAPSHOT_DIRTY)
+	{
+		TransactionId xwait;
+
+		xwait = dbe_catalog_reservation_in_progress(scan->rel->rd_locator.relNumber,
+													dbe_rownum_from_tid(tid));
+		if (TransactionIdIsValid(xwait))
+		{
+			snapshot->xmin = xwait;
+			snapshot->xmax = InvalidTransactionId;
+			snapshot->speculativeToken = 0;
+
+			ExecStoreAllNullTuple(slot);
+			slot->tts_tid = *tid;
+			slot->tts_tableOid = RelationGetRelid(scan->rel);
+			return true;
+		}
+	}
+
+	return false;
 }
 
 /* ------------------------------------------------------------------------
