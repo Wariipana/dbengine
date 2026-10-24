@@ -1,0 +1,99 @@
+-- F6: canal de feedback del workload.
+--
+-- El planner es la única parte del sistema que ve por cuál columna se
+-- filtra.  Acá se comprueba que lo anota bien: la columna correcta y la
+-- forma correcta (igualdad contra rango), que es lo que la compactación va
+-- a necesitar para decidir por cuál columna reordenar.
+--
+-- Necesita shared_preload_libraries: la tabla vive en memoria compartida y
+-- eso solo se puede pedir desde el postmaster.  Sin precarga el canal queda
+-- apagado, y el test lo dice en vez de fallar.
+CREATE EXTENSION dbengine;
+SELECT dbengine.preloaded() AS precargado \gset
+CREATE TABLE w (a int, b bigint, c text) USING dbengine_columnar;
+INSERT INTO w SELECT g, g % 1000, 'x' || g FROM generate_series(1, 50000) g;
+ANALYZE w;
+SELECT dbengine.workload_reset();
+ workload_reset 
+----------------
+ 
+(1 row)
+
+-- Dos igualdades y dos rangos sobre `a`, un rango sobre `b`, una igualdad
+-- sobre `c`.  Se ejecutan para que el planner las vea.
+SELECT count(*) FROM w WHERE a = 5;
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM w WHERE a = 6;
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM w WHERE a > 100 AND a < 200;
+ count 
+-------
+    99
+(1 row)
+
+SELECT count(*) FROM w WHERE b >= 7;
+ count 
+-------
+ 49650
+(1 row)
+
+SELECT count(*) FROM w WHERE c = 'x9';
+ count 
+-------
+     1
+(1 row)
+
+-- Formas que el canal NO anota: no se pueden traducir a una comparación
+-- contra el zone map, así que tampoco dicen nada sobre cómo ordenar.
+SELECT count(*) FROM w WHERE a % 7 = 0;
+ count 
+-------
+  7142
+(1 row)
+
+SELECT count(*) FROM w WHERE c LIKE 'x1%';
+ count 
+-------
+ 11111
+(1 row)
+
+\if :precargado
+SELECT attnum, eq_preds, range_preds
+FROM dbengine.workload_stats()
+WHERE relfilenode = pg_relation_filenode('w')::bigint
+ORDER BY attnum;
+\else
+\echo 'sin shared_preload_libraries: el canal está apagado'
+sin shared_preload_libraries: el canal está apagado
+SELECT count(*) = 0 AS canal_apagado FROM dbengine.workload_stats();
+ canal_apagado 
+---------------
+ t
+(1 row)
+
+\endif
+-- Reset deja la tabla vacía para esta relación.
+SELECT dbengine.workload_reset();
+ workload_reset 
+----------------
+ 
+(1 row)
+
+SELECT count(*) AS tras_reset
+FROM dbengine.workload_stats()
+WHERE relfilenode = pg_relation_filenode('w')::bigint;
+ tras_reset 
+------------
+          0
+(1 row)
+
+DROP TABLE w;
+DROP EXTENSION dbengine CASCADE;

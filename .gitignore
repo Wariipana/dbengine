@@ -19,3 +19,6 @@ log/
 .dbengine/
 test/isolation/regression.diffs
 test/isolation/regression.out
+
+# Sello de versión del build (Makefile, guarda de objetos mezclados)
+.pgbuild-*

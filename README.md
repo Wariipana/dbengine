@@ -1215,10 +1215,27 @@ importa no es cuántos tests pasan sino **qué falla por otra razón que la
 limitación documentada**.
 
 ```sh
-# baseline: 245/245 con heap
-# con el AM columnar: ~110 pasan, y los ERROR introducidos son en su enorme
-# mayoría nuestros mensajes de "no soportado" más sus cascadas
+PGSRC=~/src/postgresql-18.6 PGBIN=... tools/f1-gate.sh
+# PostgreSQL 18.6 con --enable-cassert, 230 tests (sin `vacuum`):
+#   heap:     224 pasan (los 6 que no, son diferencias de build: ICU, lz4, locale)
+#   columnar: 108 pasan; 116 fallan además de esos 6
 ```
+
+El script automatiza el criterio: falla si el servidor se cae o si aparece
+un fallo que no está en `test/f1-gate/expected-failures.txt`, y avisa cuando
+un test deja de fallar. Corre en el CI sobre el build con aserciones.
+
+Los 116 son, por orden de peso: `UPDATE`/`DELETE`/`FOR UPDATE`/`ON CONFLICT`
+rechazados con su error y las cascadas que dejan; planes distintos en
+`EXPLAIN` (el Custom Scan); ausencia de tabla TOAST; tamaños físicos
+distintos; y orden de filas o de `array_agg` donde la query no lo fija.
+Clasificar los fallos que **no** traen ningún error de dbengine es lo que
+importa: ahí estaban, en la segunda pasada, seis bugs de resultados
+incorrectos — valores varlena leídos desalineados, herencia, `tableoid`,
+`TABLESAMPLE`, agregados polimórficos y `ON COMMIT DELETE ROWS` — cubiertos
+hoy por `test/regress/sql/columnar_compat.sql`.
+
+La primera pasada del gate:
 
 Encontró siete bugs que ningún test escrito a mano había pensado, incluido
 uno que **colgaba el backend para siempre** (`ON CONFLICT` sin el contrato

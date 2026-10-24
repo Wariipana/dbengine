@@ -43,6 +43,15 @@ jobs:
       - name: Build
         run: make PG_CONFIG=${PGBIN}/pg_config
 
+      - name: Tests del motor (y con ASan + UBSan)
+        run: |
+          make PG_CONFIG=${PGBIN}/pg_config check-engine
+          UBSAN_OPTIONS=halt_on_error=1 make PG_CONFIG=${PGBIN}/pg_config check-engine \
+            DBE_ENGINE_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -g"
+
+      - name: Sin warnings
+        run: make PG_CONFIG=${PGBIN}/pg_config check-warnings
+
       - name: Install
         run: sudo make PG_CONFIG=${PGBIN}/pg_config install
 
@@ -64,6 +73,9 @@ jobs:
           ./tools/devcluster.sh start
           make PG_CONFIG=${PGBIN}/pg_config installcheck
 
+      - name: pg_dump y restore en otro cluster
+        run: make PG_CONFIG=${PGBIN}/pg_config check-dump
+
       - name: Diagnóstico del fallo
         if: failure()
         run: |
@@ -80,24 +92,36 @@ jobs:
             test/regress/results/
           if-no-files-found: ignore
 
-  # --- PostgreSQL 19 beta: no está empaquetado en PGDG, se compila --------
+  # --- PostgreSQL compilado desde fuente, con aserciones -----------------
   #
-  # No bloquea el merge (es una beta en movimiento), pero avisa temprano si
-  # una API que usamos cambió.  Cuando PGDG publique postgresql-19, esto se
-  # reemplaza por una entrada más en la matriz de `stable`.
-  beta:
-    name: PostgreSQL ${{ matrix.pg_version }} (desde fuente)
+  # --enable-cassert convierte los segfaults intermitentes en aserciones que
+  # dicen qué invariante se rompió: así aparecieron los bugs de corrupción
+  # silenciosa del gate de F1.  Por eso corre siempre, y el gate de F1
+  # (tools/f1-gate.sh) corre acá, contra el mismo árbol de fuentes.
+  #
+  # La versión estable bloquea el merge; la próxima mayor (hoy 19, en RC) no
+  # —se mueve—, pero avisa temprano si una API que usamos cambió.  Cuando
+  # PGDG publique postgresql-19, se suma a la matriz de `stable`.
+  source:
+    name: PostgreSQL ${{ matrix.pg_version }} (fuente, cassert)
     runs-on: ubuntu-24.04
-    continue-on-error: true
+    continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - pg_version: 19beta3
+          - pg_version: "18.6"
+            pg_major: 18
+            experimental: false
+            gate: true
+          - pg_version: 19rc1
             pg_major: 19
+            experimental: true
+            gate: false
     env:
       PG_MAJOR: ${{ matrix.pg_major }}
       PGPREFIX: /home/runner/.dbengine/pg${{ matrix.pg_major }}-install
+      PGSRC: /home/runner/.dbengine/postgresql-${{ matrix.pg_version }}
       PGPORT: 54319
       PGHOST: /home/runner/.dbengine/pg${{ matrix.pg_major }}/run
 
@@ -108,21 +132,28 @@ jobs:
         id: pgcache
         uses: actions/cache@v4
         with:
-          path: /home/runner/.dbengine/pg${{ matrix.pg_major }}-install
-          key: pgsrc-${{ runner.os }}-${{ matrix.pg_version }}
+          path: |
+            /home/runner/.dbengine/pg${{ matrix.pg_major }}-install
+            /home/runner/.dbengine/postgresql-${{ matrix.pg_version }}
+          key: pgsrc-cassert-${{ runner.os }}-${{ matrix.pg_version }}
 
       - name: Compilar PostgreSQL ${{ matrix.pg_version }}
         if: steps.pgcache.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends build-essential bison flex libreadline-dev
+          mkdir -p "$(dirname "$PGSRC")" && cd "$(dirname "$PGSRC")"
           curl -fsSL -O https://ftp.postgresql.org/pub/source/v${{ matrix.pg_version }}/postgresql-${{ matrix.pg_version }}.tar.bz2
+          curl -fsSL -O https://ftp.postgresql.org/pub/source/v${{ matrix.pg_version }}/postgresql-${{ matrix.pg_version }}.tar.bz2.sha256
+          sha256sum -c postgresql-${{ matrix.pg_version }}.tar.bz2.sha256
           tar xf postgresql-${{ matrix.pg_version }}.tar.bz2
-          cd postgresql-${{ matrix.pg_version }}
+          cd "$PGSRC"
           ./configure --prefix="${PGPREFIX}" --without-icu --without-zlib \
-                      --without-zstd --without-lz4 --without-llvm --enable-debug
+                      --without-zstd --without-lz4 --without-llvm \
+                      --enable-debug --enable-cassert
           make -j"$(nproc)" -s
           make -s install
+          make -s -C src/test/regress
 
       - name: Guarda de la frontera C/C++ (R2)
         run: python3 tools/check_layering.py
@@ -138,6 +169,19 @@ jobs:
           PGBIN=${PGPREFIX}/bin ./tools/devcluster.sh init
           PGBIN=${PGPREFIX}/bin ./tools/devcluster.sh start
           make PG_CONFIG=${PGPREFIX}/bin/pg_config installcheck
+
+      - name: pg_dump y restore en otro cluster
+        run: make PG_CONFIG=${PGPREFIX}/bin/pg_config check-dump
+
+      - name: Crash y recuperación
+        run: |
+          PGDATA=${HOME}/.dbengine/pg${PG_MAJOR}/data PGBIN=${PGPREFIX}/bin \
+            PSQL=${PGPREFIX}/bin/psql \
+            make PG_CONFIG=${PGPREFIX}/bin/pg_config check-crash
+
+      - name: Gate de F1 (suite de PostgreSQL contra el AM columnar)
+        if: matrix.gate
+        run: PGBIN=${PGPREFIX}/bin GATE_KEEP=1 TMPDIR=${HOME} tools/f1-gate.sh
 
       - name: Diagnóstico del fallo
         if: failure()

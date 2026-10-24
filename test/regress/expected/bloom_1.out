@@ -1,0 +1,191 @@
+-- F5: filtro de Bloom por segmento.
+--
+-- Cierra el único hueco que la medición encontró en los zone maps min/max:
+-- el predicado de igualdad sobre una columna de alta cardinalidad que no
+-- está correlacionada con el orden de inserción.  Ahí el min/max no puede
+-- descartar nada y casi ningún stripe tiene la fila buscada.
+--
+-- La propiedad que lo hace usable es el error de un solo lado: puede decir
+-- "puede estar" cuando no está, nunca "no está" cuando sí.  Por eso lo que
+-- se prueba acá, sobre todo, es que **el filtro no cambia ningún
+-- resultado**.
+CREATE EXTENSION dbengine;
+SET dbengine.enable_agg_pushdown = off;
+SET max_parallel_workers_per_gather = 0;
+-- ===========================================================================
+-- El filtro no puede cambiar un resultado
+-- ===========================================================================
+SET dbengine.bloom_bits_per_row = 8;
+-- Varios stripes: con uno solo no hay nada que descartar.
+SET dbengine.staging_threshold_rows = 5000;
+CREATE TABLE b (ord bigint, uid bigint, txt text) USING dbengine_columnar;
+INSERT INTO b SELECT g, (g * 7919) % 100000, 'v' || g
+	FROM generate_series(1, 60000) g;
+ANALYZE b;
+-- Con y sin descarte tiene que dar exactamente lo mismo, para claves que
+-- existen y para claves que no.
+CREATE FUNCTION igual(pred text) RETURNS text AS $$
+DECLARE
+	con bigint;
+	sin bigint;
+BEGIN
+	SET LOCAL dbengine.enable_zonemap_pruning = on;
+	EXECUTE 'SELECT count(*) FROM b WHERE ' || pred INTO con;
+	SET LOCAL dbengine.enable_zonemap_pruning = off;
+	EXECUTE 'SELECT count(*) FROM b WHERE ' || pred INTO sin;
+	IF con = sin THEN
+		RETURN 'igual: ' || con;
+	END IF;
+	RETURN 'DIFIERE con=' || con || ' sin=' || sin || ' en ' || pred;
+END
+$$ LANGUAGE plpgsql;
+DO $$
+DECLARE
+	k bigint;
+	r text;
+	malos int := 0;
+	n int := 0;
+BEGIN
+	-- claves que existen
+	FOR k IN SELECT uid FROM b ORDER BY uid LIMIT 100 LOOP
+		n := n + 1;
+		r := igual('uid = ' || k);
+		IF r NOT LIKE 'igual:%' THEN malos := malos + 1; RAISE NOTICE '%', r; END IF;
+	END LOOP;
+	-- claves que no existen
+	FOR k IN SELECT g * 100003 FROM generate_series(1, 100) g LOOP
+		n := n + 1;
+		r := igual('uid = ' || k);
+		IF r NOT LIKE 'igual:%' THEN malos := malos + 1; RAISE NOTICE '%', r; END IF;
+	END LOOP;
+	RAISE NOTICE 'igualdades comparadas: %, distintas: %', n, malos;
+END
+$$;
+NOTICE:  igualdades comparadas: 200, distintas: 0
+-- Y tampoco cambia nada para las formas que el filtro no puede contestar.
+SELECT igual('uid > 50000') AS rango,
+	   igual('txt = ''v100''') AS texto,
+	   igual('uid = 7919 AND ord < 100') AS combinado,
+	   igual('uid IS NULL') AS nulos;
+    rango     |  texto   | combinado |  nulos   
+--------------+----------+-----------+----------
+ igual: 29996 | igual: 1 | igual: 1  | igual: 0
+(1 row)
+
+-- ===========================================================================
+-- Y sí descarta
+-- ===========================================================================
+-- `ord` está correlacionada: el min/max ya descartaba.  `uid` no lo está, y
+-- es el caso que solo el filtro puede podar.
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT count(*) FROM b WHERE uid = 7919;
+                                QUERY PLAN                                
+--------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Custom Scan (DbengineColumnarScan) on b (actual rows=1.00 loops=1)
+         Columnas leídas: uid
+         Filter: (b.uid = 7919)
+         Rows Removed by Filter: 4999
+         Predicados sobre zone maps: 1
+         Stripes descartados: 11
+(7 rows)
+
+-- Apagarlo por GUC no cambia resultados, solo deja de podar.
+SET dbengine.enable_zonemap_pruning = off;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT count(*) FROM b WHERE uid = 7919;
+                                QUERY PLAN                                
+--------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Custom Scan (DbengineColumnarScan) on b (actual rows=1.00 loops=1)
+         Columnas leídas: uid
+         Filter: (b.uid = 7919)
+         Rows Removed by Filter: 59999
+         Stripes descartados: 0
+(6 rows)
+
+RESET dbengine.enable_zonemap_pruning;
+-- ===========================================================================
+-- Por defecto solo se construye donde el workload lo pidió
+-- ===========================================================================
+RESET dbengine.bloom_bits_per_row;
+SELECT dbengine.workload_reset();
+ workload_reset 
+----------------
+ 
+(1 row)
+
+CREATE TABLE c (a bigint, k bigint) USING dbengine_columnar;
+INSERT INTO c SELECT g, g % 1000 FROM generate_series(1, 20000) g;
+-- Sin historial de workload no se construye ninguno.
+SELECT count(*) AS filtros_sin_historial
+FROM dbengine.stripe_column
+WHERE relfilenode = pg_relation_filenode('c') AND bloom IS NOT NULL;
+ filtros_sin_historial 
+-----------------------
+                     0
+(1 row)
+
+-- Llegan igualdades sobre k y un rango sobre a.
+SELECT count(*) FROM c WHERE k = 7;
+ count 
+-------
+    20
+(1 row)
+
+SELECT count(*) FROM c WHERE a > 100;
+ count 
+-------
+ 19900
+(1 row)
+
+-- Lo que se escribe después lleva filtro, y solo en la columna que se
+-- consultó por igualdad.
+INSERT INTO c SELECT g, g % 1000 FROM generate_series(20001, 40000) g;
+\if :{?precargado}
+\else
+SELECT dbengine.preloaded() AS precargado \gset
+\endif
+\if :precargado
+SELECT attnum, count(*) > 0 AS tiene_filtro
+FROM dbengine.stripe_column
+WHERE relfilenode = pg_relation_filenode('c') AND bloom IS NOT NULL
+GROUP BY attnum ORDER BY attnum;
+\else
+\echo 'sin shared_preload_libraries: el canal de feedback está apagado'
+sin shared_preload_libraries: el canal de feedback está apagado
+\endif
+-- ===========================================================================
+-- El canal tiene que sobrevivir a la reescritura
+-- ===========================================================================
+-- Los filtros se construyen SOLO al escribir, y una reescritura escribe bajo
+-- un relfilenode nuevo. Si el canal no se lleva con ella, se le pregunta por
+-- un relfilenode que nunca vio, contesta que no para todas las columnas, y el
+-- Bloom adaptativo no se activa jamás. Era el caso: solo andaba forzándolo
+-- con dbengine.bloom_bits_per_row, y nada lo delataba.
+\if :precargado
+CREATE TABLE r (k bigint, tag bigint) USING dbengine_columnar;
+CREATE INDEX r_k ON r (k);
+INSERT INTO r SELECT g % 500, (g * 7919) % 5000 FROM generate_series(1, 20000) g;
+ANALYZE r;
+SELECT dbengine.workload_reset();
+-- Planificar alcanza: el hook anota el predicado de igualdad sobre tag.
+EXPLAIN (COSTS off) SELECT count(*) FROM r WHERE tag = 42;
+-- Todavía no hay filtros: la tabla se escribió antes de que nadie preguntara.
+SELECT count(DISTINCT attnum) AS filtros_antes
+FROM dbengine.stripe_column
+WHERE relfilenode = pg_relation_filenode('r') AND bloom IS NOT NULL;
+CLUSTER r USING r_k;
+-- Y ahora sí, sobre tag (attnum 2) y solo sobre tag.
+SELECT attnum, count(*) > 0 AS tiene_filtro
+FROM dbengine.stripe_column
+WHERE relfilenode = pg_relation_filenode('r') AND bloom IS NOT NULL
+GROUP BY attnum ORDER BY attnum;
+DROP TABLE r;
+\else
+\echo 'sin shared_preload_libraries: el canal de feedback está apagado'
+sin shared_preload_libraries: el canal de feedback está apagado
+\endif
+DROP FUNCTION igual(text);
+DROP TABLE b, c;
+DROP EXTENSION dbengine CASCADE;
