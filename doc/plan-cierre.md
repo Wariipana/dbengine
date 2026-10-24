@@ -14,15 +14,15 @@ compromisos.
 
 ---
 
-## C0 — Base y riesgos de correctitud (≈ 3–5 días)
+## C0 — Base y riesgos de correctitud (≈ 3–5 días) ✅
 
 Antes de agregar nada, cerrar lo que hoy puede devolver datos incorrectos o
 perder trabajo.
 
-- [ ] **Trabajo en curso**: correr `installcheck` completo (regress +
+- [x] **Trabajo en curso**: correr `installcheck` completo (regress +
       isolation) sobre los cambios sin commitear (`row_reservation`,
       `scancols`, `columnar_ddl`) y commitearlos.
-- [ ] **pg_dump / restore — probable bug.** `stripe`, `stripe_column` y
+- [x] **pg_dump / restore — probable bug.** `stripe`, `stripe_column` y
       `relation_order` están marcadas con `pg_extension_config_dump`, pero
       pg_dump ya vuelca los datos de la tabla columnar con `COPY` (que pasa
       por el AM) y el restore los reescribe en stripes nuevos. Las filas del
@@ -31,14 +31,14 @@ perder trabajo.
       coincide con uno nuevo, el scan listaría stripes ajenos. Escribir el
       test (dump + restore a una base nueva + comparar resultados) y, si se
       confirma, sacar los `config_dump`.
-- [ ] **Remote + CI corriendo** (GitHub). Hoy el workflow nunca se ejecutó.
-- [ ] **LICENSE** del proyecto (PostgreSQL License o MIT; FSST ya es MIT).
-- [ ] `doc/recuperacion/` fuera del repo: tiene rutas y datos de la máquina
+- [x] **Remote + CI corriendo** (GitHub). Hoy el workflow nunca se ejecutó.
+- [x] **LICENSE** del proyecto (PostgreSQL License o MIT; FSST ya es MIT).
+- [x] `doc/recuperacion/` fuera del repo: tiene rutas y datos de la máquina
       local, no documentación del proyecto.
-- [ ] **Tests de merge/timetravel deterministas**: detectar que el xmin
+- [x] **Tests de merge/timetravel deterministas**: detectar que el xmin
       global está retenido y fallar con un mensaje que lo diga, en vez de
       `fusiono_algo = f`.
-- [ ] **CI más estricto**:
+- [x] **CI más estricto**:
   - job con PostgreSQL compilado con `--enable-cassert` (ya encontró
     corrupción silenciosa una vez; tiene que correr siempre);
   - ASan/UBSan sobre `check-engine`;
@@ -46,6 +46,16 @@ perder trabajo.
   - el **gate de F1 automatizado**: la suite de Postgres con el AM como
     default, comparada contra una lista de fallos esperados — un fallo
     nuevo rompe el build.
+
+**Resultado de C0** (2026-10-24). El bug de pg_dump se confirmó: el
+restore en un cluster nuevo fallaba y la tabla quedaba ilegible. El gate
+automatizado, revisando a mano los fallos que no traían ningún error de
+dbengine, encontró seis bugs más de resultados incorrectos (varlena
+desalineados, herencia, `tableoid`, `TABLESAMPLE`, agregados polimórficos,
+`ON COMMIT DELETE ROWS`), y el build con aserciones uno del propio arreglo.
+La primera corrida real del CI encontró dos más del arnés: el sello
+`.pgbuild-18` versionado y las salidas sin `shared_preload_libraries` que
+nunca se habían generado. Todos cubiertos por tests.
 
 ## C1 — Funcionalidad que falta (≈ 3–5 semanas)
 
@@ -94,48 +104,123 @@ borro una fila?".
 - [ ] Test de `pg_upgrade` 18 → 19 (los relfilenode se preservan; verificar
       que el catálogo viaja bien).
 
-## C2 — Rendimiento (≈ 3–6 semanas, iterativo)
+## C2 — Rendimiento (≈ 6–10 semanas, iterativo)
 
-Primero **perfilar** (`perf` sobre ClickBench en caliente) y atacar lo que
-el perfil diga; el orden de abajo es la hipótesis a confirmar. Máquina de
-referencia: aarch64, 4 núcleos — las optimizaciones SIMD tienen que ser
-NEON o auto-vectorizables, no AVX.
+Objetivo: que dbengine mejore el rendimiento de verdad, no solo que sea
+correcto. Primero **medir dónde se va el tiempo** y después atacar en orden
+de ganancia esperada sobre esfuerzo. Cada punto es una hipótesis hasta que
+su benchmark diga otra cosa, con la misma regla de siempre: número antes y
+después, y las 43 queries de ClickBench iguales a heap.
 
-1. [ ] **Decodificación por lotes a través del airlock.** Hoy el scan pide
-       valor por valor (`dbe_segreader_get`). Reemplazar por
-       `decode_range(row, n, datums, nulls)` de 1024 filas, con
-       bit-unpacking desenrollado por ancho de bit (estilo FastPFor) que
-       el compilador vectorice. `bitpack.hpp` dice explícitamente que se
-       dejó sin optimizar hasta medirlo.
-2. [ ] **Predicados evaluados sobre datos comprimidos.** Para `Var op
-       Const` sobre tipos de ancho fijo y `=`/`LIKE` sobre texto: comparar
-       contra `const - min` en FOR, y en diccionario resolver el predicado
-       **una vez por entrada** (un `LIKE '%google%'` sobre 800k URLs
-       distintas en vez de 10M filas) y filtrar por código. Sale un vector
-       de selección; `ExecQual` queda solo para el residuo.
-3. [ ] **Late materialization a nivel segmento** (q24, `SELECT *` con
-       filtro selectivo): abrir los segmentos de las columnas de salida
-       solo cuando hay filas que pasaron, y leerlos con acceso aleatorio
-       (FOR y diccionario ya lo permiten; RLE necesita un índice de
-       corridas).
-4. [ ] **I/O con `read_stream`** (PG 17+), que en PG 18 usa AIO: los
-       segmentos son rangos contiguos de bloques, el caso ideal. Debería
-       notarse en frío, que es donde dbengine ya gana más.
-5. [ ] **Agregación de alta cardinalidad** (q16, q5): tabla hash
-       especializada para claves enteras (open addressing, sin `Datum`), y
-       `count(DISTINCT)` sobre un hash set de `int64`.
-6. [ ] **Catálogo compacto + caché.** Una fila por stripe con los zone
-       maps de todas las columnas empaquetados, y un caché por backend
-       invalidado por relcache. Ataca el overhead fijo de las queries chicas
-       (q20: 2,4 ms contra 1,1 ms de heap) y el crecimiento a 272k filas
-       de `stripe_column`.
-7. [ ] (Opcional) **zstd/lz4 como candidata más** en la selección "gana la
-       más chica", para texto de alta entropía donde hoy queda crudo.
+Máquina de referencia: aarch64, 4 núcleos. SIMD tiene que ser NEON o
+auto-vectorizable, no AVX.
 
-**Criterio de cierre**: ClickBench a 10M (y si entra en disco, 100M) con
-la media geométrica en frío y en caliente contra heap, publicada junto a
-Citus columnar y pg_duckdb **en la misma máquina**, con las 43 queries
-verificadas contra heap. Las que sigan perdiendo, explicadas como hoy.
+Tres hechos del código que ordenan la lista:
+
+- `dbe_storage_read` lee **bloque por bloque y sincrónico** (`ReadBuffer`
+  por página, sin prefetch) y llama a `RelationGetNumberOfBlocks` en cada
+  lectura. PG 18 trae I/O asíncrono y `read_stream` está disponible.
+- En caliente cada valor cruza el airlock de a uno (`dbe_segreader_get`) y
+  los predicados se evalúan fila por fila con `ExecQual`.
+- Las queries más lentas son agregaciones de alta cardinalidad (q9, q10,
+  q19, q33–q35: 6 a 12 s cada una), donde el hash gana apenas
+  1,08×–1,23× sobre PostgreSQL.
+
+### C2.0 — Línea base
+
+- [ ] `perf record -g` sobre q3, q24, q29, q33 y una en frío; flame graphs
+      y reparto por capa (decodificación, airlock, `ExecQual`, hash,
+      funciones de transición, I/O). Re-correr ClickBench completo como
+      referencia de partida en esta máquina.
+
+### C2.1 — Victorias rápidas
+
+1. [ ] **Agregados precalculados por stripe (SMA).** Guardar suma exacta
+       (`numeric`) y conteo de no nulos por columna numérica, igual que hoy
+       `row_count` y min/max. `sum`/`avg`/`count(x)` sin filtro salen del
+       catálogo; `sum(x + k)` = `sum(x) + k·count(x)` (q30: 90 sumas, 5,1 s).
+       Y la regla del **stripe que cumple entero**: si el zone map prueba
+       que todas sus filas pasan el `WHERE`, se usan los metadatos sin
+       evaluar nada — hoy un `WHERE` apaga todos los atajos. Ataca q30, q3,
+       q4, q2, q8. Ref.: Moerkotte, *Small Materialized Aggregates*, VLDB 1998.
+2. [ ] **`read_stream` + AIO de PG 18** en `dbe_storage_read`: un segmento
+       es un rango contiguo de bloques (`READ_STREAM_SEQUENTIAL`). Medir en
+       frío, con `io_method` worker e io_uring. Revisar de paso la
+       `BufferAccessStrategy` (hoy ninguna: un scan grande desaloja todo
+       `shared_buffers`).
+3. [ ] **`count(DISTINCT)` por unión de diccionarios**: en un segmento con
+       diccionario, las entradas *son* los valores distintos del stripe; sin
+       filtro y con todo visible, alcanza con unir diccionarios (q6). Y
+       combinar los conjuntos parciales para correr en paralelo (q5, que
+       hoy pierde 0,79×).
+4. [ ] **Experimento: clustering multicolumna (Z-order / Hilbert)** en
+       `relation_copy_for_cluster`, con las columnas normalizadas por
+       cuantiles. Revisa "una tabla se ordena por una sola cosa":
+       `bench/f6-clustering.sh` ya tiene el caso (`uid` contra `ts`). Si no
+       gana, se documenta como negativo.
+
+### C2.2 — Trabajar sobre los datos comprimidos
+
+5. [ ] **Evaluar una vez por entrada del diccionario**: predicados (`LIKE`,
+       `<> ''`, `=`) y expresiones inmutables (`length`, `REGEXP_REPLACE`,
+       `extract`) se calculan por entrada y se guardan en un arreglo
+       indexado por código. Ataca q21–q23, q28, q29 (20,8 s; 4,7 s son el
+       regexp), q11–q15, q37–q43. Solo funciones inmutables y con la
+       colación de la columna; se apaga si el diccionario ≈ las filas.
+6. [ ] **`LIKE` sobre FSST sin descomprimir** (autómata sobre los códigos
+       de símbolo): 2,5×–17× sobre descomprimir y comparar según Pop, Riedl
+       y Neumann (TUM). Vortex lo implementa para `prefix%` y `%needle%`,
+       que son los de ClickBench. Revisa "FSST es solo tamaño".
+7. [ ] **Predicados sobre enteros comprimidos**: comparar contra
+       `const − min` en FOR sin reconstruir el valor, y salir con un vector
+       de selección; `ExecQual` queda para el residuo.
+
+### C2.3 — Lo grueso
+
+8. [ ] **Top-N con materialización tardía y umbral dinámico** para
+       `ORDER BY ... LIMIT k`: calcular solo la clave de orden y el filtro,
+       mantener los k mejores, descartar gránulos cuyo min/max no puede
+       entrar y leer las demás columnas **solo de las k filas** por TID.
+       Ataca q24 (3,3 s, pierde 0,64×), q25–q27 y `SELECT * LIMIT`. Revisa
+       el veredicto "estructural" sobre q24. Ref.: DuckDB 1.3 (3–10× con
+       LIMIT), Doris y DataFusion (filtros dinámicos al scan).
+9. [ ] **Tabla de hash propia** para claves `int2/4/8` y códigos de
+       diccionario: direccionamiento abierto, estados de agregado en un
+       arreglo plano, sin `TupleHashTable` ni `MinimalTuple`; agregación
+       parcial por worker. Ataca las queries de mayor tiempo absoluto (q9,
+       q10, q16, q17, q19, q31–q36). Revisa "el hash domina": lo que domina
+       es la tabla genérica. Ref.: DuckDB; Xue y Marcus 2025.
+10. [ ] **Decodificación por lotes** (`decode_range` de 1024 filas a través
+       del airlock) con desempaquetado de bits por ancho estilo FastLanes,
+       escrito para que el compilador lo vectorice en NEON.
+
+### C2.4 — Si queda tiempo
+
+11. [ ] **Codificaciones nuevas**: delta / delta-of-delta para enteros y
+        fechas ordenadas (después de CLUSTER), ALP para `float8`, `numeric`
+        como entero escalado para que entre en FOR.
+12. [ ] **Catálogo compacto + caché por backend** (una fila por stripe con
+        los zone maps empaquetados): overhead fijo de las queries chicas
+        (q20: 2,4 ms contra 1,1 ms).
+13. [ ] **Caché compartida de vectores decodificados** (los stripes son
+        inmutables: invalidar es trivial). Útil para dashboards; se reporta
+        aparte para no inflar ClickBench en caliente.
+
+### Descartado o para más adelante
+
+- **Filtros Bloom de join en tiempo de ejecución**: ClickBench no tiene
+  joins y el executor no deja pasar el lado de construcción al scan sin
+  reemplazar el HashJoin.
+- **HyperLogLog**: cambia la semántica de `count(DISTINCT)`.
+- **PG 19 eager aggregation**: ofrecer `DbengineVectorAgg` como agregado
+  parcial debajo de un join cuando PG 19 sea el target.
+- **Ejecución por lotes del executor** (parche de Amit Langote, apunta a
+  PG 20): el airlock ya está pensado para eso; seguirlo.
+
+**Criterio de cierre**: ClickBench a 10M con la media geométrica en frío y
+en caliente contra heap, junto a Citus columnar y pg_duckdb **en la misma
+máquina**, con las 43 queries verificadas contra heap. Las que sigan
+perdiendo, explicadas.
 
 ## C3 — Calidad de código (≈ 1–2 semanas, en paralelo)
 
@@ -179,6 +264,10 @@ Lo que convierte el trabajo en portfolio.
 
 ## Orden sugerido
 
-C0 → C1 (DELETE/UPDATE) → C2 → C4, con C3 intercalado cuando un cambio de
-C1/C2 toque el archivo en cuestión. C4 al final para que los números y el
-README reflejen el estado definitivo.
+C0 ✅ → **C2 (rendimiento)** → C1 (DELETE/UPDATE) → C4, con C3 intercalado
+cuando un cambio toque el archivo en cuestión. El foco pasó a ser que el
+motor mejore el rendimiento de verdad, así que C2 va primero; C1 después,
+porque DELETE obliga a revisar todos los atajos por metadatos (SMA, zone
+maps, `count(*)`), y conviene hacerlo una vez con la lista completa de
+atajos ya escrita. C4 al final para que los números y el README reflejen el
+estado definitivo.
