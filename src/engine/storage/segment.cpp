@@ -6,7 +6,13 @@
 //===----------------------------------------------------------------------===//
 #include "dbengine/engine/segment.hpp"
 
+// FSST es código de terceros sin modificar (ver el Makefile): sus warnings
+// no son nuestros, y con los CXXFLAGS de PG 19 (-Wimplicit-fallthrough)
+// romperían check-warnings.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
 #include "../compress/fsst/fsst.h"
+#pragma GCC diagnostic pop
 
 #include "../compress/bitpack.hpp"
 

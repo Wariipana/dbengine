@@ -19,6 +19,17 @@
 #error "dbengine requiere PostgreSQL 18 o superior"
 #endif
 
+/*
+ * PG 19: un TupleDesc armado a mano tiene que pasar por TupleDescFinalize()
+ * antes de usarse (calcula firstNonCachedOffsetAttr; con --enable-cassert
+ * deformar una tupla sin eso es un TRAP).  En PG 18 no existe ni hace falta.
+ */
+#if PG_VERSION_NUM >= 190000
+#define dbe_tupdesc_finalize(td) TupleDescFinalize(td)
+#else
+#define dbe_tupdesc_finalize(td) ((void) 0)
+#endif
+
 #define DBENGINE_VERSION "0.1.0"
 
 /* --- GUCs (definidas en init.c) ---------------------------------------- */

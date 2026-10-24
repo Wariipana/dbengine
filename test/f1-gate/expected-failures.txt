@@ -18,6 +18,7 @@ constraints
 copy2
 copydml
 copyselect
+create_am
 create_function_sql
 create_index
 create_index_spgist
@@ -67,6 +68,7 @@ misc
 misc_functions
 money
 mvcc
+numeric
 partition_aggregate
 partition_join
 partition_prune
@@ -76,6 +78,7 @@ polymorphism
 portals
 predicate
 privileges
+psql
 psql_pipeline
 publication
 rangefuncs

@@ -477,6 +477,7 @@ dbe_pgm_sort_tupdesc(void)
 
 	TupleDescInitEntry(td, (AttrNumber) 1, "clave", INT8OID, -1, 0);
 	TupleDescInitEntry(td, (AttrNumber) 2, "fila", INT8OID, -1, 0);
+	dbe_tupdesc_finalize(td);
 	return BlessTupleDesc(td);
 }
 

@@ -1545,7 +1545,8 @@ dbe_agg_begin(CustomScanState *node, EState *estate, int eflags)
 
 			TupleDescInitEntry(ddesc, 1, NameStr(att->attname), att->atttypid,
 							   att->atttypmod, 0);
-			TupleDescAttr(ddesc, 0)->attcollation = coll;
+			TupleDescInitEntryCollation(ddesc, 1, coll);
+			dbe_tupdesc_finalize(ddesc);
 
 			agg->is_distinct = true;
 			agg->dist_slot = MakeSingleTupleTableSlot(ddesc, &TTSOpsVirtual);
@@ -1651,10 +1652,12 @@ dbe_agg_begin(CustomScanState *node, EState *estate, int eflags)
 				TupleDescInitEntry(gdesc, (AttrNumber) (i + 1),
 								   NameStr(att->attname), att->atttypid,
 								   att->atttypmod, 0);
-				TupleDescAttr(gdesc, i)->attcollation = att->attcollation;
+				TupleDescInitEntryCollation(gdesc, (AttrNumber) (i + 1),
+											att->attcollation);
 				keycols[i] = (AttrNumber) (i + 1);
 				colls[i] = att->attcollation;
 			}
+			dbe_tupdesc_finalize(gdesc);
 
 			for (i = 0; i < state->naggs; i++)
 				if (!state->aggs[i].is_group)

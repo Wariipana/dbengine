@@ -112,7 +112,34 @@ else
 fi
 
 # 2. Los fallos propios de columnar son los esperados.
-comm -23 "$WORK/fallan-columnar" "$WORK/fallan-heap" > "$WORK/propios"
+#
+# Propio no es "falla con columnar y no con heap": un test que con heap falla
+# por el build (ICU, lz4, locale) puede fallar con columnar por algo más, y
+# el build cambia de máquina en máquina.  Propio es "el diff con columnar no
+# es el mismo que con heap".
+python3 - "$WORK/heap/regression.diffs" "$WORK/columnar/regression.diffs" \
+    "$WORK/fallan-columnar" > "$WORK/propios" <<'PY'
+import re, sys
+
+def diffs(path):
+    try:
+        txt = open(path, errors="replace").read()
+    except FileNotFoundError:
+        return {}
+    out = {}
+    parts = re.split(r"^diff .*?/expected/(\S+?)(?:_\d+)?\.out .*$", txt, flags=re.M)
+    for i in range(1, len(parts), 2):
+        # Los OIDs cambian de corrida en corrida: no son una diferencia.
+        body = [re.sub(r"\d{5,}", "N", l) for l in parts[i + 1].splitlines()
+                if l[:1] in "+-" and not l.startswith(("+++", "---"))]
+        out[parts[i]] = body
+    return out
+
+heap, col = diffs(sys.argv[1]), diffs(sys.argv[2])
+for t in sorted(set(open(sys.argv[3]).read().split())):
+    if heap.get(t) != col.get(t):
+        print(t)
+PY
 
 if [ -n "${GATE_UPDATE:-}" ]; then
   mkdir -p "$(dirname "$LISTA")"
