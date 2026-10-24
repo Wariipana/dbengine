@@ -31,9 +31,10 @@ CREATE TABLE eventos (id bigint, ts timestamptz, payload jsonb)
 - Python 3 (para la guarda de arquitectura)
 
 Verificado contra **18.6** y **19beta3**, con los mismos archivos
-`expected/`. PG 19 todavía no está empaquetado en PGDG (ni en
-`pgdg-testing` ni en `pgdg-snapshot`), así que el job del CI lo compila
-desde el tarball de fuentes y no bloquea el merge.
+`expected/`. PG 19 todavía no tiene versión final (está en RC; la GA está
+prevista para noviembre de 2026), así que el CI lo compila desde el tarball
+de fuentes y no bloquea el merge. El 18.6 también se compila desde fuente,
+con `--enable-cassert`, y ahí corre el gate de F1.
 
 ## Build
 
@@ -74,7 +75,13 @@ make check-engine     # PGM y Bloom contra una referencia exacta
 make check-layering   # la frontera C/C++ sigue intacta
 make check-warnings   # el build no emite ni un warning
 PGDATA=$HOME/.dbengine/pg18/data make check-crash   # crash y recuperación
+make check-dump       # pg_dump en un cluster nuevo y restore en otro
+PGSRC=~/src/postgresql-18.6 tools/f1-gate.sh   # suite de PostgreSQL contra el AM
 ```
+
+`check-dump` y `f1-gate.sh` levantan sus propios clusters temporales; solo
+necesitan la extensión instalada. El gate necesita además un árbol de fuentes
+de PostgreSQL configurado, con `make -C src/test/regress` hecho.
 
 `check-warnings` no es cosmético: los dos últimos warnings que aparecieron
 eran símbolos que PostgreSQL 19 movió de header, y el `.so` los resolvía
@@ -1346,3 +1353,9 @@ maintenance`, pero **no** en `pg_stat_activity`: en F0 se registra con
 en la vista. Cuando F7 necesite tocar catálogos para la purga, pasa a
 `BGWORKER_BACKEND_DATABASE_CONNECTION` y se vuelve visible junto con su
 wait event `DbengineMaintenanceMain`.
+
+## Licencia
+
+MIT, ver [`LICENSE`](LICENSE). FSST (`src/engine/compress/fsst/`) es una
+copia sin modificar de la implementación de referencia, también MIT, con su
+propia licencia en ese directorio.
