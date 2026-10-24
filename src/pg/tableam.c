@@ -749,6 +749,15 @@ static void
 dbe_relation_nontransactional_truncate(Relation rel)
 {
 	dbe_staging_forget(RelationGetRelid(rel));
+
+	/*
+	 * ON COMMIT DELETE ROWS llega acá desde el pre-commit, en el mismo
+	 * comando en que el flush del buffer acaba de insertar el stripe en el
+	 * catálogo.  heap_delete() no puede borrar una fila de su propio comando
+	 * ("attempted to delete invisible tuple"): hay que avanzar el command
+	 * id antes.
+	 */
+	CommandCounterIncrement();
 	dbe_catalog_drop_relation(rel->rd_locator.relNumber);
 	RelationTruncate(rel, 0);
 }

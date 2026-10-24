@@ -880,13 +880,34 @@ dbe_catalog_drop_relation(RelFileNumber relnumber)
 	SysScanDesc scan;
 	ScanKeyData key[1];
 	HeapTuple	tup;
+	bool		pushed_snapshot = false;
 
-	/* Segmentos primero. */
+	/*
+	 * Borrar una fila de stripe_column puede tocar su TOAST, y eso necesita
+	 * un snapshot.  En el pre-commit (ON COMMIT DELETE ROWS) no hay ninguno
+	 * activo; mismo caso que el flush del buffer de escritura.
+	 */
+	if (!ActiveSnapshotSet())
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
+		pushed_snapshot = true;
+	}
+
+	/*
+	 * SnapshotSelf, no el catalog snapshot: este borrado tiene que ver
+	 * también las filas que escribió el comando actual.  ON COMMIT DELETE
+	 * ROWS llega acá desde el pre-commit, en el MISMO comando en que el
+	 * flush del buffer acaba de insertar el stripe; con el catalog snapshot
+	 * esas filas eran invisibles, sobrevivían al truncate y la transacción
+	 * siguiente leía un stripe sin storage ("lectura fuera del storage").
+	 *
+	 * Segmentos primero.
+	 */
 	ScanKeyInit(&key[0], Anum_seg_relfilenode, BTEqualStrategyNumber,
 				F_OIDEQ, ObjectIdGetDatum(relnumber));
 	rel = table_open(dbe_stripe_column_relid(), RowExclusiveLock);
 	scan = systable_beginscan(rel, dbe_stripe_column_pkey_relid(), true,
-							  NULL, 1, key);
+							  SnapshotSelf, 1, key);
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
 		CatalogTupleDelete(rel, &tup->t_self);
 	systable_endscan(scan);
@@ -896,7 +917,7 @@ dbe_catalog_drop_relation(RelFileNumber relnumber)
 				F_OIDEQ, ObjectIdGetDatum(relnumber));
 	rel = table_open(dbe_stripe_relid(), RowExclusiveLock);
 	scan = systable_beginscan(rel, dbe_stripe_pkey_relid(), true,
-							  NULL, 1, key);
+							  SnapshotSelf, 1, key);
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
 		CatalogTupleDelete(rel, &tup->t_self);
 	systable_endscan(scan);
@@ -904,6 +925,9 @@ dbe_catalog_drop_relation(RelFileNumber relnumber)
 
 	dbe_catalog_clear_order(relnumber);
 	dbe_catalog_drop_reservations(relnumber);
+
+	if (pushed_snapshot)
+		PopActiveSnapshot();
 }
 
 /* ------------------------------------------------------------------------

@@ -860,7 +860,25 @@ dbe_append_value(DbeSegBuilder *builder, Form_pg_attribute att, Datum value)
 		struct varlena *v =
 			pg_detoast_datum_packed((struct varlena *) DatumGetPointer(value));
 
-		st = dbe_segbuilder_append(builder, v, VARSIZE_ANY(v), 0);
+		/*
+		 * Header corto cuando se puede, igual que heap_fill_tuple(): ocupa 3
+		 * bytes menos y, sobre todo, se puede leer desde cualquier
+		 * dirección.  Uno de 4 bytes desalineado obliga a copiarlo al leer
+		 * (dbe_varlena_datum).  Los tipos con storage plain esperan siempre
+		 * el header largo.
+		 */
+		if (VARATT_IS_4B_U(v) && att->attstorage != TYPSTORAGE_PLAIN &&
+			VARATT_CAN_MAKE_SHORT(v))
+		{
+			char		buf[VARATT_SHORT_MAX];
+			Size		len = VARATT_CONVERTED_SHORT_SIZE(v);
+
+			SET_VARSIZE_SHORT(buf, len);
+			memcpy(buf + 1, VARDATA(v), len - 1);
+			st = dbe_segbuilder_append(builder, buf, (uint32) len, 0);
+		}
+		else
+			st = dbe_segbuilder_append(builder, v, VARSIZE_ANY(v), 0);
 
 		if ((Pointer) v != DatumGetPointer(value))
 			pfree(v);

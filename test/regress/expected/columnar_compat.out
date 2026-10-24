@@ -1,0 +1,192 @@
+--
+-- Semántica de PostgreSQL que el AM columnar tiene que respetar.
+--
+-- Todo lo de este archivo lo encontró el gate de F1 (tools/f1-gate.sh): la
+-- suite de PostgreSQL daba resultados distintos sin ningún error de por
+-- medio.  Cada sección compara contra lo que devuelve heap.
+--
+CREATE EXTENSION dbengine;
+SET default_table_access_method = dbengine_columnar;
+-- ------------------------------------------------------------------------
+-- Varlena con header de 4 bytes, desalineados dentro del segmento.
+--
+-- Los valores van pegados sin padding.  range_deserialize() alinea los
+-- límites contra la dirección absoluta, así que un rango que caía en una
+-- dirección impar se leía corrido: [2,12) salía como [2,4456960).  Solo la
+-- primera fila, en el offset 0, salía bien.  Los valores que llegan de una
+-- función (no de una tabla) traen header de 4 bytes.
+-- ------------------------------------------------------------------------
+CREATE TABLE al (r4 int4range, r8 int8range, a8 int8[], n numeric);
+INSERT INTO al SELECT int4range(g, g + 10), int8range(g, g * 1000),
+                      ARRAY[g, g * 2]::int8[], g / 7.0
+FROM generate_series(1, 6) g;
+-- Y un valor que no entra en un header corto.
+INSERT INTO al VALUES (NULL, NULL, array_fill(7::int8, ARRAY[40]), NULL);
+SELECT r4, r8, a8[1:2] AS a8, round(n, 3) AS n FROM al ORDER BY lower(r4);
+   r4   |    r8    |   a8   |   n   
+--------+----------+--------+-------
+ [1,11) | [1,1000) | {1,2}  | 0.143
+ [2,12) | [2,2000) | {2,4}  | 0.286
+ [3,13) | [3,3000) | {3,6}  | 0.429
+ [4,14) | [4,4000) | {4,8}  | 0.571
+ [5,15) | [5,5000) | {5,10} | 0.714
+ [6,16) | [6,6000) | {6,12} | 0.857
+        |          | {7,7}  |      
+(7 rows)
+
+SELECT count(*) AS "igual_a_[2,12)" FROM al WHERE r4 = int4range(2, 12);
+ igual_a_[2,12) 
+----------------
+              1
+(1 row)
+
+SELECT count(*) AS contiene_25 FROM al WHERE r8 @> 25::int8;
+ contiene_25 
+-------------
+           6
+(1 row)
+
+SELECT sum(a8[2]) AS suma_a8 FROM al;
+ suma_a8 
+---------
+      49
+(1 row)
+
+SELECT array_length(a8, 1) AS largo FROM al WHERE r4 IS NULL;
+ largo 
+-------
+    40
+(1 row)
+
+-- ------------------------------------------------------------------------
+-- Agregados polimórficos dentro de DbengineVectorAgg.
+--
+-- La función de transición no recibía fn_expr y no podía preguntar el tipo
+-- de su argumento: "range_agg must be called with a range".
+-- ------------------------------------------------------------------------
+EXPLAIN (COSTS OFF) SELECT range_agg(r4) FROM al;
+              QUERY PLAN               
+---------------------------------------
+ Custom Scan (DbengineVectorAgg) on al
+   Agregados empujados al scan: 1
+(2 rows)
+
+SELECT range_agg(r4), range_intersect_agg(r4 * int4range(1, 100)) FROM al;
+ range_agg | range_intersect_agg 
+-----------+---------------------
+ {[1,16)}  | [6,11)
+(1 row)
+
+SELECT range_agg(r4) FROM al WHERE lower(r4) > 3;
+ range_agg 
+-----------
+ {[4,16)}
+(1 row)
+
+-- ------------------------------------------------------------------------
+-- Herencia: el Custom Scan sobre el padre leía solo el storage del padre.
+-- ------------------------------------------------------------------------
+CREATE TABLE padre (a int);
+CREATE TABLE hija (b int) INHERITS (padre);
+INSERT INTO padre VALUES (1);
+INSERT INTO hija VALUES (2, 20);
+SELECT a FROM padre ORDER BY a;
+ a 
+---
+ 1
+ 2
+(2 rows)
+
+SELECT count(*), sum(a) FROM padre;
+ count | sum 
+-------+-----
+     2 |   3
+(1 row)
+
+SELECT a FROM ONLY padre;
+ a 
+---
+ 1
+(1 row)
+
+-- ------------------------------------------------------------------------
+-- tableoid: el Custom Scan no lo ponía en el slot y salía 0.
+-- ------------------------------------------------------------------------
+CREATE TABLE pp (a int) PARTITION BY LIST (a);
+CREATE TABLE pp1 PARTITION OF pp FOR VALUES IN (1);
+CREATE TABLE pp2 PARTITION OF pp FOR VALUES IN (2);
+INSERT INTO pp VALUES (1), (2), (2);
+SELECT tableoid::regclass AS particion, count(*) FROM pp GROUP BY 1 ORDER BY 1;
+ particion | count 
+-----------+-------
+ pp1       |     1
+ pp2       |     2
+(2 rows)
+
+SELECT tableoid::regclass AS particion, a FROM pp1;
+ particion | a 
+-----------+---
+ pp1       | 1
+(1 row)
+
+SELECT tableoid::regclass AS tabla, a FROM padre ORDER BY a;
+ tabla | a 
+-------+---
+ padre | 1
+ hija  | 2
+(2 rows)
+
+-- ------------------------------------------------------------------------
+-- TABLESAMPLE: el Custom Scan se lo quedaba y devolvía la tabla entera.  Lo
+-- correcto, mientras no esté implementado, es el error documentado.
+-- ------------------------------------------------------------------------
+CREATE TABLE ts (id int);
+INSERT INTO ts SELECT generate_series(1, 100);
+\set VERBOSITY terse
+SELECT count(*) FROM ts TABLESAMPLE SYSTEM (0);
+ERROR:  dbengine: TABLESAMPLE no está soportado en tablas columnares
+SELECT count(*) FROM ts TABLESAMPLE BERNOULLI (50) REPEATABLE (0);
+ERROR:  dbengine: TABLESAMPLE no está soportado en tablas columnares
+\set VERBOSITY default
+-- ------------------------------------------------------------------------
+-- ON COMMIT DELETE ROWS.
+--
+-- El truncate corre en el pre-commit, en el mismo comando en que el flush
+-- del buffer inserta el stripe.  El borrado del catálogo no veía esa fila,
+-- el storage quedaba en cero y la transacción siguiente fallaba con
+-- "lectura fuera del storage".
+-- ------------------------------------------------------------------------
+CREATE TEMP TABLE oc (f1 int, t text) ON COMMIT DELETE ROWS;
+INSERT INTO oc VALUES (1, repeat('x', 5000)), (2, 'y');
+CREATE INDEX oc_i ON oc (f1);
+SELECT count(*) AS vacia FROM oc;
+ vacia 
+-------
+     0
+(1 row)
+
+BEGIN;
+INSERT INTO oc VALUES (3, 'z');
+SELECT count(*) AS dentro FROM oc;
+ dentro 
+--------
+      1
+(1 row)
+
+COMMIT;
+SELECT count(*) AS vacia_otra_vez FROM oc;
+ vacia_otra_vez 
+----------------
+              0
+(1 row)
+
+SELECT count(*) AS stripes_huerfanos FROM dbengine.stripe s
+WHERE NOT EXISTS (SELECT 1 FROM pg_class c
+                  WHERE pg_relation_filenode(c.oid) = s.relfilenode);
+ stripes_huerfanos 
+-------------------
+                 0
+(1 row)
+
+DROP TABLE al, padre, hija, pp, ts, oc;
+DROP EXTENSION dbengine CASCADE;

@@ -336,7 +336,31 @@ dbe_cursor_column(DbeRowCursor *cur, AttrNumber attnum, DbeColumnVector *out)
 	out->data = (const char *) data;
 	out->width = width;
 	out->nulls = (const char *) nulls;
+	out->attalign = TupleDescAttr(RelationGetDescr(cur->rel), attnum - 1)->attalign;
+	out->cxt = cur->stripe_cxt;
 	return true;
+}
+
+Datum
+dbe_varlena_datum(const void *data, char attalign, MemoryContext cxt)
+{
+	const struct varlena *v = (const struct varlena *) data;
+	Size		size;
+	void	   *copy;
+
+	if (!VARATT_IS_4B(v) ||
+		(uintptr_t) data == att_align_nominal((uintptr_t) data, attalign))
+		return PointerGetDatum(data);
+
+	/*
+	 * palloc devuelve memoria MAXALIGN, que alcanza para cualquier typalign.
+	 * Vive lo que el stripe: los punteros a valores alineados también
+	 * apuntan adentro del stripe y mueren con él.
+	 */
+	size = VARSIZE(v);
+	copy = MemoryContextAlloc(cxt, size);
+	memcpy(copy, data, size);
+	return PointerGetDatum(copy);
 }
 
 bool
@@ -786,6 +810,9 @@ dbe_cursor_fill_atts(DbeRowCursor *cur, uint64 row, TupleTableSlot *slot,
 
 		if (att->attlen > 0)
 			slot->tts_values[i] = fetch_att(data, att->attbyval, att->attlen);
+		else if (att->attlen == -1)
+			slot->tts_values[i] = dbe_varlena_datum(data, att->attalign,
+													cur->stripe_cxt);
 		else
 			slot->tts_values[i] = PointerGetDatum(data);
 	}
@@ -812,6 +839,13 @@ static void
 dbe_cursor_end_row(DbeRowCursor *cur, uint64 row, TupleTableSlot *slot)
 {
 	ExecStoreVirtualTuple(slot);
+	/*
+	 * tableoid lo lee slot_getsysattr() de acá.  El seq scan del Table AM lo
+	 * ponía por su cuenta, pero el Custom Scan, el fetch por índice y el
+	 * bitmap scan no: `GROUP BY tableoid` sobre una particionada colapsaba
+	 * todas las particiones en una sola fila con tableoid 0.
+	 */
+	slot->tts_tableOid = RelationGetRelid(cur->rel);
 	dbe_tid_from_rownum(cur->stripe->first_row_number + row, &slot->tts_tid);
 }
 

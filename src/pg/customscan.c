@@ -349,6 +349,19 @@ dbe_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		return;
 	if (rte->rtekind != RTE_RELATION || rte->relkind != RELKIND_RELATION)
 		return;
+
+	/*
+	 * Un padre de herencia con hijos (`rte->inh`) se resuelve con un Append
+	 * sobre él mismo y cada hijo: un path propio acá leería solo el storage
+	 * del padre y perdería las filas de los hijos.  Su propio storage entra
+	 * después como un hijo más, con inh = false, y ahí sí se ofrece.
+	 *
+	 * TABLESAMPLE lo resuelve SampleScan; este nodo no sabe muestrear y
+	 * devolvería la tabla entera.
+	 */
+	if (rte->inh || rte->tablesample != NULL)
+		return;
+
 	/*
 	 * También las particiones y los hijos de herencia.
 	 *

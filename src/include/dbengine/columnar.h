@@ -189,7 +189,21 @@ typedef struct DbeColumnVector
 	uint32		width;
 	const char *nulls;			/* bitmap: bit prendido = NO nulo; NULL = sin nulos */
 	DbeSegReader *reader;		/* camino lento: largo variable o diccionario */
+	char		attalign;		/* para dbe_varlena_datum() */
+	MemoryContext cxt;			/* dónde copiar un varlena desalineado */
 } DbeColumnVector;
+
+/*
+ * Datum de un varlena leído de un segmento.
+ *
+ * Los valores van pegados uno detrás del otro, sin padding.  Un varlena con
+ * header de 1 byte se puede leer desde cualquier dirección, pero uno con
+ * header de 4 bytes tiene que estar alineado según el typalign del tipo:
+ * las funciones del tipo (range_deserialize, los arrays) alinean sus campos
+ * internos contra la dirección absoluta.  Si no lo está, se copia a `cxt`.
+ */
+extern Datum dbe_varlena_datum(const void *data, char attalign,
+							   MemoryContext cxt);
 
 /* Avanza al siguiente stripe con filas.  false cuando se acabaron. */
 extern bool dbe_cursor_next_stripe(DbeRowCursor *cur);

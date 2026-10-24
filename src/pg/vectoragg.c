@@ -651,6 +651,9 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	rte = planner_rt_fetch(input_rel->relid, root);
 	if (rte->rtekind != RTE_RELATION || rte->relkind != RELKIND_RELATION)
 		return;
+	/* Mismas razones que en dbe_set_rel_pathlist(): hijos y muestreo. */
+	if (rte->inh || rte->tablesample != NULL)
+		return;
 
 	/*
 	 * El WHERE se evalúa adentro del nodo.
@@ -1105,6 +1108,9 @@ dbe_agg_init_one(DbeAggState *agg, Aggref *ref, AttrNumber attnum,
 	Form_pg_aggregate aggform;
 	Datum		textInitVal;
 	bool		initnull;
+	Oid			inputTypes[FUNC_MAX_ARGS];
+	int			nargs;
+	Expr	   *transfnexpr;
 
 	memset(agg, 0, sizeof(*agg));
 	agg->attnum = attnum;
@@ -1116,17 +1122,40 @@ dbe_agg_init_one(DbeAggState *agg, Aggref *ref, AttrNumber attnum,
 		elog(ERROR, "dbengine: no se encontró el agregado %u", ref->aggfnoid);
 	aggform = (Form_pg_aggregate) GETSTRUCT(tup);
 
-	agg->transtype = aggform->aggtranstype;
+	/*
+	 * Igual que nodeAgg: el tipo del estado se resuelve contra los tipos de
+	 * entrada (un agregado polimórfico declara anyarray o anyelement), y las
+	 * funciones reciben una expresión con esos tipos en fn_expr.  Sin ella,
+	 * las polimórficas —range_agg, array_agg sobre ciertos tipos— no pueden
+	 * preguntar con get_fn_expr_argtype() qué les llegó, y fallan.
+	 */
+	nargs = get_aggregate_argtypes(ref, inputTypes);
+	agg->transtype = resolve_aggregate_transtype(ref->aggfnoid,
+												 aggform->aggtranstype,
+												 inputTypes, nargs);
 	get_typlenbyval(agg->transtype, &agg->transtyplen, &agg->transtypbyval);
 
+	build_aggregate_transfn_expr(inputTypes, nargs, 0, ref->aggvariadic,
+								 agg->transtype, ref->inputcollid,
+								 aggform->aggtransfn, InvalidOid,
+								 &transfnexpr, NULL);
 	fmgr_info(aggform->aggtransfn, &agg->transfn);
+	fmgr_info_set_expr((Node *) transfnexpr, &agg->transfn);
 	agg->transfn_strict = func_strict(aggform->aggtransfn);
 
 	if (OidIsValid(aggform->aggfinalfn))
 	{
+		Expr	   *finalfnexpr;
+
+		/* Con aggfinalextra la final recibe además un NULL por argumento. */
+		agg->finalfn_nargs = (aggform->aggfinalextra ? nargs + 1 : 1);
+		build_aggregate_finalfn_expr(inputTypes, agg->finalfn_nargs,
+									 agg->transtype, ref->aggtype,
+									 ref->inputcollid, aggform->aggfinalfn,
+									 &finalfnexpr);
 		fmgr_info(aggform->aggfinalfn, &agg->finalfn);
+		fmgr_info_set_expr((Node *) finalfnexpr, &agg->finalfn);
 		agg->has_finalfn = true;
-		agg->finalfn_nargs = (aggform->aggfinalextra ? 2 : 1);
 	}
 
 	agg->skip_final = DO_AGGSPLIT_SKIPFINAL(ref->aggsplit);
@@ -1345,10 +1374,10 @@ dbe_agg_finalize(DbeAggState *agg, bool *isnull, AggState *aggctx)
 							 agg->collation, (Node *) aggctx, NULL);
 	fcinfo->args[0].value = agg->transvalue;
 	fcinfo->args[0].isnull = agg->transnull;
-	if (agg->finalfn_nargs > 1)
+	for (int k = 1; k < agg->finalfn_nargs; k++)
 	{
-		fcinfo->args[1].value = (Datum) 0;
-		fcinfo->args[1].isnull = true;
+		fcinfo->args[k].value = (Datum) 0;
+		fcinfo->args[k].isnull = true;
 	}
 	fcinfo->isnull = false;
 
@@ -1793,7 +1822,12 @@ dbe_vec_value(DbeColumnVector *vec, uint64 row, bool typbyval, int16 typlen,
 		st = dbe_segreader_get(vec->reader, (uint32) row, &data, &len, &vnull);
 		dbe_error_if_not_ok(&st, "leyendo un valor de la columna");
 		*isnull = (vnull != 0);
-		*value = *isnull ? (Datum) 0 : PointerGetDatum(data);
+		if (*isnull)
+			*value = (Datum) 0;
+		else if (typlen == -1)
+			*value = dbe_varlena_datum(data, vec->attalign, vec->cxt);
+		else
+			*value = PointerGetDatum(data);
 	}
 }
 
