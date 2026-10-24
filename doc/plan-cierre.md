@@ -126,14 +126,26 @@ Tres hechos del código que ordenan la lista:
   q19, q33–q35: 6 a 12 s cada una), donde el hash gana apenas
   1,08×–1,23× sobre PostgreSQL.
 
-### C2.0 — Línea base
+### C2.0 — Línea base ✅
 
-- [ ] `perf record -g` sobre q3, q24, q29, q33 y una en frío; flame graphs
-      y reparto por capa (decodificación, airlock, `ExecQual`, hash,
-      funciones de transición, I/O). Re-correr ClickBench completo como
-      referencia de partida en esta máquina.
+- [x] ClickBench completo sin índices como referencia (3,97× media
+      geométrica, 1,83× suma) y `perf` sobre q3, q24, q29, q33 y q21 en
+      frío. Hallazgos en [`doc/perf-linea-base-c2.md`](perf-linea-base-c2.md):
+      **abrir un segmento lo decodifica entero** (48% de q24), el `LIKE` y
+      el regexp dominan la CPU de q21–q24 y q29, y en frío el 75% es
+      espera de I/O. El orden de abajo ya está ajustado a eso.
 
-### C2.1 — Victorias rápidas
+### C2.1 — Lo que encontró el perfil
+
+0. [ ] **Apertura perezosa de segmentos**: el header al abrir; FOR y RLE
+       se expanden cuando se pide el vector, `get(fila)` va directo al dato
+       empacado (FOR en O(1), RLE por búsqueda binaria sobre las corridas),
+       el diccionario FSST se descomprime por entrada a demanda. Además,
+       desempaquetado especializado por ancho (hoy un `memcpy` de libc por
+       valor) y sin rellenar con ceros antes de sobrescribir. Ataca q24 y
+       toda query con muchas columnas y filtro selectivo.
+
+### C2.1b — Victorias rápidas
 
 1. [ ] **Agregados precalculados por stripe (SMA).** Guardar suma exacta
        (`numeric`) y conteo de no nulos por columna numérica, igual que hoy
