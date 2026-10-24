@@ -107,7 +107,7 @@ DBE_STALE = $(filter-out $(DBE_STAMP),$(wildcard .pgbuild-*))
 # compilan o instalan.  Quedan exentos `clean` —si no, un árbol mezclado no
 # se podría destrabar—, los tests del motor, que no tocan Postgres, y
 # `installcheck`, que corre contra lo que ya está instalado.
-ifeq ($(filter clean distclean check-engine check-layering installcheck check-crash check-warnings,$(MAKECMDGOALS)),)
+ifeq ($(filter clean distclean check-engine check-layering installcheck check-crash check-dump check-warnings,$(MAKECMDGOALS)),)
 ifneq ($(DBE_STALE),)
 $(error el árbol tiene objetos de PostgreSQL $(patsubst .pgbuild-%,%,$(DBE_STALE)) \
 y estás compilando contra $(DBE_PG_MAJOR). Corré 'make clean' antes de cambiar de versión)
@@ -119,13 +119,19 @@ endif
 # El motor C++ no necesita Postgres para probarse.  Se compila aparte y se
 # corre contra una referencia exacta; es mucho más rápido que ir y volver por
 # pg_regress, y encuentra otra clase de bugs.
+#
+# DBE_ENGINE_FLAGS agrega flags al build de los tests; el CI lo corre con
+# ASan y UBSan:
+#   make check-engine DBE_ENGINE_FLAGS="-fsanitize=address,undefined -g"
+DBE_ENGINE_FLAGS ?=
+
 .PHONY: check-engine
 check-engine:
-	@$(CXX) -std=$(DBE_CXX_STD) -O2 -Wall -Wextra -I$(CURDIR)/src/include \
+	@$(CXX) -std=$(DBE_CXX_STD) -O2 -Wall -Wextra $(DBE_ENGINE_FLAGS) -I$(CURDIR)/src/include \
 		-o /tmp/dbe-pgm-test $(CURDIR)/test/engine/pgm_test.cpp \
 		$(CURDIR)/src/engine/index/pgm.cpp
 	@/tmp/dbe-pgm-test
-	@$(CXX) -std=$(DBE_CXX_STD) -O2 -Wall -Wextra -I$(CURDIR)/src/include \
+	@$(CXX) -std=$(DBE_CXX_STD) -O2 -Wall -Wextra $(DBE_ENGINE_FLAGS) -I$(CURDIR)/src/include \
 		-o /tmp/dbe-bloom-test $(CURDIR)/test/engine/bloom_test.cpp \
 		$(CURDIR)/src/engine/zonemap/bloom.cpp
 	@/tmp/dbe-bloom-test
@@ -151,6 +157,14 @@ check-warnings:
 check-crash:
 	@PGDATA=$${PGDATA:?falta PGDATA} PGBIN=$${PGBIN:-} \
 		bash $(CURDIR)/test/crash/recovery.sh
+
+# pg_dump de un cluster y restore en otro.  Levanta sus propios dos clusters
+# con los binarios de PGBIN (o los del PATH), así que no necesita el de
+# desarrollo; sí necesita la extensión instalada.
+.PHONY: check-dump
+check-dump:
+	@PGBIN=$${PGBIN:-$$($(PG_CONFIG) --bindir)} \
+		bash $(CURDIR)/test/dump/roundtrip.sh
 
 # --- Guardas de arquitectura -------------------------------------------------
 # Falla el build si alguien rompe la frontera de R2.  La logica esta en un

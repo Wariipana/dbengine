@@ -140,10 +140,13 @@ COMMENT ON TABLE relation_order IS
 	'Se indexa por relfilenode y no por OID: una reescritura cambia el '
 	'storage, y con él el orden.';
 
--- Sin estas tablas en el dump no se puede restaurar una tabla columnar.
-SELECT pg_catalog.pg_extension_config_dump('stripe', '');
-SELECT pg_catalog.pg_extension_config_dump('stripe_column', '');
-SELECT pg_catalog.pg_extension_config_dump('relation_order', '');
+-- Estas tablas NO se marcan con pg_extension_config_dump, a propósito.
+-- pg_dump vuelca los datos de una tabla columnar con COPY, que pasa por el
+-- AM, y el restore los reescribe en stripes nuevos con su propio catálogo.
+-- Las filas de acá están indexadas por relfilenode, que es del cluster de
+-- origen: si viajaran en el dump, en un cluster nuevo chocarían con las que
+-- escribe el restore y la tabla quedaría ilegible (test/dump/roundtrip.sh).
+-- pg_upgrade no pasa por acá: copia los archivos y preserva los relfilenode.
 
 CREATE TABLE row_reservation (
 	relfilenode oid    NOT NULL,
