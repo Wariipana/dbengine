@@ -46,6 +46,32 @@ WHERE relfilenode = pg_relation_filenode('m');
 CREATE TEMP TABLE tids_antes AS
 SELECT a, ctid::text AS tid FROM m;
 
+-- La fusión solo toca stripes anteriores al xmin global del cluster: otra
+-- sesión con una transacción abierta (en cualquier base) la frena, y el test
+-- fallaría sin que haya nada roto.  Se espera a que se vayan las pasajeras
+-- (autovacuum, por ejemplo) y, si alguna sigue, el diff lo dice acá en vez
+-- de mostrar una fusión que "no hizo nada".
+DO $$
+BEGIN
+	FOR i IN 1..600 LOOP
+		PERFORM pg_stat_clear_snapshot();
+		EXIT WHEN NOT EXISTS (
+			SELECT 1 FROM pg_stat_activity
+			WHERE pid <> pg_backend_pid()
+			  AND (backend_xmin IS NOT NULL OR backend_xid IS NOT NULL))
+		  AND NOT EXISTS (SELECT 1 FROM pg_prepared_xacts)
+		  AND NOT EXISTS (SELECT 1 FROM pg_replication_slots
+						  WHERE xmin IS NOT NULL OR catalog_xmin IS NOT NULL);
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END
+$$;
+SELECT NOT EXISTS (
+	SELECT 1 FROM pg_stat_activity
+	WHERE pid <> pg_backend_pid()
+	  AND (backend_xmin IS NOT NULL OR backend_xid IS NOT NULL))
+   AND NOT EXISTS (SELECT 1 FROM pg_prepared_xacts) AS cluster_quieto;
+
 SELECT dbengine.merge_stripes('m') > 0 AS fusiono_algo;
 
 SELECT count(*) AS tids_distintos
