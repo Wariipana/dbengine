@@ -30,7 +30,7 @@
 #define dbe_tupdesc_finalize(td) ((void) 0)
 #endif
 
-#define DBENGINE_VERSION "0.1.0"
+#define DBENGINE_VERSION "0.2.0"
 
 /* --- GUCs (definidas en init.c) ---------------------------------------- */
 extern bool dbe_enable_vectorized;

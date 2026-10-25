@@ -88,7 +88,7 @@ ROLLBACK;
 SELECT dbengine.version() AS motor_vivo_despues_del_rollback;
  motor_vivo_despues_del_rollback 
 ---------------------------------
- 0.1.0
+ 0.2.0
 (1 row)
 
 -- Y un error atrapado en una subtransacción no rompe la transacción externa.
@@ -104,7 +104,7 @@ NOTICE:  subtransacción abortada limpiamente
 SELECT dbengine.version() AS motor_vivo_en_la_misma_transaccion;
  motor_vivo_en_la_misma_transaccion 
 ------------------------------------
- 0.1.0
+ 0.2.0
 (1 row)
 
 COMMIT;

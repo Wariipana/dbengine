@@ -97,6 +97,14 @@ typedef struct DbeSegDesc
 	 */
 	const char *granules;
 	uint32		granules_length;
+
+	/*
+	 * Agregado precalculado (SMA): la suma exacta de los no nulos, como
+	 * numeric.  Solo para smallint, integer y bigint; con eso y null_count
+	 * salen sum, avg y count(col) del stripe sin leer datos.
+	 */
+	bool		has_sum;
+	Datum		sum_value;
 } DbeSegDesc;
 
 /*

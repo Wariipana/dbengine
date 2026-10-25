@@ -52,6 +52,8 @@
 #include "optimizer/pathnode.h"
 #include "optimizer/planner.h"
 #include "parser/parse_agg.h"
+#include "common/int.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
@@ -114,6 +116,15 @@ typedef struct DbeAggState
 	bool		want_min;
 	FmgrInfo	minmax_cmp;
 
+	/*
+	 * sum, avg y count(col) sobre smallint/integer se pueden avanzar de a
+	 * un stripe entero con los agregados precalculados del catálogo (SMA):
+	 * la suma exacta y null_count.  sma_now dice si se hizo con el stripe
+	 * actual, y entonces el recorrido por fila lo saltea.
+	 */
+	uint8		sma;
+	bool		sma_now;
+
 	/* Vista de la columna en el stripe que se está recorriendo. */
 	bool		has_vector;
 	DbeColumnVector vec;
@@ -164,6 +175,7 @@ typedef struct DbeAggParallelShared
 	pg_atomic_uint64 rows_filtered;
 	pg_atomic_uint64 stripes_pruned;
 	pg_atomic_uint64 granules_pruned;
+	pg_atomic_uint64 stripes_sma;
 } DbeAggParallelShared;
 
 typedef struct DbeVectorAggState
@@ -172,6 +184,9 @@ typedef struct DbeVectorAggState
 	DbeAggParallelShared *shared;	/* NULL si el nodo corre serial */
 	bool		only_count_star;
 	bool		only_metadata;	/* todos count(*) o min/max */
+	bool		sma_any;		/* algún agregado admite SMA */
+	int			next_index;		/* próximo stripe del recorrido serial */
+	uint64		stripes_sma;	/* stripes contestados sin leer datos */
 
 	/*
 	 * Contexto de agregación para las funciones de transición.
@@ -1259,6 +1274,172 @@ dbe_agg_detect_minmax(DbeAggState *agg, Oid aggfnoid)
 	agg->is_minmax = true;
 }
 
+/* ------------------------------------------------------------------------
+ * Agregados precalculados (SMA)
+ *
+ * Por cada segmento de smallint, integer o bigint el catálogo guarda la
+ * suma exacta de los no nulos, y siempre guarda null_count.  Con eso un
+ * stripe visible entero aporta a sum, avg y count(col) sin leer un byte:
+ * se arma su estado parcial y se combina con el acumulado, que es lo mismo
+ * que hace el Finalize de un plan paralelo con los parciales de cada
+ * worker.  Ref.: Moerkotte, "Small Materialized Aggregates", VLDB 1998.
+ *
+ * Solo para los agregados cuyo estado se conoce: sum(int2/int4) acumula en
+ * int8, avg(int2/int4) en un int8[2] {cantidad, suma}, count(col) en int8.
+ * sum(int8) y avg(int8) usan un estado interno (numeric/int128) y quedan
+ * fila por fila.
+ * ------------------------------------------------------------------------ */
+
+#define DBE_SMA_NONE	0
+#define DBE_SMA_SUM		1
+#define DBE_SMA_AVG		2
+#define DBE_SMA_COUNT	3
+
+static void
+dbe_agg_detect_sma(DbeAggState *agg, Oid aggfnoid)
+{
+	agg->sma = DBE_SMA_NONE;
+	if (agg->is_count_star || agg->is_distinct || agg->attnum == InvalidAttrNumber)
+		return;
+
+	switch (aggfnoid)
+	{
+		case F_SUM_INT2:
+		case F_SUM_INT4:
+			agg->sma = DBE_SMA_SUM;
+			break;
+		case F_AVG_INT2:
+		case F_AVG_INT4:
+			agg->sma = DBE_SMA_AVG;
+			break;
+		case F_COUNT_ANY:
+			agg->sma = DBE_SMA_COUNT;
+			break;
+	}
+}
+
+/*
+ * Suma un stripe al estado del agregado: `nonnull` valores no nulos que
+ * suman `sum`.  Hace exactamente lo que harían las transiciones fila por
+ * fila, con la misma detección de overflow que int8pl.
+ */
+static void
+dbe_agg_apply_sma(DbeAggState *agg, int64 nonnull, int64 sum)
+{
+	int64		r;
+
+	switch (agg->sma)
+	{
+		case DBE_SMA_COUNT:
+			if (pg_add_s64_overflow(DatumGetInt64(agg->transvalue), nonnull, &r))
+				ereport(ERROR,
+						(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+						 errmsg("bigint out of range")));
+			agg->transvalue = Int64GetDatum(r);
+			break;
+
+		case DBE_SMA_SUM:
+			/* Sin valores no nulos el stripe no aporta: sum() sigue en NULL. */
+			if (nonnull == 0)
+				break;
+			if (agg->transnull)
+				r = sum;
+			else if (pg_add_s64_overflow(DatumGetInt64(agg->transvalue), sum, &r))
+				ereport(ERROR,
+						(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+						 errmsg("bigint out of range")));
+			agg->transvalue = Int64GetDatum(r);
+			agg->transnull = false;
+			agg->nothing_yet = false;
+			break;
+
+		case DBE_SMA_AVG:
+		{
+			/*
+			 * El int8[2] de int4_avg_accum: se modifica en el lugar, igual
+			 * que lo hace esa función cuando corre dentro de un agregado.
+			 */
+			ArrayType  *a = DatumGetArrayTypeP(agg->transvalue);
+			int64	   *d = (int64 *) ARR_DATA_PTR(a);
+
+			if (ARR_HASNULL(a) || ARR_SIZE(a) != ARR_OVERHEAD_NONULLS(1) + 2 * sizeof(int64))
+				elog(ERROR, "dbengine: estado de avg con forma inesperada");
+			d[0] += nonnull;
+			d[1] += sum;
+			break;
+		}
+	}
+}
+
+/*
+ * ¿Se puede avanzar el stripe `idx` desde el catálogo?  Marca sma_now en
+ * cada agregado que sí, y devuelve true si TODOS pudieron —entonces ya
+ * quedaron avanzados y no hace falta leer el stripe—.  Si solo algunos,
+ * esos se avanzan igual y el recorrido por fila los saltea.
+ */
+static bool
+dbe_agg_stripe_sma(DbeVectorAggState *state, int idx)
+{
+	DbeSegDesc *segs = (DbeSegDesc *) palloc(sizeof(DbeSegDesc) * state->naggs);
+	uint64		rows = 0;
+	bool		all = true;
+	int			i;
+
+	/*
+	 * dbe_cursor_stripe_segment() ya exige que el stripe sea visible entero
+	 * para el snapshot, así que con un solo agregado que pase alcanza para
+	 * saber que el row_count del stripe vale como count(*).
+	 */
+	for (i = 0; i < state->naggs; i++)
+	{
+		DbeAggState *agg = &state->aggs[i];
+
+		agg->sma_now = false;
+		if (agg->is_count_star || agg->is_group)
+			continue;
+		if (agg->sma != DBE_SMA_NONE &&
+			dbe_cursor_stripe_segment(state->cursor, idx, agg->attnum,
+									  &segs[i], &rows) &&
+			(agg->sma == DBE_SMA_COUNT || segs[i].has_sum ||
+			 segs[i].null_count >= rows))
+			agg->sma_now = true;
+		else
+			all = false;
+	}
+
+	for (i = 0; i < state->naggs; i++)
+	{
+		DbeAggState *agg = &state->aggs[i];
+		int64		sum = 0;
+
+		/*
+		 * count(*) sale del catálogo solo si el stripe entero se contesta
+		 * así: si hay que leerlo, lo cuenta el recorrido por fila.
+		 */
+		if (agg->is_count_star)
+		{
+			if (all)
+				agg->count += (int64) rows;
+			continue;
+		}
+		if (!agg->sma_now)
+			continue;
+
+		if (segs[i].has_sum)
+			sum = DatumGetInt64(DirectFunctionCall1(numeric_int8,
+													segs[i].sum_value));
+		dbe_agg_apply_sma(agg, (int64) (rows - segs[i].null_count), sum);
+	}
+
+	pfree(segs);
+	if (all)
+	{
+		state->rows_seen += rows;
+		state->stripes_sma++;
+	}
+	return all;
+}
+
 static void
 dbe_agg_advance(DbeAggState *agg, Datum value, bool isnull, MemoryContext cxt,
 				AggState *aggctx)
@@ -1718,6 +1899,9 @@ dbe_agg_begin(CustomScanState *node, EState *estate, int eflags)
 		if (agg->is_group)
 			continue;
 		dbe_agg_detect_minmax(agg, ((Aggref *) tle->expr)->aggfnoid);
+		dbe_agg_detect_sma(agg, ((Aggref *) tle->expr)->aggfnoid);
+		if (agg->sma != DBE_SMA_NONE)
+			state->sma_any = true;
 	}
 
 	state->only_count_star = true;
@@ -2394,6 +2578,23 @@ dbe_agg_take_stripe(DbeVectorAggState *state)
 	return DBE_TAKE_STRIPE;
 }
 
+/*
+ * El próximo stripe a recorrer, sin cargarlo: -1 si no quedan.  Serial,
+ * el siguiente en orden; en paralelo, el que toque del contador compartido.
+ */
+static int
+dbe_agg_claim_index(DbeVectorAggState *state)
+{
+	uint64		idx;
+
+	if (state->shared == NULL)
+		idx = (uint64) state->next_index++;
+	else
+		idx = pg_atomic_fetch_add_u64(&state->shared->next_stripe, 1);
+
+	return idx < (uint64) dbe_cursor_nstripes(state->cursor) ? (int) idx : -1;
+}
+
 static bool
 dbe_agg_is_partial(DbeVectorAggState *state)
 {
@@ -2654,7 +2855,26 @@ dbe_agg_exec(CustomScanState *node)
 		bool		all_visible;
 		uint64		row;
 
-		take = dbe_agg_take_stripe(state);
+		/*
+		 * Sin WHERE, un stripe visible entero puede contestarse desde el
+		 * catálogo: si todos los agregados salen de ahí, ni se lee.  Para
+		 * eso hay que decidir ANTES de cargarlo, así que el índice del
+		 * stripe se reserva acá y no adentro de dbe_agg_take_stripe().
+		 */
+		if (state->sma_any && state->qual == NULL)
+		{
+			int			idx = dbe_agg_claim_index(state);
+
+			if (idx < 0)
+				break;
+			if (dbe_agg_stripe_sma(state, idx))
+				continue;
+			take = dbe_cursor_set_stripe(state->cursor, idx) &&
+				dbe_cursor_stripe_has_pending(state->cursor)
+				? DBE_TAKE_STRIPE : DBE_TAKE_SKIP;
+		}
+		else
+			take = dbe_agg_take_stripe(state);
 		if (take == DBE_TAKE_DONE)
 			break;
 		if (take == DBE_TAKE_SKIP)
@@ -2667,7 +2887,8 @@ dbe_agg_exec(CustomScanState *node)
 		{
 			DbeAggState *agg = &state->aggs[i];
 
-			agg->has_vector = !agg->is_count_star &&
+			/* Los que ya avanzó el SMA no necesitan la columna. */
+			agg->has_vector = !agg->is_count_star && !agg->sma_now &&
 				dbe_cursor_column(state->cursor, agg->attnum, &agg->vec);
 		}
 
@@ -2706,6 +2927,8 @@ dbe_agg_exec(CustomScanState *node)
 					agg->count++;
 					continue;
 				}
+				if (agg->sma_now)
+					continue;
 				if (!agg->has_vector)
 				{
 					dbe_agg_missing_value(state, agg->attnum, &value, &isnull);
@@ -2830,6 +3053,8 @@ dbe_agg_rescan(CustomScanState *node)
 	state->rows_filtered = 0;
 	state->stripes_pruned = 0;
 	state->granules_pruned = 0;
+	state->stripes_sma = 0;
+	state->next_index = 0;
 	state->published = false;
 	state->totals_ready = false;
 	dbe_cursor_rescan(state->cursor);
@@ -2860,6 +3085,7 @@ dbe_agg_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	pg_atomic_init_u64(&shared->rows_filtered, 0);
 	pg_atomic_init_u64(&shared->stripes_pruned, 0);
 	pg_atomic_init_u64(&shared->granules_pruned, 0);
+	pg_atomic_init_u64(&shared->stripes_sma, 0);
 	state->shared = shared;
 }
 
@@ -2878,6 +3104,7 @@ dbe_agg_shutdown(CustomScanState *node)
 
 	pg_atomic_fetch_add_u64(&state->shared->rows_seen, state->rows_seen);
 	pg_atomic_fetch_add_u64(&state->shared->rows_filtered, state->rows_filtered);
+	pg_atomic_fetch_add_u64(&state->shared->stripes_sma, state->stripes_sma);
 	if (state->cursor != NULL)
 	{
 		pg_atomic_fetch_add_u64(&state->shared->stripes_pruned,
@@ -2893,6 +3120,7 @@ dbe_agg_shutdown(CustomScanState *node)
 		state->rows_filtered = pg_atomic_read_u64(&state->shared->rows_filtered);
 		state->stripes_pruned = pg_atomic_read_u64(&state->shared->stripes_pruned);
 		state->granules_pruned = pg_atomic_read_u64(&state->shared->granules_pruned);
+		state->stripes_sma = pg_atomic_read_u64(&state->shared->stripes_sma);
 		state->totals_ready = true;
 	}
 }
@@ -2908,6 +3136,7 @@ dbe_agg_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	pg_atomic_write_u64(&shared->rows_filtered, 0);
 	pg_atomic_write_u64(&shared->stripes_pruned, 0);
 	pg_atomic_write_u64(&shared->granules_pruned, 0);
+	pg_atomic_write_u64(&shared->stripes_sma, 0);
 }
 
 static void
@@ -2961,6 +3190,9 @@ dbe_agg_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 	{
 		ExplainPropertyInteger("Filas agregadas", NULL,
 							   (int64) state->rows_seen, es);
+		if (state->stripes_sma > 0 || (state->sma_any && es->format != EXPLAIN_FORMAT_TEXT))
+			ExplainPropertyInteger("Stripes desde metadatos", NULL,
+								   (int64) state->stripes_sma, es);
 		if (quals != NIL)
 		{
 			ExplainPropertyInteger("Filas descartadas por el filtro", NULL,

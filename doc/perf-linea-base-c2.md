@@ -135,3 +135,18 @@ Lo que encontró la medición: q21 pedía 274 MB y el disco leía 532. Con
 entero y trae las columnas de al lado. Con `FADV_RANDOM` se lee del disco
 exactamente lo pedido (271 MB). q24 (las 105 columnas) no cambia: lee la
 tabla entera y está en el techo del disco.
+
+## Resultado: agregados precalculados (C2.1b, ítem 1)
+
+q3 (`SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth)`, los dos smallint):
+473 → 14,5 ms. Los 153 stripes salen del catálogo (`Stripes desde
+metadatos: 153` en el EXPLAIN ANALYZE) y no se lee un byte de datos; lo que
+queda son las lecturas del catálogo.
+
+Para medirlo hubo que recargar la tabla: los stripes escritos con 0.1.0 no
+tienen la suma. Primero la copié de `hits_heap` con `INSERT ... SELECT`, y
+el orden físico salió distinto al del TSV (9.998.803 de 10M filas en otra
+posición, 1830 MB contra 1785 MB) aun con `synchronize_seqscans` apagado.
+Recargada desde el TSV como `run.sh`, quedó idéntica fila por fila.
+
+Las 43 contra la línea base: media geométrica 0,815, suma 97,0 s.

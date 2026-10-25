@@ -430,6 +430,46 @@ dbe_cursor_stripe_zonemap(DbeRowCursor *cur, int stripe_index,
 	return ok;
 }
 
+bool
+dbe_cursor_stripe_segment(DbeRowCursor *cur, int stripe_index,
+						  AttrNumber attnum, DbeSegDesc *out, uint64 *rows)
+{
+	DbeStripeDesc *stripe;
+	DbeSegDesc *segs;
+	bool	   *found;
+	bool	   *wanted;
+	bool		ok;
+
+	if (stripe_index < 0 || stripe_index >= cur->nstripes ||
+		attnum < 1 || attnum > cur->natts)
+		return false;
+
+	stripe = (DbeStripeDesc *) list_nth(cur->stripes, stripe_index);
+	if (dbe_stripe_visible(stripe, cur->snapshot) != DBE_STRIPE_ALL)
+		return false;
+
+	segs = (DbeSegDesc *) palloc0(sizeof(DbeSegDesc) * cur->natts);
+	found = (bool *) palloc0(sizeof(bool) * cur->natts);
+	wanted = (bool *) palloc0(sizeof(bool) * cur->natts);
+	wanted[attnum - 1] = true;
+
+	dbe_catalog_load_segments_ext(cur->rel->rd_locator.relNumber,
+								  stripe->stripe_id, cur->natts, wanted, NULL,
+								  cur->catalog_snapshot, segs, found);
+
+	ok = found[attnum - 1];
+	if (ok)
+	{
+		*out = segs[attnum - 1];
+		*rows = stripe->row_count;
+	}
+
+	pfree(found);
+	pfree(wanted);
+	/* segs no se libera: out apunta adentro. */
+	return ok;
+}
+
 uint64
 dbe_cursor_count_rows(DbeRowCursor *cur)
 {

@@ -23,6 +23,7 @@
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
+#include "utils/numeric.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
@@ -57,7 +58,8 @@
 #define Anum_seg_max_value			9
 #define Anum_seg_bloom				10
 #define Anum_seg_granules			11
-#define Natts_seg					11
+#define Anum_seg_sum_value			12
+#define Natts_seg					12
 
 /*
  * Verifica que la tabla del catálogo tenga la forma que este código espera.
@@ -80,8 +82,7 @@ dbe_check_catalog_shape(Relation rel, int expected)
 						RelationGetRelationName(rel),
 						RelationGetDescr(rel)->natts, expected),
 				 errhint("La extensión instalada no coincide con la biblioteca. "
-						 "Recreala con DROP EXTENSION dbengine CASCADE; "
-						 "CREATE EXTENSION dbengine;")));
+						 "Actualizala con ALTER EXTENSION dbengine UPDATE.")));
 }
 
 /* bytea a partir de bytes crudos; no hay helper en el core para esto. */
@@ -398,6 +399,11 @@ dbe_catalog_insert_segment(RelFileNumber relnumber, uint64 stripe_id, const DbeS
 	else
 		nulls[Anum_seg_granules - 1] = true;
 
+	if (seg->has_sum)
+		values[Anum_seg_sum_value - 1] = seg->sum_value;
+	else
+		nulls[Anum_seg_sum_value - 1] = true;
+
 	rel = table_open(dbe_stripe_column_relid(), RowExclusiveLock);
 	dbe_check_catalog_shape(rel, Natts_seg);
 	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
@@ -551,6 +557,10 @@ dbe_catalog_scan_segments(RelFileNumber relnumber, uint64 stripe_id,
 		out[attnum - 1].null_count = (uint64) DatumGetInt64(values[Anum_seg_null_count - 1]);
 		out[attnum - 1].encoding = DatumGetInt16(values[Anum_seg_encoding - 1]);
 		out[attnum - 1].has_minmax = !nulls[Anum_seg_min_value - 1];
+		out[attnum - 1].has_sum = !nulls[Anum_seg_sum_value - 1];
+		if (out[attnum - 1].has_sum)
+			out[attnum - 1].sum_value =
+				PointerGetDatum(DatumGetNumericCopy(values[Anum_seg_sum_value - 1]));
 
 		if (out[attnum - 1].has_minmax)
 		{

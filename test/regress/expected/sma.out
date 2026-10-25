@@ -1,0 +1,135 @@
+--
+-- Agregados precalculados por segmento (SMA, C2).
+--
+-- sum, avg y count(col) sobre smallint/integer se contestan con la suma
+-- exacta y el null_count del catálogo, sin leer el stripe.  Todo se compara
+-- contra heap: los casos son los que podrían romper el atajo.
+--
+-- La ruta de actualización: 0.1.0 no tenía la columna de la suma.
+CREATE EXTENSION dbengine VERSION '0.1.0';
+ALTER EXTENSION dbengine UPDATE;
+SELECT extversion FROM pg_extension WHERE extname = 'dbengine';
+ extversion 
+------------
+ 0.2.0
+(1 row)
+
+SELECT count(*) AS tiene_sum_value FROM pg_attribute
+WHERE attrelid = 'dbengine.stripe_column'::regclass AND attname = 'sum_value';
+ tiene_sum_value 
+-----------------
+               1
+(1 row)
+
+SET max_parallel_workers_per_gather = 0;
+CREATE TABLE sm (a int2, b int4, c int8, t text) USING dbengine_columnar;
+-- Un stripe por INSERT: con nulos, sin nulos, todo nulo, negativos.
+INSERT INTO sm SELECT g % 100, g * 3, g, 'x' FROM generate_series(1, 5000) g;
+INSERT INTO sm SELECT CASE WHEN g % 3 = 0 THEN NULL ELSE -g % 50 END,
+                      CASE WHEN g % 5 = 0 THEN NULL ELSE 2000000000 END, NULL, NULL
+FROM generate_series(1, 4000) g;
+INSERT INTO sm SELECT NULL, NULL, NULL, NULL FROM generate_series(1, 300);
+INSERT INTO sm VALUES (32767, 2147483647, 9223372036854775807, 'max');
+CREATE TABLE sm_heap AS SELECT * FROM sm;
+-- La suma se guarda para los enteros y no para el texto.
+SELECT a.attname, count(*) AS stripes, count(sc.sum_value) AS con_suma
+FROM dbengine.stripe_column sc
+JOIN pg_attribute a ON a.attrelid = 'sm'::regclass AND a.attnum = sc.attnum
+WHERE sc.relfilenode = pg_relation_filenode('sm')
+GROUP BY a.attname ORDER BY a.attname;
+ attname | stripes | con_suma 
+---------+---------+----------
+ a       |       4 |        3
+ b       |       4 |        3
+ c       |       4 |        2
+ t       |       4 |        0
+(4 rows)
+
+-- Sin WHERE: los stripes salen enteros del catálogo.
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT sum(a), avg(b), count(t), count(*) FROM sm;
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Custom Scan (DbengineVectorAgg) on sm (actual rows=1.00 loops=1)
+   Agregados empujados al scan: 4
+   Filas agregadas: 9301
+   Stripes desde metadatos: 4
+(4 rows)
+
+SELECT sum(a), sum(b), avg(a), avg(b), count(a), count(b), count(c), count(t), count(*)
+FROM sm;
+  sum   |      sum      |         avg         |        avg         | count | count | count | count | count 
+--------+---------------+---------------------+--------------------+-------+-------+-------+-------+-------
+ 214950 | 6402184991147 | 28.0320813771517997 | 780659064.88806243 |  7668 |  8201 |  5001 |  5001 |  9301
+(1 row)
+
+SELECT sum(a), sum(b), avg(a), avg(b), count(a), count(b), count(c), count(t), count(*)
+FROM sm_heap;
+  sum   |      sum      |         avg         |        avg         | count | count | count | count | count 
+--------+---------------+---------------------+--------------------+-------+-------+-------+-------+-------
+ 214950 | 6402184991147 | 28.0320813771517997 | 780659064.88806243 |  7668 |  8201 |  5001 |  5001 |  9301
+(1 row)
+
+-- Mezclado con agregados que no tienen SMA: esos leen el stripe y los
+-- demás igual salen del catálogo.
+SELECT sum(b), avg(a), sum(c), min(t), max(a) FROM sm;
+      sum      |         avg         |         sum         | min |  max  
+---------------+---------------------+---------------------+-----+-------
+ 6402184991147 | 28.0320813771517997 | 9223372036867278307 | max | 32767
+(1 row)
+
+SELECT sum(b), avg(a), sum(c), min(t), max(a) FROM sm_heap;
+      sum      |         avg         |         sum         | min |  max  
+---------------+---------------------+---------------------+-----+-------
+ 6402184991147 | 28.0320813771517997 | 9223372036867278307 | max | 32767
+(1 row)
+
+-- Con WHERE no aplica: el catálogo describe todas las filas del stripe.
+SELECT sum(b), count(a) FROM sm WHERE b > 100;
+      sum      | count 
+---------------+-------
+ 6402184989464 |  7101
+(1 row)
+
+SELECT sum(b), count(a) FROM sm_heap WHERE b > 100;
+      sum      | count 
+---------------+-------
+ 6402184989464 |  7101
+(1 row)
+
+-- Filas que este snapshot todavía no ve como de otro comando: dentro de
+-- la misma transacción, el stripe nuevo es de visibilidad parcial y se
+-- recorre fila por fila.
+BEGIN;
+INSERT INTO sm VALUES (1, 1, 1, 'y');
+SELECT sum(b), count(a), count(*) FROM sm;
+      sum      | count | count 
+---------------+-------+-------
+ 6402184991148 |  7669 |  9302
+(1 row)
+
+ROLLBACK;
+SELECT sum(b), count(a), count(*) FROM sm;
+      sum      | count | count 
+---------------+-------+-------
+ 6402184991147 |  7668 |  9301
+(1 row)
+
+-- Una tabla sin filas y una con un solo stripe todo nulo.
+CREATE TABLE sm_vacia (a int4) USING dbengine_columnar;
+SELECT sum(a), avg(a), count(a), count(*) FROM sm_vacia;
+ sum | avg | count | count 
+-----+-----+-------+-------
+     |     |     0 |     0
+(1 row)
+
+INSERT INTO sm_vacia SELECT NULL FROM generate_series(1, 10);
+SELECT sum(a), avg(a), count(a), count(*) FROM sm_vacia;
+ sum | avg | count | count 
+-----+-----+-------+-------
+     |     |     0 |    10
+(1 row)
+
+DROP TABLE sm, sm_heap, sm_vacia;
+RESET max_parallel_workers_per_gather;
+DROP EXTENSION dbengine CASCADE;

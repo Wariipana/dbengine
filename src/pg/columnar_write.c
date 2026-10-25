@@ -55,6 +55,8 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/datum.h"
+#include "utils/fmgrprotos.h"
+#include "utils/numeric.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
@@ -94,6 +96,16 @@ typedef struct DbeZoneMapAcc
 	 * tipos donde el descarte por rango sirve.
 	 */
 	bool		gran_usable;
+
+	/*
+	 * Suma exacta de los no nulos, para smallint, integer y bigint (SMA).
+	 * int128 alcanza siempre: un stripe tiene a lo sumo unos millones de
+	 * filas y cada valor entra en 64 bits.
+	 */
+	bool		sum_usable;
+	Oid			sum_typid;
+	int128		sum;
+
 	uint64		nrows;			/* filas vistas, nulos incluidos */
 	uint32		gran_count;
 	uint32		gran_capacity;
@@ -243,6 +255,10 @@ dbe_zonemap_init(DbeZoneMapAcc *zm, Form_pg_attribute att, MemoryContext cxt)
 	zm->gran_usable = att->attbyval &&
 		(att->attlen == 1 || att->attlen == 2 ||
 		 att->attlen == 4 || att->attlen == 8);
+
+	zm->sum_typid = att->atttypid;
+	zm->sum_usable = att->atttypid == INT2OID || att->atttypid == INT4OID ||
+		att->atttypid == INT8OID;
 }
 
 /*
@@ -422,6 +438,11 @@ dbe_zonemap_add(DbeZoneMapAcc *zm, Datum value, bool isnull, MemoryContext cxt)
 
 	dbe_zonemap_granule_add(zm, value, isnull, cxt);
 
+	if (zm->sum_usable && !isnull)
+		zm->sum += zm->sum_typid == INT2OID ? DatumGetInt16(value)
+			: zm->sum_typid == INT4OID ? DatumGetInt32(value)
+			: DatumGetInt64(value);
+
 	if (!zm->usable || isnull)
 		return;
 
@@ -485,10 +506,48 @@ dbe_zonemap_value_bytes(const DbeZoneMapAcc *zm, Datum value,
 	}
 }
 
+/*
+ * int128 a numeric.  El core no lo exporta (int128_to_numeric es static en
+ * numeric.c), así que se arma con las dos mitades: alto * 2^64 + bajo.
+ * Casi siempre entra en int64 y es una sola llamada; se hace una vez por
+ * segmento.
+ */
+static Datum
+dbe_int128_numeric(int128 v)
+{
+	int64		hi = (int64) (v >> 64);
+	uint64		lo = (uint64) v;
+	Datum		two32;
+	Datum		num_hi;
+	Datum		num_lo;
+
+	if (v >= PG_INT64_MIN && v <= PG_INT64_MAX)
+		return NumericGetDatum(int64_to_numeric((int64) v));
+
+	two32 = NumericGetDatum(int64_to_numeric((int64) 1 << 32));
+	num_hi = DirectFunctionCall2(numeric_mul,
+								 DirectFunctionCall2(numeric_mul,
+													 NumericGetDatum(int64_to_numeric(hi)),
+													 two32),
+								 two32);
+	/* lo no entra en int64 con signo: (lo / 2) * 2 + lo % 2. */
+	num_lo = DirectFunctionCall2(numeric_add,
+								 DirectFunctionCall2(numeric_mul,
+													 NumericGetDatum(int64_to_numeric((int64) (lo >> 1))),
+													 NumericGetDatum(int64_to_numeric(2))),
+								 NumericGetDatum(int64_to_numeric((int64) (lo & 1))));
+	return DirectFunctionCall2(numeric_add, num_hi, num_lo);
+}
+
 static void
 dbe_zonemap_finish(DbeZoneMapAcc *zm, DbeSegDesc *seg)
 {
 	seg->has_minmax = false;
+
+	/* Sin valores no nulos la suma es NULL, como la de SQL. */
+	seg->has_sum = zm->sum_usable && zm->nrows > seg->null_count;
+	if (seg->has_sum)
+		seg->sum_value = dbe_int128_numeric(zm->sum);
 
 	if (!zm->usable || !zm->seen)
 		return;

@@ -239,6 +239,16 @@ extern bool dbe_cursor_column(DbeRowCursor *cur, AttrNumber attnum,
 extern DbeSegReader *dbe_cursor_reader(DbeRowCursor *cur, AttrNumber attnum,
 									   uint64 *generation);
 
+/*
+ * El descriptor del segmento de una columna en el stripe `stripe_index`,
+ * sin cargar el stripe.  false si el stripe no es visible entero para el
+ * snapshot del cursor —sus metadatos describirían filas que no ve— o si no
+ * tiene segmento para esa columna.
+ */
+extern bool dbe_cursor_stripe_segment(DbeRowCursor *cur, int stripe_index,
+									  AttrNumber attnum, DbeSegDesc *out,
+									  uint64 *rows);
+
 /* Cuántos stripes ve el cursor; lo usa el scan paralelo. */
 extern int	dbe_cursor_nstripes(DbeRowCursor *cur);
 /* Metadatos del stripe `index`; NULL si está fuera de rango. */

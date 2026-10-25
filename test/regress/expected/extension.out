@@ -3,7 +3,7 @@ CREATE EXTENSION dbengine;
 SELECT dbengine.version();
  version 
 ---------
- 0.1.0
+ 0.2.0
 (1 row)
 
 -- dbengine.preloaded() tiene que coincidir con la realidad del cluster,

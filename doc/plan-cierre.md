@@ -156,14 +156,23 @@ Tres hechos del código que ordenan la lista:
 
 ### C2.1b — Victorias rápidas
 
-1. [ ] **Agregados precalculados por stripe (SMA).** Guardar suma exacta
-       (`numeric`) y conteo de no nulos por columna numérica, igual que hoy
-       `row_count` y min/max. `sum`/`avg`/`count(x)` sin filtro salen del
-       catálogo; `sum(x + k)` = `sum(x) + k·count(x)` (q30: 90 sumas, 5,1 s).
-       Y la regla del **stripe que cumple entero**: si el zone map prueba
-       que todas sus filas pasan el `WHERE`, se usan los metadatos sin
-       evaluar nada — hoy un `WHERE` apaga todos los atajos. Ataca q30, q3,
-       q4, q2, q8. Ref.: Moerkotte, *Small Materialized Aggregates*, VLDB 1998.
+1. [~] **Agregados precalculados por stripe (SMA).** Ref.: Moerkotte,
+       *Small Materialized Aggregates*, VLDB 1998.
+       - [x] `stripe_column.sum_value` (numeric, suma exacta en int128) para
+         smallint, integer y bigint; extensión 0.2.0 con upgrade desde
+         0.1.0 (los stripes viejos quedan con NULL y se leen fila por
+         fila). En VectorAgg sin `WHERE`, un stripe visible entero avanza
+         `sum`/`avg` de int2/int4 y `count(col)` de cualquier tipo con su
+         estado parcial, como lo combinaría un Finalize; si todos los
+         agregados salen así, el stripe ni se lee. **q3 473 → 14,5 ms**.
+         Las 43 contra la línea base: media geométrica 0,815.
+       - [ ] `sum`/`avg` de int8 (q4): el estado es interno (int128); hay
+         que armarlo con su serialización.
+       - [ ] `sum(x + k)` = `sum(x) + k·count(x)` (q30: 90 sumas, 5,1 s): el
+         pushdown todavía no acepta expresiones como argumento.
+       - [ ] La regla del **stripe que cumple entero**: si el zone map
+         prueba que todas sus filas pasan el `WHERE`, se usan los metadatos
+         sin evaluar nada (q2, q8).
 2. [x] **`read_stream` + AIO de PG 18** en la carga del stripe: todos los
        segmentos que pide la query en un solo stream (`READ_STREAM_FULL`),
        con `dbe_storage_read_ranges`. Lo que más pesaba en frío no era la
