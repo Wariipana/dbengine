@@ -180,3 +180,18 @@ Merge junta: **q9 6.261 → 1.068 ms (5,9×)**, q11 489 → 219 ms, q12
 que sí cuentan repeticiones; siguen siendo Sort/HashAggregate de Postgres.
 
 Las 43 contra la línea base: media geométrica 0,655, suma 109,9 → 85,7 s.
+
+## Resultado: GROUP BY por hash aunque no entre en work_mem
+
+El agregado vectorizado agrupa por hash solo como agregado parcial debajo
+de un Finalize, y al pasarse de memoria emite lo que tiene y sigue. Aun así
+el planner no lo ofrecía si la estimación de grupos no entraba en
+`work_mem`, que dejaba afuera los GROUP BY de texto con muchos valores:
+q34 agrupa 10M URLs en 2,6M grupos. Ahora se ofrece si entra en memoria o
+si se espera que el parcial reduzca las filas al menos a la mitad; sin eso
+el Finalize recibe todo y su hash vuelca a disco (q32, 1,37M grupos en
+1,37M filas, fue 1,28× más lento hasta poner la condición).
+
+q16 2,66 → 1,54 s, q18 2,46 → 1,59 s, q34 7,15 → 5,14 s, q15 1,61 → 1,25 s,
+q37 524 → 366 ms, q39 128 → 45 ms, q41 93 → 58 ms. Las 43 contra la línea
+base: media geométrica 0,604, suma 109,9 → 80,4 s.

@@ -230,6 +230,10 @@ Tres hechos del código que ordenan la lista:
          ignoran duplicados, exacto por stripe y con Gather Merge en
          paralelo. GUC `dbengine.enable_scan_dedup`. **q9 6,26 → 1,07 s**,
          q11 y q12 2,2×. Las 43: media geométrica 0,655, suma 85,7 s.
+       - [x] **GROUP BY por hash aunque no entre en work_mem**: el parcial
+         vuelca solo, así que se ofrece si entra en memoria o si reduce al
+         menos a la mitad. q16 1,73×, q18 1,54×, q34 1,39×, q39 2,8×. Las
+         43: media geométrica 0,604, suma 80,4 s.
 6. [ ] **`LIKE` sobre FSST sin descomprimir** (autómata sobre los códigos
        de símbolo): 2,5×–17× sobre descomprimir y comparar según Pop, Riedl
        y Neumann (TUM). Vortex lo implementa para `prefix%` y `%needle%`,

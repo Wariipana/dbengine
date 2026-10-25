@@ -1019,14 +1019,13 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		return;
 
 	/*
-	 * La versión con hash no vuelca a disco, así que no se ofrece si la
-	 * tabla no entra en work_mem.  nodeAgg sí sabe volcar: cuando la
-	 * estimación no da, el plan normal es el correcto y no hay por qué
-	 * competirle con algo que se va a comer la memoria.
-	 *
-	 * La estimación es grosera a propósito —la clave del grupo más el
-	 * estado de cada agregado, redondeado para arriba— porque errar por
-	 * poco no cambia la decisión y errar por mucho ya lo cubre el margen.
+	 * La versión con hash se ofrece aunque la estimación de grupos no entre
+	 * en work_mem: solo existe como agregado parcial debajo de un Finalize
+	 * (ver más abajo), y al pasarse del presupuesto emite lo que tiene y
+	 * sigue con la tabla vacía.  Antes se descartaba si no entraba, y eso
+	 * dejaba afuera justo los GROUP BY de texto con muchos valores —q34 y
+	 * q35 agrupan 10M filas en 2,6M URLs—, donde agrupar por el código del
+	 * diccionario es lo que más rinde.
 	 */
 	if (grouped)
 	{
@@ -1041,13 +1040,25 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		ngroups = estimate_num_groups(root, gexprs, input_path->rows,
 									  NULL, NULL);
 
+		/*
+		 * Con casi un grupo por fila el parcial no reduce nada: el Finalize
+		 * recibe todas las filas y, si no le entran en memoria, su
+		 * HashAggregate vuelca a disco.  En q32 —1,37M grupos en 1,37M
+		 * filas— eso fue 1,28× más lento que el plan normal, que ordena.
+		 * Así que se ofrece si la tabla entra en work_mem, donde no hay
+		 * volcado que temer, o si se espera al menos reducir a la mitad.
+		 * La estimación de memoria es grosera a propósito —la clave del
+		 * grupo más el estado de cada agregado, redondeado para arriba—
+		 * porque errar por poco no cambia la decisión.
+		 */
 		if (hashed)
 		{
 			Size		per_group = sizeof(MinimalTupleData) + 64 +
 				sizeof(Datum) * 4 * list_length(agg_attnums);
+			bool		fits = ngroups * (double) per_group <=
+				(double) work_mem * 1024.0;
 
-			if (ngroups <= 0 || ngroups * (double) per_group >
-				(double) work_mem * 1024.0)
+			if (!fits && ngroups > input_path->rows * 0.5)
 				return;
 		}
 	}
