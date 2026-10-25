@@ -16,6 +16,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "dbengine/engine/engine.hpp"
@@ -52,11 +53,12 @@ enum SegmentEncoding : uint8_t
 ///                          COMPRIMIDO; data = [u32 largo de la tabla de
 ///                          símbolos][tabla][diccionario comprimido][códigos]
 ///
-/// FSST comprime el CONTENIDO del diccionario, no valor por valor: se
-/// descomprime entero una vez al abrir el segmento y de ahí en más el acceso
-/// es idéntico a kEncDict.  Medido sobre ClickBench el diccionario baja 1,6×
-/// a 2,0× y descomprimirlo cuesta 0,53 s para un scan completo de las tres
-/// columnas de texto, contra 7,8 s de I/O que ahorra en frío.
+/// FSST comprime el CONTENIDO del diccionario, no valor por valor: cada
+/// entrada se descomprime la primera vez que alguien la pide y de ahí en
+/// más el acceso es idéntico a kEncDict.  Medido sobre ClickBench el
+/// diccionario baja 1,6× a 2,0× y descomprimirlo entero cuesta 0,53 s para
+/// un scan completo de las tres columnas de texto, contra 7,8 s de I/O que
+/// ahorra en frío.
 ///
 /// Los nulos ocupan lugar igual: un slot en cero si es de ancho fijo, un
 /// rango vacío si es variable.  Cuesta espacio y compra acceso aleatorio
@@ -142,14 +144,23 @@ private:
 	EncodingChoice choice_;
 };
 
-/// Lee un segmento serializado.  Para kEncNone y kEncDict apunta adentro
-/// del buffer que le pasan, que tiene que sobrevivir al reader.  Para las
-/// codificaciones que no dan acceso aleatorio directo (RLE, FOR) expande el
-/// cuerpo una vez al abrirlo.
+/// Lee un segmento serializado.  Apunta adentro del buffer que le pasan,
+/// que tiene que sobrevivir al reader.
+///
+/// Abrir un segmento solo valida el header: nada se decodifica hasta que
+/// alguien lo pide.  get() de una fila de FOR o RLE decodifica ese valor
+/// solo; vector() expande el segmento entero, una vez.  Una entrada del
+/// diccionario FSST se descomprime la primera vez que se lee.  Antes todo
+/// eso se hacía al abrir, y en un `SELECT *` con filtro selectivo era la
+/// mitad del tiempo: se decodificaban 65.536 valores de cada columna para
+/// devolver diez filas.
+struct FsstDecoder;				///< envuelve fsst_decoder_t; definido en segment.cpp
+
 class SegmentReader
 {
 public:
 	SegmentReader(const uint8_t *bytes, uint32_t len);
+	~SegmentReader();
 
 	uint32_t	row_count() const noexcept { return header_.row_count; }
 	uint8_t		encoding() const noexcept { return header_.encoding; }
@@ -181,18 +192,49 @@ public:
 						   uint32_t *len) const;
 
 private:
-	void		materialize_rle(const uint8_t *data, uint32_t len);
-	void		materialize_for(const uint8_t *data, uint32_t len);
+	/// Slot de la fila en el buffer de valores decodificados.  Se reserva
+	/// sin inicializar: las páginas que nadie toca no cuestan nada.
+	uint8_t    *slot(uint32_t row) const;
+	void		expand() const;
+	void		build_runs() const;
+	uint32_t	run_of(uint32_t row) const;
+	void		load_fsst(const uint8_t *data, uint32_t len);
+	void		fsst_entry(uint32_t idx, const uint8_t **data,
+						   uint32_t *len) const;
 
 	SegmentHeader header_;
 	const uint8_t *nulls_ = nullptr;
 	const uint32_t *offsets_ = nullptr;
 	const uint8_t *data_ = nullptr;
-	std::vector<uint8_t> expanded_;	///< usado por RLE, FOR y el diccionario FSST
-	std::vector<uint32_t> dict_offsets_;	///< offsets ya descomprimidos
 	const uint8_t *codes_ = nullptr;	///< códigos empacados (kEncDict*)
 
-	void		materialize_fsst_dict(const uint8_t *data, uint32_t len);
+	/// RLE y FOR: valores decodificados, row_count * fixed_width bytes.
+	/// Con `expanded_` en true están todos; si no, solo los que pidió get().
+	mutable std::unique_ptr<uint8_t[]> values_;
+	mutable bool expanded_ = false;
+
+	/// RLE: fila donde termina cada corrida (exclusiva), armado al primer
+	/// acceso, y la última corrida usada: los scans piden filas en orden.
+	mutable std::vector<uint32_t> run_end_;
+	mutable uint32_t run_hint_ = 0;
+
+	/// FSST: cada entrada se descomprime la primera vez que se pide, a
+	/// continuación de la anterior en `arena_`.  El arena se reserva de
+	/// entrada con la cota del peor caso (FSST expande a lo sumo 8×, más 32
+	/// bytes de holgura por entrada para su camino rápido) pero se llena en
+	/// orden, así que solo se tocan las páginas que se usan, y nada se mueve:
+	/// los punteros devueltos valen mientras viva el reader.
+	struct FsstSlot
+	{
+		uint32_t	off;
+		uint32_t	len;		///< UINT32_MAX = todavía sin descomprimir
+	};
+
+	std::unique_ptr<FsstDecoder> fsst_;
+	const uint8_t *fsst_comp_ = nullptr;
+	mutable std::unique_ptr<uint8_t[]> arena_;
+	mutable size_t arena_used_ = 0;
+	mutable std::vector<FsstSlot> fsst_slots_;
 };
 
 }	// namespace dbe

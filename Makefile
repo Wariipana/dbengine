@@ -135,6 +135,14 @@ check-engine:
 		-o /tmp/dbe-bloom-test $(CURDIR)/test/engine/bloom_test.cpp \
 		$(CURDIR)/src/engine/zonemap/bloom.cpp
 	@/tmp/dbe-bloom-test
+	@$(CXX) -std=$(DBE_CXX_STD) -O2 -w $(DBE_ENGINE_FLAGS) \
+		-c -o /tmp/dbe-fsst.o $(CURDIR)/src/engine/compress/fsst/libfsst.cpp
+	@$(CXX) -std=$(DBE_CXX_STD) -O2 -w $(DBE_ENGINE_FLAGS) \
+		-c -o /tmp/dbe-fsst-avx512.o $(CURDIR)/src/engine/compress/fsst/fsst_avx512.cpp
+	@$(CXX) -std=$(DBE_CXX_STD) -O2 -Wall -Wextra $(DBE_ENGINE_FLAGS) -I$(CURDIR)/src/include \
+		-o /tmp/dbe-segment-test $(CURDIR)/test/engine/segment_test.cpp \
+		$(CURDIR)/src/engine/storage/segment.cpp /tmp/dbe-fsst.o /tmp/dbe-fsst-avx512.o
+	@/tmp/dbe-segment-test
 
 # --- Chequeo de warnings -----------------------------------------------------
 # Los warnings del compilador no son ruido: los últimos dos que aparecieron

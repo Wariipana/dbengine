@@ -933,6 +933,12 @@ Las tres primeras son la misma historia contada de tres formas:
   tienen al menos una y no habría nada que saltear. Bajar de ahí necesita
   acceso aleatorio dentro del segmento, no diferir su carga.
 
+  *Actualización (C2):* el diagnóstico de arriba estaba mal a medias. Abrir
+  un segmento lo decodificaba entero —FOR, RLE y el diccionario FSST— y
+  eso era la mitad del tiempo de q24. Con la apertura perezosa cada
+  `get(fila)` decodifica solo esa fila y q24 baja de 3,25 s a 1,63 s, sin
+  índices de por medio (ver `doc/perf-linea-base-c2.md`).
+
 **Ninguna de las seis pierde por sorpresa.** Las tres formas en que un store
 columnar pierde contra un heap indexado son: lookup por clave, early-stop
 sobre un orden que el índice ya tiene, y `SELECT *`. Están las tres, y no hay

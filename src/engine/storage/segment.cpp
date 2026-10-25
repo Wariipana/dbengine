@@ -16,6 +16,7 @@
 
 #include "../compress/bitpack.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <map>
 #include <string>
@@ -537,17 +538,61 @@ SegmentBuilder::finish()
 	return out_;
 }
 
+struct FsstDecoder
+{
+	fsst_decoder_t dec;
+};
+
+namespace {
+
+/// Copia un valor de ancho fijo.  Con el ancho como constante el compilador
+/// lo reduce a una sola instrucción; un memcpy de ancho variable terminaba
+/// en una llamada a libc por valor, y era la cuarta parte de q24.
+inline void
+copy_value(uint8_t *dst, const uint8_t *src, uint32_t w)
+{
+	switch (w)
+	{
+		case 1: *dst = *src; return;
+		case 2: std::memcpy(dst, src, 2); return;
+		case 4: std::memcpy(dst, src, 4); return;
+		case 8: std::memcpy(dst, src, 8); return;
+		default: std::memcpy(dst, src, w); return;
+	}
+}
+
+template <typename T>
+void
+unpack_for(T *out, const uint8_t *packed, uint32_t n, uint32_t bits, T min_v)
+{
+	for (uint32_t i = 0; i < n; i++)
+		out[i] = static_cast<T>(min_v + bitpack_get(packed, i, bits));
+}
+
+template <typename T>
+void
+fill_run(uint8_t *dst, const uint8_t *value, uint32_t run)
+{
+	T			v;
+	T		   *out = reinterpret_cast<T *>(dst);
+
+	std::memcpy(&v, value, sizeof(T));
+	for (uint32_t i = 0; i < run; i++)
+		out[i] = v;
+}
+
+}	// namespace
+
+SegmentReader::~SegmentReader() = default;
+
 /*
- * Descomprime el diccionario entero al abrir el segmento.
- *
- * Es la única vez que se paga: después el acceso por fila es idéntico a
- * kEncDict, un bitpack_get para el código y un índice en el arreglo ya
- * descomprimido.  Medido sobre ClickBench, el diccionario de un stripe son
- * ~5 MB entre las tres columnas de texto y se descomprime a 1.200-1.600
- * MB/s.
+ * Prepara el diccionario FSST para descomprimirlo por entrada.  Solo se
+ * importa la tabla de símbolos y se reserva el arena, sin tocarlo: una
+ * query que filtra por otra columna y lee diez filas descomprime diez
+ * entradas, no las 20.000 del stripe.
  */
 void
-SegmentReader::materialize_fsst_dict(const uint8_t *data, uint32_t len)
+SegmentReader::load_fsst(const uint8_t *data, uint32_t len)
 {
 	const uint32_t n = header_.aux_count;
 
@@ -560,102 +605,175 @@ SegmentReader::materialize_fsst_dict(const uint8_t *data, uint32_t len)
 	if (static_cast<uint64_t>(symlen) + 4 > len)
 		throw Error(DBE_ERR_INTERNAL, "tabla de símbolos FSST fuera de rango");
 
-	fsst_decoder_t dec;
-
-	if (fsst_import(&dec, const_cast<unsigned char *>(data + 4)) == 0)
+	fsst_.reset(new FsstDecoder);
+	if (fsst_import(&fsst_->dec, const_cast<unsigned char *>(data + 4)) == 0)
 		throw Error(DBE_ERR_INTERNAL, "no se pudo leer la tabla de símbolos FSST");
 
-	const uint8_t *comp = data + 4 + symlen;
+	fsst_comp_ = data + 4 + symlen;
+
 	const uint32_t comp_bytes = offsets_[n];
 
 	if (static_cast<uint64_t>(4) + symlen + comp_bytes > len)
 		throw Error(DBE_ERR_INTERNAL, "diccionario FSST fuera de rango");
-
-	/*
-	 * Cota superior de lo descomprimido: FSST nunca expande más de 8 bytes
-	 * por código, y el peor caso de un escape son 2 bytes por byte original.
-	 */
-	dict_offsets_.clear();
-	dict_offsets_.reserve(n + 1);
-	dict_offsets_.push_back(0);
-	expanded_.assign(static_cast<size_t>(comp_bytes) * 8 + 64, 0);
-
-	size_t		out = 0;
-
 	for (uint32_t i = 0; i < n; i++)
-	{
-		const uint32_t clen = offsets_[i + 1] - offsets_[i];
-		const size_t room = expanded_.size() - out;
-		const size_t got = fsst_decompress(&dec, clen, comp + offsets_[i],
-										   room, expanded_.data() + out);
+		if (offsets_[i + 1] < offsets_[i])
+			throw Error(DBE_ERR_INTERNAL, "offsets del diccionario FSST desordenados");
 
-		if (got > room)
-			throw Error(DBE_ERR_INTERNAL, "entrada de diccionario FSST truncada");
-		out += got;
-		dict_offsets_.push_back(static_cast<uint32_t>(out));
-	}
-
-	expanded_.resize(out);
-	codes_ = comp + comp_bytes;
+	codes_ = fsst_comp_ + comp_bytes;
+	arena_.reset(new uint8_t[(size_t) comp_bytes * 8 + (size_t) n * 32 + 64]);
+	fsst_slots_.assign(n, FsstSlot{0, UINT32_MAX});
 }
 
 void
-SegmentReader::materialize_rle(const uint8_t *data, uint32_t len)
+SegmentReader::fsst_entry(uint32_t idx, const uint8_t **data,
+						  uint32_t *len) const
+{
+	FsstSlot   &e = fsst_slots_[idx];
+
+	if (e.len == UINT32_MAX)
+	{
+		const uint32_t clen = offsets_[idx + 1] - offsets_[idx];
+		const size_t room = (size_t) clen * 8 + 32;
+		const size_t got = fsst_decompress(&fsst_->dec, clen,
+										   fsst_comp_ + offsets_[idx],
+										   room, arena_.get() + arena_used_);
+
+		if (got > room)
+			throw Error(DBE_ERR_INTERNAL, "entrada de diccionario FSST truncada");
+		e.off = static_cast<uint32_t>(arena_used_);
+		e.len = static_cast<uint32_t>(got);
+		arena_used_ += got;
+	}
+
+	*data = arena_.get() + e.off;
+	*len = e.len;
+}
+
+/*
+ * RLE: dónde termina cada corrida.  Se arma recién la primera vez que
+ * alguien lee una fila, y valida lo que antes se validaba al abrir.
+ */
+void
+SegmentReader::build_runs() const
 {
 	const uint32_t w = header_.fixed_width;
+	const uint32_t len = header_.data_bytes;
 
 	if (len < 4)
 		throw Error(DBE_ERR_INTERNAL, "segmento RLE truncado");
+	if ((uint64_t) 4 + (uint64_t) header_.aux_count * (4 + w) > len)
+		throw Error(DBE_ERR_INTERNAL, "corrida RLE fuera del segmento");
 
-	expanded_.assign((size_t) header_.row_count * w, 0);
+	run_end_.resize(header_.aux_count);
 
-	const uint8_t *p = data + 4;
+	const uint8_t *p = data_ + 4;
 	uint32_t	written = 0;
 
-	for (uint32_t r = 0; r < header_.aux_count; r++)
+	for (uint32_t r = 0; r < header_.aux_count; r++, p += 4 + w)
 	{
 		uint32_t	run;
 
-		if ((uint32_t) (p - data) + 4 + w > len)
-			throw Error(DBE_ERR_INTERNAL, "corrida RLE fuera del segmento");
-
 		std::memcpy(&run, p, 4);
-		p += 4;
-
-		if (written + run > header_.row_count)
+		if (run > header_.row_count - written)
 			throw Error(DBE_ERR_INTERNAL, "las corridas RLE exceden las filas");
-
-		for (uint32_t i = 0; i < run; i++)
-			std::memcpy(&expanded_[(size_t) (written + i) * w], p, w);
-
 		written += run;
-		p += w;
+		run_end_[r] = written;
 	}
 
 	if (written != header_.row_count)
 		throw Error(DBE_ERR_INTERNAL, "las corridas RLE no cubren todas las filas");
 }
 
+uint32_t
+SegmentReader::run_of(uint32_t row) const
+{
+	if (run_end_.empty())
+		build_runs();
+
+	uint32_t	r = run_hint_;
+
+	/* Lo normal es la misma corrida o la siguiente. */
+	if (r < run_end_.size() && row < run_end_[r] &&
+		(r == 0 || row >= run_end_[r - 1]))
+		return r;
+	if (r + 1 < run_end_.size() && row >= run_end_[r] && row < run_end_[r + 1])
+		return run_hint_ = r + 1;
+
+	r = static_cast<uint32_t>(std::upper_bound(run_end_.begin(), run_end_.end(), row) -
+							  run_end_.begin());
+	return run_hint_ = r;
+}
+
+uint8_t *
+SegmentReader::slot(uint32_t row) const
+{
+	if (!values_)
+		values_.reset(new uint8_t[(size_t) header_.row_count * header_.fixed_width]);
+	return values_.get() + (size_t) row * header_.fixed_width;
+}
+
+/*
+ * Expande RLE o FOR a un arreglo contiguo.  Pisa también los valores que
+ * get() ya había decodificado, con el mismo resultado.
+ */
 void
-SegmentReader::materialize_for(const uint8_t *data, uint32_t len)
+SegmentReader::expand() const
 {
 	const uint32_t w = header_.fixed_width;
-	const uint32_t bits = header_.bit_width;
+	const uint32_t n = header_.row_count;
+	uint8_t    *out = slot(0);
 
-	if (len < w + 4)
-		throw Error(DBE_ERR_INTERNAL, "segmento FOR truncado");
+	if (header_.encoding == kEncRle)
+	{
+		if (run_end_.empty())
+			build_runs();
 
-	const uint64_t min_v = load_uint(data, w);
-	const uint8_t *packed = data + w + 1 + 3;
+		const uint8_t *p = data_ + 4;
+		uint32_t	start = 0;
 
-	if ((uint32_t) (packed - data) + packed_bytes(header_.row_count, bits) > len)
-		throw Error(DBE_ERR_INTERNAL, "valores FOR fuera del segmento");
+		for (uint32_t r = 0; r < header_.aux_count; r++, p += 4 + w)
+		{
+			const uint32_t run = run_end_[r] - start;
+			uint8_t    *dst = out + (size_t) start * w;
 
-	expanded_.assign((size_t) header_.row_count * w, 0);
+			switch (w)
+			{
+				case 1: std::memset(dst, p[4], run); break;
+				case 2: fill_run<uint16_t>(dst, p + 4, run); break;
+				case 4: fill_run<uint32_t>(dst, p + 4, run); break;
+				case 8: fill_run<uint64_t>(dst, p + 4, run); break;
+				default:
+					for (uint32_t i = 0; i < run; i++)
+						std::memcpy(dst + (size_t) i * w, p + 4, w);
+			}
+			start = run_end_[r];
+		}
+	}
+	else
+	{
+		const uint32_t bits = header_.bit_width;
+		const uint64_t min_v = load_uint(data_, w);
+		const uint8_t *packed = data_ + w + 1 + 3;
 
-	for (uint32_t i = 0; i < header_.row_count; i++)
-		store_uint(&expanded_[(size_t) i * w], w,
-				   min_v + bitpack_get(packed, i, bits));
+		switch (w)
+		{
+			case 1: unpack_for<uint8_t>(out, packed, n, bits, (uint8_t) min_v); break;
+			case 2:
+				unpack_for<uint16_t>(reinterpret_cast<uint16_t *>(out), packed, n,
+									 bits, (uint16_t) min_v);
+				break;
+			case 4:
+				unpack_for<uint32_t>(reinterpret_cast<uint32_t *>(out), packed, n,
+									 bits, (uint32_t) min_v);
+				break;
+			default:
+				unpack_for<uint64_t>(reinterpret_cast<uint64_t *>(out), packed, n,
+									 bits, min_v);
+				break;
+		}
+	}
+
+	expanded_ = true;
 }
 
 SegmentReader::SegmentReader(const uint8_t *bytes, uint32_t len)
@@ -674,7 +792,7 @@ SegmentReader::SegmentReader(const uint8_t *bytes, uint32_t len)
 	const uint32_t off_offsets = align_up(off_nulls + header_.null_bitmap_bytes);
 	const uint32_t off_data = align_up(off_offsets + header_.offsets_bytes);
 
-	if (off_data + header_.data_bytes > len)
+	if ((uint64_t) off_data + header_.data_bytes > len)
 		throw Error(DBE_ERR_INTERNAL, "segmento más corto que su propio header");
 
 	if (header_.null_bitmap_bytes > 0)
@@ -694,12 +812,21 @@ SegmentReader::SegmentReader(const uint8_t *bytes, uint32_t len)
 			break;
 
 		case kEncRle:
-			materialize_rle(data_, header_.data_bytes);
+			if (header_.fixed_width == 0)
+				throw Error(DBE_ERR_INTERNAL, "segmento RLE sin ancho fijo");
 			break;
 
 		case kEncFor:
-			materialize_for(data_, header_.data_bytes);
+		{
+			const uint32_t w = header_.fixed_width;
+
+			if (w != 1 && w != 2 && w != 4 && w != 8)
+				throw Error(DBE_ERR_INTERNAL, "ancho inválido en un segmento FOR");
+			if ((uint64_t) w + 4 +
+				packed_bytes(header_.row_count, header_.bit_width) > header_.data_bytes)
+				throw Error(DBE_ERR_INTERNAL, "valores FOR fuera del segmento");
 			break;
+		}
 
 		case kEncDict:
 			if (header_.offsets_bytes != (header_.aux_count + 1) * sizeof(uint32_t))
@@ -710,7 +837,7 @@ SegmentReader::SegmentReader(const uint8_t *bytes, uint32_t len)
 		case kEncDictFsst:
 			if (header_.offsets_bytes != (header_.aux_count + 1) * sizeof(uint32_t))
 				throw Error(DBE_ERR_INTERNAL, "offsets del diccionario inconsistentes");
-			materialize_fsst_dict(data_, header_.data_bytes);
+			load_fsst(data_, header_.data_bytes);
 			break;
 
 		default:
@@ -727,9 +854,16 @@ SegmentReader::vector(const uint8_t **data, uint32_t *width,
 	if (header_.encoding == kEncDict)
 		return false;			// indirecto por códigos
 
-	// kEncNone apunta al buffer original; RLE y FOR ya se expandieron al
-	// abrir el segmento.  En los dos casos hay un arreglo contiguo.
-	*data = (header_.encoding == kEncNone) ? data_ : expanded_.data();
+	// kEncNone apunta al buffer original; RLE y FOR se expanden la primera
+	// vez que alguien pide el vector.
+	if (header_.encoding == kEncNone)
+		*data = data_;
+	else
+	{
+		if (!expanded_)
+			expand();
+		*data = values_.get();
+	}
 	*width = header_.fixed_width;
 	*nulls = nulls_;
 	return true;
@@ -778,8 +912,7 @@ SegmentReader::dict_value(uint32_t idx, const uint8_t **data,
 
 	if (header_.encoding == kEncDictFsst)
 	{
-		*data = expanded_.data() + dict_offsets_[idx];
-		*len = dict_offsets_[idx + 1] - dict_offsets_[idx];
+		fsst_entry(idx, data, len);
 		return;
 	}
 
@@ -809,9 +942,31 @@ SegmentReader::get(uint32_t row, const uint8_t **data, uint32_t *len,
 	{
 		case kEncRle:
 		case kEncFor:
-			*data = expanded_.data() + (size_t) row * header_.fixed_width;
-			*len = header_.fixed_width;
+		{
+			const uint32_t w = header_.fixed_width;
+			uint8_t    *out = slot(row);
+
+			/*
+			 * Se decodifica solo esta fila, en su slot: el puntero tiene que
+			 * seguir valiendo después de la próxima llamada, porque un tipo
+			 * de ancho fijo por referencia (macaddr8) se devuelve así.
+			 */
+			if (!expanded_)
+			{
+				if (header_.encoding == kEncRle)
+					copy_value(out, data_ + 4 + (size_t) run_of(row) * (4 + w) + 4, w);
+				else
+				{
+					const uint64_t v = load_uint(data_, w) +
+						bitpack_get(data_ + w + 1 + 3, row, header_.bit_width);
+
+					copy_value(out, reinterpret_cast<const uint8_t *>(&v), w);
+				}
+			}
+			*data = out;
+			*len = w;
 			return;
+		}
 
 		case kEncDict:
 		case kEncDictFsst:
@@ -823,10 +978,7 @@ SegmentReader::get(uint32_t row, const uint8_t **data, uint32_t *len,
 				throw Error(DBE_ERR_INTERNAL, "código de diccionario fuera de rango");
 
 			if (header_.encoding == kEncDictFsst)
-			{
-				*data = expanded_.data() + dict_offsets_[code];
-				*len = dict_offsets_[code + 1] - dict_offsets_[code];
-			}
+				fsst_entry(code, data, len);
 			else
 			{
 				*data = data_ + offsets_[code];

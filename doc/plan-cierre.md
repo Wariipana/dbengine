@@ -137,13 +137,22 @@ Tres hechos del código que ordenan la lista:
 
 ### C2.1 — Lo que encontró el perfil
 
-0. [ ] **Apertura perezosa de segmentos**: el header al abrir; FOR y RLE
-       se expanden cuando se pide el vector, `get(fila)` va directo al dato
-       empacado (FOR en O(1), RLE por búsqueda binaria sobre las corridas),
-       el diccionario FSST se descomprime por entrada a demanda. Además,
-       desempaquetado especializado por ancho (hoy un `memcpy` de libc por
-       valor) y sin rellenar con ceros antes de sobrescribir. Ataca q24 y
-       toda query con muchas columnas y filtro selectivo.
+0. [x] **Apertura perezosa de segmentos**: el header al abrir; FOR y RLE
+       se expanden cuando se pide el vector, `get(fila)` decodifica solo esa
+       fila (FOR en O(1), RLE por búsqueda binaria con pista de corrida), y
+       el diccionario FSST se descomprime por entrada, en un arena que se
+       llena en orden. Expansión especializada por ancho, sin rellenar con
+       ceros. A/B contra el binario anterior: **q24 3,25 → 1,63 s (2,0×)**,
+       q3 471 → 395 ms (1,19×), el resto dentro del ruido (±1,5%). Test
+       nuevo del segmento en `check-engine` (`test/engine/segment_test.cpp`).
+       - Primera versión: cada entrada FSST en un tramo fijo de 8× su
+         tamaño comprimido. Tocaba ~5× más páginas y q15/q26 salían 3%
+         más lentas; con el arena secuencial quedaron en el ruido.
+       - Encontrado de paso: **FOR mira los valores como enteros sin
+         signo**, así que una columna con negativos y positivos mezclados
+         (-1 y 1 quedan en los extremos del rango) sale cruda. Arreglo
+         posible: probar también con el bit de signo invertido y marcarlo
+         en el header. Cambia el formato (versión 3 del segmento).
 
 ### C2.1b — Victorias rápidas
 

@@ -67,3 +67,18 @@ Otras observaciones:
 5. La tabla de hash propia baja de prioridad para q33 (el cuello es el
    `HashAggregate` de PostgreSQL), y hay que perfilar q9/q10/q19 antes de
    decidir.
+
+## Resultado: apertura perezosa (C2.1.0)
+
+A/B en la misma sesión, alternando los dos `.so` con el cluster reiniciado
+entre medio, mejor de 3 en caliente, dos vueltas:
+
+| query | antes | después | |
+|---|---|---|---|
+| q24 | 3.252–3.266 ms | 1.626–1.688 ms | **2,0×** |
+| q3 | 471 ms | 394–395 ms | 1,19× |
+| q14, q15, q19, q22, q26, q33 | | | ±1,5%, ruido |
+
+Las 43 contra la línea base: media geométrica de dbengine 0,993 del tiempo
+anterior; la suma no se mueve porque la dominan q29, q33 y q9/q10/q19, que
+no pasan por acá.
