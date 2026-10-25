@@ -104,3 +104,16 @@ La primera sola daba 1,25×–1,43×; con la segunda sale `dbe_segreader_get`
 
 Las 43 contra la línea base, con esto y la apertura perezosa: media
 geométrica 0,887, suma 109,9 → 105,4 s.
+
+## Resultado: expresiones de la salida por diccionario
+
+El scan de q29 proyecta `REGEXP_REPLACE(Referer, ...)`. Con la proyección
+propia del Custom Scan, cada valor distinto de Referer en el stripe pasa una
+vez por el motor de regexp en vez de ~3. Misma GUC, dos vueltas:
+
+| query | apagado | prendido | |
+|---|---|---|---|
+| q29 | 20.996–21.051 ms | 11.831–11.888 ms | **1,77×** |
+| q34, q35 | | | ruido |
+
+Las 43 contra la línea base: media geométrica 0,879, suma 109,9 → 96,8 s.

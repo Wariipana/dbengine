@@ -24,6 +24,9 @@
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
 #include "optimizer/optimizer.h"
+#include "utils/datum.h"
+#include "utils/lsyscache.h"
+#include "utils/memutils.h"
 
 #include "dbengine/dbengine.h"
 #include "dbengine/dictqual.h"
@@ -268,4 +271,158 @@ dbe_dictqual_reset(DbeDictQual *dq)
 		return;
 	for (i = 0; i < dq->nclauses; i++)
 		dq->clauses[i].generation = 0;
+}
+
+/* ------------------------------------------------------------------------
+ * Expresiones de la salida
+ *
+ * Igual que las cláusulas, pero lo que se guarda por código es el valor.
+ * Los valores de varlena se copian a un contexto propio que se vacía al
+ * cambiar de stripe: un valor devuelto vale lo que dura el stripe, que es
+ * más de lo que el slot de salida necesita (hasta la próxima fila).
+ * ------------------------------------------------------------------------ */
+
+#define DE_UNKNOWN	0
+#define DE_VALUE	1
+#define DE_NULL		2
+
+struct DbeDictExpr
+{
+	AttrNumber	attnum;
+	ExprState  *expr;
+	int16		typlen;
+	bool		typbyval;
+
+	uint64		generation;
+	bool		is_dict;
+	uint32		capacity;
+	uint8	   *state;			/* DE_* por código */
+	Datum	   *values;
+	uint8		null_state;		/* lo mismo para la fila con la columna en NULL */
+	Datum		null_value;
+	MemoryContext values_cxt;	/* copias de los valores del stripe */
+};
+
+DbeDictExpr *
+dbe_dictexpr_build(Expr *expr, Index varno, TupleDesc desc, PlanState *parent)
+{
+	DbeDictExpr *de;
+	Node	   *bare = (Node *) expr;
+	AttrNumber	attnum;
+
+	if (!dbe_enable_dict_quals)
+		return NULL;
+
+	/* La columna sola no tiene nada que calcular. */
+	while (IsA(bare, RelabelType))
+		bare = (Node *) ((RelabelType *) bare)->arg;
+	if (IsA(bare, Var) || expression_returns_set((Node *) expr))
+		return NULL;
+
+	attnum = dbe_dictqual_column((Node *) expr, varno, desc);
+	if (attnum == InvalidAttrNumber)
+		return NULL;
+
+	de = (DbeDictExpr *) palloc0(sizeof(DbeDictExpr));
+	de->attnum = attnum;
+	de->expr = ExecInitExpr(expr, parent);
+	get_typlenbyval(exprType((Node *) expr), &de->typlen, &de->typbyval);
+	de->values_cxt = AllocSetContextCreate(CurrentMemoryContext,
+										   "dbengine valores por diccionario",
+										   ALLOCSET_DEFAULT_SIZES);
+	return de;
+}
+
+static void
+dbe_dictexpr_sync(DbeDictExpr *de, DbeSegReader *reader, uint64 generation)
+{
+	int32		is_dict = 0;
+	uint32		ndict = 0;
+
+	de->generation = generation;
+	de->null_state = DE_UNKNOWN;
+	de->is_dict = false;
+	MemoryContextReset(de->values_cxt);
+
+	if (reader == NULL)
+		return;
+
+	{
+		DbeStatus	st = dbe_segreader_dict(reader, &is_dict, &ndict);
+
+		dbe_error_if_not_ok(&st, "consultando el diccionario de una columna");
+	}
+	if (!is_dict || ndict == 0)
+		return;
+
+	if (de->capacity < ndict)
+	{
+		MemoryContext cxt = GetMemoryChunkContext(de);
+
+		if (de->state != NULL)
+		{
+			pfree(de->state);
+			pfree(de->values);
+		}
+		de->state = (uint8 *) MemoryContextAlloc(cxt, ndict);
+		de->values = (Datum *) MemoryContextAlloc(cxt, sizeof(Datum) * ndict);
+		de->capacity = ndict;
+	}
+	memset(de->state, DE_UNKNOWN, ndict);
+	de->is_dict = true;
+}
+
+Datum
+dbe_dictexpr_eval(DbeDictExpr *de, DbeRowCursor *cur, uint64 row,
+				  ExprContext *econtext, bool *isnull)
+{
+	uint64		generation;
+	DbeSegReader *reader = dbe_cursor_reader(cur, de->attnum, &generation);
+	uint32		code = 0;
+	int32		colnull = 0;
+	uint8	   *st;
+	Datum	   *val;
+	Datum		v;
+	MemoryContext old;
+
+	if (generation != de->generation)
+		dbe_dictexpr_sync(de, reader, generation);
+
+	if (!de->is_dict)
+		return ExecEvalExprSwitchContext(de->expr, econtext, isnull);
+
+	{
+		DbeStatus	s = dbe_segreader_code(reader, (uint32) row, &code, &colnull);
+
+		dbe_error_if_not_ok(&s, "leyendo un código de diccionario");
+	}
+
+	st = colnull ? &de->null_state : &de->state[code];
+	val = colnull ? &de->null_value : &de->values[code];
+	if (*st != DE_UNKNOWN)
+	{
+		*isnull = (*st == DE_NULL);
+		return *val;
+	}
+
+	v = ExecEvalExprSwitchContext(de->expr, econtext, isnull);
+	if (*isnull)
+	{
+		*st = DE_NULL;
+		*val = (Datum) 0;
+		return (Datum) 0;
+	}
+
+	old = MemoryContextSwitchTo(de->values_cxt);
+	*val = datumCopy(v, de->typbyval, de->typlen);
+	MemoryContextSwitchTo(old);
+	*st = DE_VALUE;
+	return *val;
+}
+
+void
+dbe_dictexpr_reset(DbeDictExpr *de)
+{
+	if (de != NULL)
+		de->generation = 0;
 }

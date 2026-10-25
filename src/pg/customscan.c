@@ -17,6 +17,7 @@
 #include "commands/explain_format.h"
 #include "access/parallel.h"
 #include "executor/executor.h"
+#include "miscadmin.h"
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -66,6 +67,14 @@ typedef struct DbeParallelScanShared
 	pg_atomic_uint64 rows_filtered;
 } DbeParallelScanShared;
 
+/* Una columna de la salida cuando el nodo proyecta por su cuenta. */
+typedef struct DbeScanOutput
+{
+	AttrNumber	attnum;			/* > 0: la columna tal cual del scan */
+	DbeDictExpr *cached;		/* si no: calculada por entrada del diccionario */
+	ExprState  *expr;			/* si no: evaluada fila por fila */
+} DbeScanOutput;
+
 typedef struct DbeScanState
 {
 	CustomScanState css;
@@ -79,6 +88,16 @@ typedef struct DbeScanState
 	 * hacerlo ANTES de terminar de armar la fila (late materialization).
 	 */
 	DbeDictQual *qual;
+
+	/*
+	 * Proyección propia, solo si alguna expresión de la salida se puede
+	 * calcular por entrada del diccionario (ver dbe_scan_init_projection).
+	 * NULL = la proyección normal de ExecScan().
+	 */
+	DbeScanOutput *outputs;
+	int			noutputs;
+	int			ncached;
+
 	uint64		rows_filtered;
 	uint64		stripes_pruned;	/* total del plan, solo si totals_ready */
 	uint64		granules_pruned;
@@ -605,6 +624,89 @@ dbe_create_scan_state(CustomScan *cscan)
 
 
 
+/*
+ * Expresiones de la salida por entrada del diccionario.
+ *
+ * En q29 el scan proyecta `REGEXP_REPLACE(Referer, ...)`, y Referer repite
+ * cada valor ~3 veces por stripe.  ExecScan() evalúa la proyección fila por
+ * fila sin saber nada de diccionarios, así que si alguna expresión califica
+ * el nodo proyecta él mismo: las columnas sueltas se copian del slot, las
+ * expresiones que califican salen de la tabla por código, y las demás se
+ * evalúan como siempre.
+ *
+ * No con EvalPlanQual: ahí el executor le pasa al scan la fila a revisar
+ * por ExecScan(), y saltearlo la perdería.
+ */
+static void
+dbe_scan_init_projection(DbeScanState *state, EState *estate)
+{
+	CustomScanState *node = &state->css;
+	List	   *tlist = node->ss.ps.plan->targetlist;
+	Index		scanrelid = ((Scan *) node->ss.ps.plan)->scanrelid;
+	TupleDesc	desc = RelationGetDescr(node->ss.ss_currentRelation);
+	DbeScanOutput *outs;
+	int			ncached = 0;
+	int			i = 0;
+	ListCell   *lc;
+
+	if (node->ss.ps.ps_ProjInfo == NULL || estate->es_epq_active != NULL ||
+		!dbe_enable_dict_quals)
+		return;
+
+	outs = (DbeScanOutput *) palloc0(sizeof(DbeScanOutput) * list_length(tlist));
+	foreach(lc, tlist)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		Var		   *var = (Var *) te->expr;
+
+		if (IsA(var, Var) && var->varno == (int) scanrelid &&
+			var->varlevelsup == 0 && var->varattno >= 1 &&
+			var->varattno <= desc->natts)
+			outs[i].attnum = var->varattno;
+		else if ((outs[i].cached = dbe_dictexpr_build(te->expr, scanrelid, desc,
+													  &node->ss.ps)) != NULL)
+			ncached++;
+		else
+			outs[i].expr = ExecInitExpr(te->expr, &node->ss.ps);
+		i++;
+	}
+
+	if (ncached == 0)
+	{
+		pfree(outs);
+		return;
+	}
+	state->outputs = outs;
+	state->noutputs = i;
+	state->ncached = ncached;
+}
+
+static TupleTableSlot *
+dbe_scan_project(DbeScanState *state, TupleTableSlot *scan)
+{
+	TupleTableSlot *res = state->css.ss.ps.ps_ResultTupleSlot;
+	ExprContext *econtext = state->css.ss.ps.ps_ExprContext;
+	uint64		row = dbe_cursor_current_row(state->cursor);
+	int			i;
+
+	ExecClearTuple(res);
+	econtext->ecxt_scantuple = scan;
+	for (i = 0; i < state->noutputs; i++)
+	{
+		DbeScanOutput *o = &state->outputs[i];
+
+		if (o->attnum > 0)
+			res->tts_values[i] = slot_getattr(scan, o->attnum, &res->tts_isnull[i]);
+		else if (o->cached != NULL)
+			res->tts_values[i] = dbe_dictexpr_eval(o->cached, state->cursor, row,
+												   econtext, &res->tts_isnull[i]);
+		else
+			res->tts_values[i] = ExecEvalExprSwitchContext(o->expr, econtext,
+														   &res->tts_isnull[i]);
+	}
+	return ExecStoreVirtualTuple(res);
+}
+
 static void
 dbe_begin_scan(CustomScanState *node, EState *estate, int eflags)
 {
@@ -690,6 +792,8 @@ dbe_begin_scan(CustomScanState *node, EState *estate, int eflags)
 		dbe_cursor_set_filter_columns(state->cursor, filter_cols);
 		pfree(filter_cols);
 	}
+
+	dbe_scan_init_projection(state, estate);
 }
 
 /*
@@ -778,9 +882,25 @@ dbe_scan_recheck(CustomScanState *node, TupleTableSlot *slot)
 static TupleTableSlot *
 dbe_exec_scan(CustomScanState *node)
 {
-	return ExecScan(&node->ss,
-					(ExecScanAccessMtd) dbe_scan_next,
-					(ExecScanRecheckMtd) dbe_scan_recheck);
+	DbeScanState *state = (DbeScanState *) node;
+	TupleTableSlot *slot;
+
+	if (state->outputs == NULL)
+		return ExecScan(&node->ss,
+						(ExecScanAccessMtd) dbe_scan_next,
+						(ExecScanRecheckMtd) dbe_scan_recheck);
+
+	/*
+	 * Lo que hace ExecScan() sin qual (plan.qual está siempre vacío: el
+	 * predicado lo evalúa dbe_scan_next) ni EvalPlanQual, con la proyección
+	 * propia.
+	 */
+	CHECK_FOR_INTERRUPTS();
+	ResetExprContext(node->ss.ps.ps_ExprContext);
+	slot = dbe_scan_next(node);
+	if (TupIsNull(slot))
+		return ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
+	return dbe_scan_project(state, slot);
 }
 
 static void
@@ -808,6 +928,8 @@ dbe_rescan_scan(CustomScanState *node)
 	if (state->cursor != NULL)
 		dbe_cursor_rescan(state->cursor);
 	dbe_dictqual_reset(state->qual);
+	for (int i = 0; i < state->noutputs; i++)
+		dbe_dictexpr_reset(state->outputs[i].cached);
 }
 
 /* ------------------------------------------------------------------------
@@ -951,6 +1073,9 @@ dbe_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 	if (state->filters->nfilters > 0)
 		ExplainPropertyInteger("Predicados sobre zone maps", NULL,
 							   state->filters->nfilters, es);
+	if (state->ncached > 0)
+		ExplainPropertyInteger("Expresiones por diccionario", NULL,
+							   state->ncached, es);
 	if (es->analyze && state->cursor != NULL)
 	{
 		int64		gran;

@@ -54,6 +54,21 @@ SELECT dq_check($$SELECT id FROM dq WHERE s ~ '^[a-c]' OR s IS NULL$$);
 SELECT dq_check($$SELECT id, s FROM dq WHERE s LIKE '%a%' AND s || t <> 'anax1'$$);
 SELECT dq_check($$SELECT t, count(*) FROM dq WHERE s LIKE '%a%' AND s || t <> 'anax1' GROUP BY t$$);
 
+-- Expresiones de la salida: el Custom Scan proyecta por su cuenta y calcula
+-- cada una una vez por entrada del diccionario.
+EXPLAIN (COSTS OFF) SELECT upper(s), id FROM dq WHERE id > 0;
+SELECT dq_check($$SELECT upper(s), length(s), id FROM dq$$);
+SELECT dq_check($$SELECT regexp_replace(s, '^(.)', '[\1]') AS k, t, id FROM dq WHERE id % 3 = 0$$);
+SELECT dq_check($$SELECT coalesce(s, 'nulo') || '!' AS k, s IS NULL AS n FROM dq$$);
+SELECT dq_check($$SELECT nullif(s, 'ana') AS k, s || t AS dos FROM dq WHERE s LIKE '%a%'$$);
+SELECT dq_check($$SELECT k, count(*) FROM (SELECT upper(s) AS k FROM dq) x GROUP BY k$$);
+-- Resultado concreto: el mismo valor en distintos stripes, con códigos distintos.
+SELECT upper(s) AS k, count(*) FROM dq GROUP BY 1 ORDER BY 1;
+-- Correlacionada: la expresión depende de un Param que cambia por fila de
+-- afuera, y la tabla se tiene que vaciar en cada rescan.
+SELECT dq_check($$SELECT p, (SELECT string_agg(DISTINCT s || p, ',') FROM dq WHERE id < 20)
+                  FROM (VALUES ('1'), ('2')) v(p)$$);
+
 -- Pushdown de agregados.
 SELECT dq_check($$SELECT count(*) FROM dq WHERE s LIKE '%a%'$$);
 SELECT dq_check($$SELECT s, count(*) FROM dq WHERE s <> 'zoe' GROUP BY s$$);

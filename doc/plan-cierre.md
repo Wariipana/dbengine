@@ -182,7 +182,7 @@ Tres hechos del código que ordenan la lista:
 
 ### C2.2 — Trabajar sobre los datos comprimidos
 
-5. [~] **Evaluar una vez por entrada del diccionario**: predicados (`LIKE`,
+5. [x] **Evaluar una vez por entrada del diccionario**: predicados (`LIKE`,
        `<> ''`, `=`) y expresiones inmutables (`length`, `REGEXP_REPLACE`,
        `extract`) se calculan por entrada y se guardan en un arreglo
        indexado por código. Ataca q21–q23, q28, q29 (20,8 s; 4,7 s son el
@@ -195,9 +195,14 @@ Tres hechos del código que ordenan la lista:
          cuyo código ya se conoce. GUC `dbengine.enable_dict_quals`. A/B con
          la GUC: q21 1,59×, q22 1,78×, **q23 2,2×**, q24 1,34×, q26 1,4×,
          q27 1,35×. Contra la línea base, las 43: media geométrica 0,887.
-       - [ ] **Expresiones del SELECT** (`REGEXP_REPLACE` de q29,
-         `length(URL)` de q28): el mismo arreglo por código, pero para el
-         valor proyectado.
+       - [x] **Expresiones de la salida del Custom Scan**: si alguna
+         expresión del targetlist califica, el nodo proyecta por su cuenta
+         (sin EvalPlanQual) y la calcula una vez por código; el valor se
+         copia a un contexto que dura el stripe. **q29 21,0 → 11,85 s
+         (1,77×)**, el resto sin cambios. Las 43: media geométrica 0,879
+         contra la línea base, suma 109,9 → 96,8 s.
+       - [ ] `length(URL)` de q28 es argumento de un agregado empujado: el
+         mismo arreglo en `dbe_vec_value` de VectorAgg.
        - De paso: el EXPLAIN de `DbengineVectorAgg` dentro de una subconsulta
          fallaba ("invalid attnum 2 for relation v"): setrefs.c no corrige
          los Var de `custom_private`.

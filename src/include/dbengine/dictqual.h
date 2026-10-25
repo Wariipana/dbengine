@@ -9,7 +9,8 @@
  * sola columna da el mismo resultado para el mismo valor, así que alcanza
  * con evaluarla la primera vez que aparece cada código y recordarlo.
  *
- * Lo usan el Custom Scan y el pushdown de agregados.  Las cláusulas que no
+ * Lo usan el Custom Scan y el pushdown de agregados, y el Custom Scan
+ * también para las expresiones de su salida.  Las cláusulas que no
  * califican —varias columnas, funciones volátiles, subplans— y las que caen
  * en un segmento sin diccionario se evalúan como siempre.
  *
@@ -56,5 +57,25 @@ extern bool dbe_dictqual_eval(DbeDictQual *dq, DbeRowCursor *cur, uint64 row,
 
 /* Olvida los resultados: en un rescan pueden haber cambiado los Params. */
 extern void dbe_dictqual_reset(DbeDictQual *dq);
+
+/*
+ * Lo mismo para una expresión de la salida: `REGEXP_REPLACE(Referer, ...)`
+ * se calcula una vez por entrada del diccionario y el valor se reusa en las
+ * demás filas con el mismo código.  NULL si la expresión no califica (mira
+ * más de una columna, es volátil, o es la columna sola).
+ */
+typedef struct DbeDictExpr DbeDictExpr;
+
+extern DbeDictExpr *dbe_dictexpr_build(Expr *expr, Index varno,
+									   TupleDesc desc, PlanState *parent);
+
+/*
+ * Valor de la expresión para la fila `row`.  El slot de
+ * econtext->ecxt_scantuple tiene que tener la columna cargada.  El valor
+ * vale hasta que se cambie de stripe.
+ */
+extern Datum dbe_dictexpr_eval(DbeDictExpr *de, DbeRowCursor *cur, uint64 row,
+							   ExprContext *econtext, bool *isnull);
+extern void dbe_dictexpr_reset(DbeDictExpr *de);
 
 #endif							/* DBENGINE_DICTQUAL_H */
