@@ -168,8 +168,12 @@ Tres hechos del código que ordenan la lista:
          Las 43 contra la línea base: media geométrica 0,815.
        - [ ] `sum`/`avg` de int8 (q4): el estado es interno (int128); hay
          que armarlo con su serialización.
-       - [ ] `sum(x + k)` = `sum(x) + k·count(x)` (q30: 90 sumas, 5,1 s): el
-         pushdown todavía no acepta expresiones como argumento.
+       - [x] **Argumentos de expresión** en el pushdown: una expresión sobre
+         una sola columna se evalúa fila por fila contra el slot. Y `col ± k`
+         sale del catálogo: `sum(col) + k·count(col)`, solo si el zone map
+         prueba que `min + k` y `max + k` entran en el tipo (si no, la fila
+         por fila da el mismo overflow que heap). **q30 5.088 → 9,8 ms**.
+         Las 43: media geométrica 0,699, suma 91,1 s.
        - [ ] La regla del **stripe que cumple entero**: si el zone map
          prueba que todas sus filas pasan el `WHERE`, se usan los metadatos
          sin evaluar nada (q2, q8).

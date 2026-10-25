@@ -115,6 +115,77 @@ SELECT sum(b), count(a), count(*) FROM sm;
  6402184991147 |  7668 |  9301
 (1 row)
 
+-- Argumentos que son una expresión sobre una columna.  col + k y col - k
+-- salen del catálogo (sum(col) + k·count(col)); las demás se evalúan fila
+-- por fila contra el slot.
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT sum(a + 1), sum(b - 5), avg(1 + a), count(a + 7) FROM sm;
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Custom Scan (DbengineVectorAgg) on sm (actual rows=1.00 loops=1)
+   Agregados empujados al scan: 4
+   Filas agregadas: 9301
+   Stripes desde metadatos: 4
+(4 rows)
+
+SELECT sum(a + 1), sum(b - 5), avg(1 + a), count(a + 7), sum(a::int4 + 100000) FROM sm;
+  sum   |      sum      |         avg         | count |    sum    
+--------+---------------+---------------------+-------+-----------
+ 222618 | 6402184950142 | 29.0320813771517997 |  7668 | 767014950
+(1 row)
+
+SELECT sum(a + 1), sum(b - 5), avg(1 + a), count(a + 7), sum(a::int4 + 100000) FROM sm_heap;
+  sum   |      sum      |         avg         | count |    sum    
+--------+---------------+---------------------+-------+-----------
+ 222618 | 6402184950142 | 29.0320813771517997 |  7668 | 767014950
+(1 row)
+
+SELECT sum(a * 2), avg(abs(b)), max(a + 1), min(length(t)) FROM sm;
+  sum   |        avg         |  max  | min 
+--------+--------------------+-------+-----
+ 429900 | 780659064.88806243 | 32768 |   1
+(1 row)
+
+SELECT sum(a * 2), avg(abs(b)), max(a + 1), min(length(t)) FROM sm_heap;
+  sum   |        avg         |  max  | min 
+--------+--------------------+-------+-----
+ 429900 | 780659064.88806243 | 32768 |   1
+(1 row)
+
+SELECT t, sum(a + 1), count(b - 1) FROM sm GROUP BY t ORDER BY t;
+  t  |  sum   | count 
+-----+--------+-------
+ max |  32768 |     1
+ x   | 252500 |  5000
+     | -62650 |  3200
+(3 rows)
+
+SELECT t, sum(a + 1), count(b - 1) FROM sm_heap GROUP BY t ORDER BY t;
+  t  |  sum   | count 
+-----+--------+-------
+ max |  32768 |     1
+ x   | 252500 |  5000
+     | -62650 |  3200
+(3 rows)
+
+SELECT sum(a + 1) FROM sm WHERE b > 100;
+  sum   
+--------
+ 233475
+(1 row)
+
+SELECT sum(a + 1) FROM sm_heap WHERE b > 100;
+  sum   
+--------
+ 233475
+(1 row)
+
+-- Overflow: b llega a 2147483647, así que b + 1 no entra en integer.  El
+-- zone map lo ve y el stripe se recorre fila por fila, que da el error.
+SELECT sum(b + 1) FROM sm;
+ERROR:  integer out of range
+SELECT sum(b + 1) FROM sm_heap;
+ERROR:  integer out of range
 -- Una tabla sin filas y una con un solo stripe todo nulo.
 CREATE TABLE sm_vacia (a int4) USING dbengine_columnar;
 SELECT sum(a), avg(a), count(a), count(*) FROM sm_vacia;

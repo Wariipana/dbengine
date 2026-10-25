@@ -102,10 +102,19 @@ typedef struct DbeAggState
 	Oid			transtype;
 	int16		transtyplen;
 	bool		transtypbyval;
-	Oid			inputtype;
+	Oid			inputtype;		/* de la columna */
 	int16		inputtyplen;
 	bool		inputtypbyval;
 	Oid			collation;
+
+	/*
+	 * Argumento que no es la columna sola: se evalúa contra el slot de la
+	 * relación con la columna cargada.  val* es el tipo de lo que le llega
+	 * a la transición: el de la expresión, o el de la columna si no hay.
+	 */
+	ExprState  *argexpr;
+	int16		valtyplen;
+	bool		valtypbyval;
 
 	/*
 	 * MIN/MAX se reconocen por pg_aggregate.aggsortop, que es la misma
@@ -124,6 +133,17 @@ typedef struct DbeAggState
 	 */
 	uint8		sma;
 	bool		sma_now;
+
+	/*
+	 * sum(col + k): el stripe aporta sum(col) + k·count(col).  sma_lo y
+	 * sma_hi son el rango del tipo de la expresión: fila por fila, col + k
+	 * puede dar overflow, así que el atajo vale solo si el zone map prueba
+	 * que ni min + k ni max + k se salen.
+	 */
+	bool		sma_affine;
+	int64		sma_k;
+	int64		sma_lo;
+	int64		sma_hi;
 
 	/* Vista de la columna en el stripe que se está recorriendo. */
 	bool		has_vector;
@@ -322,6 +342,8 @@ static void dbe_agg_reinitialize_dsm(CustomScanState *node,
 									 ParallelContext *pcxt, void *coordinate);
 static void dbe_agg_initialize_worker(CustomScanState *node, shm_toc *toc,
 									  void *coordinate);
+static void dbe_agg_value(DbeVectorAggState *state, DbeAggState *agg,
+						  uint64 row, Datum *value, bool *isnull);
 static void dbe_agg_missing_value(DbeVectorAggState *state, AttrNumber attnum,
 								  Datum *value, bool *isnull);
 typedef enum DbeStripeTake
@@ -425,15 +447,41 @@ dbe_agg_supported(Aggref *ref, Index relid, AttrNumber *attnum,
 		return false;
 
 	arg = (Node *) ((TargetEntry *) linitial(ref->args))->expr;
-	if (!IsA(arg, Var))
-		return false;
-
+	if (IsA(arg, Var))
 	{
 		Var		   *var = (Var *) arg;
 
 		if (var->varno != relid || var->varattno <= 0 || var->varlevelsup != 0)
 			return false;
 		*attnum = var->varattno;
+		return true;
+	}
+
+	/*
+	 * Una expresión sobre UNA columna —`sum(ResolutionWidth + 1)`, q30— se
+	 * evalúa fila por fila contra el slot de la relación, como el WHERE.
+	 * Con DISTINCT no: el conjunto de hash es sobre la columna.
+	 */
+	if (*is_distinct || contain_volatile_functions(arg) ||
+		contain_subplans(arg) || expression_returns_set(arg))
+		return false;
+	{
+		List	   *vars = pull_var_clause(arg, 0);
+		ListCell   *lc;
+
+		*attnum = InvalidAttrNumber;
+		foreach(lc, vars)
+		{
+			Var		   *var = (Var *) lfirst(lc);
+
+			if (var->varno != relid || var->varattno <= 0 ||
+				var->varlevelsup != 0 ||
+				(*attnum != InvalidAttrNumber && var->varattno != *attnum))
+				return false;
+			*attnum = var->varattno;
+		}
+		if (*attnum == InvalidAttrNumber)
+			return false;		/* sin columnas: que lo haga el executor */
 	}
 
 	return true;
@@ -453,6 +501,10 @@ dbe_all_minmax(List *tlist)
 
 		if (ref->aggstar)
 			continue;
+
+		/* El zone map es de la columna, no de una expresión sobre ella. */
+		if (!IsA(((TargetEntry *) linitial(ref->args))->expr, Var))
+			return false;
 
 		tup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(ref->aggfnoid));
 		if (!HeapTupleIsValid(tup))
@@ -1212,10 +1264,21 @@ dbe_agg_init_one(DbeAggState *agg, Aggref *ref, AttrNumber attnum,
 	if (attnum != InvalidAttrNumber)
 	{
 		Form_pg_attribute att = TupleDescAttr(desc, attnum - 1);
+		Expr	   *arg = ((TargetEntry *) linitial(ref->args))->expr;
 
 		agg->inputtype = att->atttypid;
 		agg->inputtyplen = att->attlen;
 		agg->inputtypbyval = att->attbyval;
+		agg->valtyplen = att->attlen;
+		agg->valtypbyval = att->attbyval;
+
+		if (!IsA(arg, Var))
+		{
+			/* Con parent NULL los Var se leen de ecxt_scantuple. */
+			agg->argexpr = ExecInitExpr(arg, NULL);
+			get_typlenbyval(exprType((Node *) arg), &agg->valtyplen,
+							&agg->valtypbyval);
+		}
 	}
 }
 
@@ -1238,7 +1301,8 @@ dbe_agg_detect_minmax(DbeAggState *agg, Oid aggfnoid)
 
 	agg->is_minmax = false;
 
-	if (agg->is_count_star || agg->attnum == InvalidAttrNumber)
+	if (agg->is_count_star || agg->attnum == InvalidAttrNumber ||
+		agg->argexpr != NULL)
 		return;
 
 	tup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(aggfnoid));
@@ -1295,11 +1359,100 @@ dbe_agg_detect_minmax(DbeAggState *agg, Oid aggfnoid)
 #define DBE_SMA_AVG		2
 #define DBE_SMA_COUNT	3
 
-static void
-dbe_agg_detect_sma(DbeAggState *agg, Oid aggfnoid)
+/*
+ * ¿El argumento es `col + k` o `col - k`, con col y k smallint o integer?
+ * Deja k y el rango del tipo del resultado.  Es la forma de q30: noventa
+ * `sum(ResolutionWidth + i)`.
+ */
+static bool
+dbe_agg_affine_arg(DbeAggState *agg, Expr *arg)
 {
+	OpExpr	   *op = (OpExpr *) arg;
+	Node	   *l;
+	Node	   *r;
+	Const	   *k;
+	bool		minus;
+	int64		kv;
+	Oid			restype;
+
+	if (!IsA(arg, OpExpr) || list_length(op->args) != 2)
+		return false;
+	switch (op->opfuncid)
+	{
+		case F_INT2PL:
+		case F_INT4PL:
+		case F_INT24PL:
+		case F_INT42PL:
+			minus = false;
+			break;
+		case F_INT2MI:
+		case F_INT4MI:
+		case F_INT24MI:
+		case F_INT42MI:
+			minus = true;
+			break;
+		default:
+			return false;
+	}
+
+	l = strip_implicit_coercions((Node *) linitial(op->args));
+	r = strip_implicit_coercions((Node *) lsecond(op->args));
+	if (IsA(l, Var) && IsA(r, Const))
+		k = (Const *) r;
+	else if (!minus && IsA(l, Const) && IsA(r, Var))
+		k = (Const *) l;
+	else
+		return false;
+	if (k->constisnull)
+		return false;
+
+	if (k->consttype == INT2OID)
+		kv = DatumGetInt16(k->constvalue);
+	else if (k->consttype == INT4OID)
+		kv = DatumGetInt32(k->constvalue);
+	else
+		return false;
+
+	restype = exprType((Node *) arg);
+	if (restype == INT2OID)
+	{
+		agg->sma_lo = PG_INT16_MIN;
+		agg->sma_hi = PG_INT16_MAX;
+	}
+	else if (restype == INT4OID)
+	{
+		agg->sma_lo = PG_INT32_MIN;
+		agg->sma_hi = PG_INT32_MAX;
+	}
+	else
+		return false;
+
+	agg->sma_k = minus ? -kv : kv;
+	agg->sma_affine = true;
+	return true;
+}
+
+/* Un valor de smallint o integer del zone map, como int64. */
+static int64
+dbe_agg_int_of(DbeAggState *agg, const char *bytes)
+{
+	Datum		d = fetch_att(bytes, agg->inputtypbyval, agg->inputtyplen);
+
+	return agg->inputtype == INT2OID ? DatumGetInt16(d) : DatumGetInt32(d);
+}
+
+static void
+dbe_agg_detect_sma(DbeAggState *agg, Aggref *ref)
+{
+	Oid			aggfnoid = ref->aggfnoid;
+
 	agg->sma = DBE_SMA_NONE;
+	agg->sma_affine = false;
 	if (agg->is_count_star || agg->is_distinct || agg->attnum == InvalidAttrNumber)
+		return;
+	if (agg->argexpr != NULL &&
+		((agg->inputtype != INT2OID && agg->inputtype != INT4OID) ||
+		 !dbe_agg_affine_arg(agg, ((TargetEntry *) linitial(ref->args))->expr)))
 		return;
 
 	switch (aggfnoid)
@@ -1377,10 +1530,38 @@ dbe_agg_apply_sma(DbeAggState *agg, int64 nonnull, int64 sum)
  * quedaron avanzados y no hace falta leer el stripe—.  Si solo algunos,
  * esos se avanzan igual y el recorrido por fila los saltea.
  */
+/*
+ * El segmento de la columna del agregado i en el stripe idx.  Cada búsqueda
+ * es un scan del catálogo, y q30 tiene noventa agregados sobre la MISMA
+ * columna: se busca una vez y se copia.  have[i]: 0 sin buscar, 1 hallado,
+ * -1 no hay.
+ */
+static bool
+dbe_agg_stripe_segment(DbeVectorAggState *state, int idx, int i,
+					   DbeSegDesc *segs, int8 *have, uint64 *rows)
+{
+	int			j;
+
+	for (j = 0; j < i; j++)
+		if (have[j] != 0 && state->aggs[j].attnum == state->aggs[i].attnum)
+		{
+			segs[i] = segs[j];
+			have[i] = have[j];
+			return have[i] > 0;
+		}
+
+	have[i] = dbe_cursor_stripe_segment(state->cursor, idx,
+										state->aggs[i].attnum, &segs[i], rows)
+		? 1 : -1;
+	return have[i] > 0;
+}
+
 static bool
 dbe_agg_stripe_sma(DbeVectorAggState *state, int idx)
 {
 	DbeSegDesc *segs = (DbeSegDesc *) palloc(sizeof(DbeSegDesc) * state->naggs);
+	int8	   *have = (int8 *) palloc0(sizeof(int8) * state->naggs);
+	int64	   *sums = (int64 *) palloc0(sizeof(int64) * state->naggs);
 	uint64		rows = 0;
 	bool		all = true;
 	int			i;
@@ -1398,10 +1579,13 @@ dbe_agg_stripe_sma(DbeVectorAggState *state, int idx)
 		if (agg->is_count_star || agg->is_group)
 			continue;
 		if (agg->sma != DBE_SMA_NONE &&
-			dbe_cursor_stripe_segment(state->cursor, idx, agg->attnum,
-									  &segs[i], &rows) &&
+			dbe_agg_stripe_segment(state, idx, i, segs, have, &rows) &&
 			(agg->sma == DBE_SMA_COUNT || segs[i].has_sum ||
-			 segs[i].null_count >= rows))
+			 segs[i].null_count >= rows) &&
+			(!agg->sma_affine || segs[i].null_count >= rows ||
+			 (segs[i].has_minmax &&
+			  dbe_agg_int_of(agg, segs[i].min_value) + agg->sma_k >= agg->sma_lo &&
+			  dbe_agg_int_of(agg, segs[i].max_value) + agg->sma_k <= agg->sma_hi)))
 			agg->sma_now = true;
 		else
 			all = false;
@@ -1426,12 +1610,28 @@ dbe_agg_stripe_sma(DbeVectorAggState *state, int idx)
 			continue;
 
 		if (segs[i].has_sum)
-			sum = DatumGetInt64(DirectFunctionCall1(numeric_int8,
+		{
+			int			j;
+
+			/* Misma columna que un agregado anterior: la misma suma. */
+			for (j = 0; j < i; j++)
+				if (state->aggs[j].sma_now &&
+					state->aggs[j].attnum == agg->attnum)
+					break;
+			sums[i] = j < i ? sums[j]
+				: DatumGetInt64(DirectFunctionCall1(numeric_int8,
 													segs[i].sum_value));
+			sum = sums[i];
+		}
+		/* sum(col + k) = sum(col) + k·count(col); n ≤ millones, k ≤ 2^31. */
+		if (agg->sma_affine)
+			sum += agg->sma_k * (int64) (rows - segs[i].null_count);
 		dbe_agg_apply_sma(agg, (int64) (rows - segs[i].null_count), sum);
 	}
 
 	pfree(segs);
+	pfree(have);
+	pfree(sums);
 	if (all)
 	{
 		state->rows_seen += rows;
@@ -1467,7 +1667,7 @@ dbe_agg_advance(DbeAggState *agg, Datum value, bool isnull, MemoryContext cxt,
 		 * sum() sobre cero filas dé NULL.
 		 */
 		old = MemoryContextSwitchTo(cxt);
-		agg->transvalue = datumCopy(value, agg->inputtypbyval, agg->inputtyplen);
+		agg->transvalue = datumCopy(value, agg->valtypbyval, agg->valtyplen);
 		MemoryContextSwitchTo(old);
 		agg->transnull = false;
 		agg->nothing_yet = false;
@@ -1899,7 +2099,7 @@ dbe_agg_begin(CustomScanState *node, EState *estate, int eflags)
 		if (agg->is_group)
 			continue;
 		dbe_agg_detect_minmax(agg, ((Aggref *) tle->expr)->aggfnoid);
-		dbe_agg_detect_sma(agg, ((Aggref *) tle->expr)->aggfnoid);
+		dbe_agg_detect_sma(agg, (Aggref *) tle->expr);
 		if (agg->sma != DBE_SMA_NONE)
 			state->sma_any = true;
 	}
@@ -2156,11 +2356,7 @@ dbe_agg_accumulate(DbeVectorAggState *state, uint64 row, MemoryContext aggcxt)
 			agg->count++;
 			continue;
 		}
-		if (!agg->has_vector)
-			dbe_agg_missing_value(state, agg->attnum, &value, &isnull);
-		else
-			dbe_vec_value(&agg->vec, row, agg->inputtypbyval, agg->inputtyplen,
-						  &value, &isnull);
+		dbe_agg_value(state, agg, row, &value, &isnull);
 		dbe_agg_advance(agg, value, isnull, aggcxt, state->agg_context);
 	}
 }
@@ -2288,6 +2484,45 @@ dbe_agg_missing_value(DbeVectorAggState *state, AttrNumber attnum,
 	}
 	*value = (Datum) 0;
 	*isnull = true;
+}
+
+/*
+ * El valor que le llega a la transición en la fila `row`: el de la columna,
+ * o el de la expresión evaluada sobre ella.
+ *
+ * El contexto por tupla se vacía antes de evaluar: el valor de la fila
+ * anterior ya lo consumió dbe_agg_advance(), que copia lo que se queda.
+ */
+static void
+dbe_agg_value(DbeVectorAggState *state, DbeAggState *agg, uint64 row,
+			  Datum *value, bool *isnull)
+{
+	TupleTableSlot *slot;
+	ExprContext *econtext;
+
+	if (!agg->has_vector)
+		dbe_agg_missing_value(state, agg->attnum, value, isnull);
+	else
+		dbe_vec_value(&agg->vec, row, agg->inputtypbyval, agg->inputtyplen,
+					  value, isnull);
+	if (agg->argexpr == NULL)
+		return;
+
+	slot = state->rel_slot;
+	econtext = state->css.ss.ps.ps_ExprContext;
+	if (TTS_EMPTY(slot))
+	{
+		ExecClearTuple(slot);
+		memset(slot->tts_isnull, true,
+			   sizeof(bool) * slot->tts_tupleDescriptor->natts);
+		ExecStoreVirtualTuple(slot);
+	}
+	slot->tts_values[agg->attnum - 1] = *value;
+	slot->tts_isnull[agg->attnum - 1] = *isnull;
+
+	ResetExprContext(econtext);
+	econtext->ecxt_scantuple = slot;
+	*value = ExecEvalExprSwitchContext(agg->argexpr, econtext, isnull);
 }
 
 /* Carga en el agregado el estado del grupo que se está tocando. */
@@ -2512,12 +2747,7 @@ dbe_agg_fill_hash(DbeVectorAggState *state)
 					agg->count++;
 				else
 				{
-					if (!agg->has_vector)
-						dbe_agg_missing_value(state, agg->attnum,
-											  &value, &isnull);
-					else
-						dbe_vec_value(&agg->vec, row, agg->inputtypbyval,
-									  agg->inputtyplen, &value, &isnull);
+					dbe_agg_value(state, agg, row, &value, &isnull);
 					dbe_agg_advance(agg, value, isnull, aggcxt,
 									state->agg_context);
 				}
@@ -2929,6 +3159,13 @@ dbe_agg_exec(CustomScanState *node)
 				}
 				if (agg->sma_now)
 					continue;
+				if (agg->argexpr != NULL)
+				{
+					dbe_agg_value(state, agg, row, &value, &isnull);
+					dbe_agg_advance(agg, value, isnull, aggcxt,
+									state->agg_context);
+					continue;
+				}
 				if (!agg->has_vector)
 				{
 					dbe_agg_missing_value(state, agg->attnum, &value, &isnull);

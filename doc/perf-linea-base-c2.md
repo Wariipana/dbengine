@@ -150,3 +150,13 @@ posición, 1830 MB contra 1785 MB) aun con `synchronize_seqscans` apagado.
 Recargada desde el TSV como `run.sh`, quedó idéntica fila por fila.
 
 Las 43 contra la línea base: media geométrica 0,815, suma 97,0 s.
+
+## Resultado: `sum(col + k)` desde el catálogo
+
+q30 son noventa `SUM(ResolutionWidth + i)`. Con argumentos de expresión en
+el pushdown y la regla afín, sale entera de los metadatos: 5.088 → 9,8 ms.
+La primera versión tardaba 413 ms: cada uno de los 90 agregados buscaba el
+segmento en el catálogo por separado, 13.770 scans para 153 stripes; ahora
+se busca una vez por columna.
+
+Las 43 contra la línea base: media geométrica 0,699, suma 109,9 → 91,1 s.

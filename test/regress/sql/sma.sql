@@ -59,6 +59,24 @@ SELECT sum(b), count(a), count(*) FROM sm;
 ROLLBACK;
 SELECT sum(b), count(a), count(*) FROM sm;
 
+-- Argumentos que son una expresión sobre una columna.  col + k y col - k
+-- salen del catálogo (sum(col) + k·count(col)); las demás se evalúan fila
+-- por fila contra el slot.
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT sum(a + 1), sum(b - 5), avg(1 + a), count(a + 7) FROM sm;
+SELECT sum(a + 1), sum(b - 5), avg(1 + a), count(a + 7), sum(a::int4 + 100000) FROM sm;
+SELECT sum(a + 1), sum(b - 5), avg(1 + a), count(a + 7), sum(a::int4 + 100000) FROM sm_heap;
+SELECT sum(a * 2), avg(abs(b)), max(a + 1), min(length(t)) FROM sm;
+SELECT sum(a * 2), avg(abs(b)), max(a + 1), min(length(t)) FROM sm_heap;
+SELECT t, sum(a + 1), count(b - 1) FROM sm GROUP BY t ORDER BY t;
+SELECT t, sum(a + 1), count(b - 1) FROM sm_heap GROUP BY t ORDER BY t;
+SELECT sum(a + 1) FROM sm WHERE b > 100;
+SELECT sum(a + 1) FROM sm_heap WHERE b > 100;
+-- Overflow: b llega a 2147483647, así que b + 1 no entra en integer.  El
+-- zone map lo ve y el stripe se recorre fila por fila, que da el error.
+SELECT sum(b + 1) FROM sm;
+SELECT sum(b + 1) FROM sm_heap;
+
 -- Una tabla sin filas y una con un solo stripe todo nulo.
 CREATE TABLE sm_vacia (a int4) USING dbengine_columnar;
 SELECT sum(a), avg(a), count(a), count(*) FROM sm_vacia;
