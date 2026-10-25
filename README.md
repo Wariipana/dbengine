@@ -1349,6 +1349,8 @@ tools/        guarda de arquitectura y cluster de desarrollo
 | `dbengine.enable_compression` | `on` | user | F2 |
 | `dbengine.bloom_bits_per_row` | `0` | user | F5 |
 | `dbengine.debug_backtrace` | `off` | sighup | diagnóstico |
+| `dbengine.enable_dict_quals` | `on` | user | C2: predicados y expresiones por entrada del diccionario |
+| `dbengine.kernel_readahead` | `off` | user | C2: readahead del kernel en los archivos columnar |
 
 `dbengine.debug_backtrace` hace que un backend imprima su propio backtrace
 en el log si recibe `SIGSEGV`. Sirve donde no hay core dumps ni `ptrace`
@@ -1369,6 +1371,22 @@ shared_preload_libraries = 'dbengine'
 ```
 
 `SELECT dbengine_preloaded();` dice si está activa.
+
+### I/O: `io_method = io_uring`
+
+Los segmentos de un stripe se leen con un read stream, y cada lectura avisa
+`POSIX_FADV_RANDOM` para que el kernel no traiga de más las columnas
+vecinas. Ese aviso vale para el descriptor del proceso que lee, así que solo
+sirve con `io_method = sync` o `io_uring`: con `worker`, el default de PG 18,
+las lecturas las hacen los procesos de I/O con sus propios descriptores. En
+la VM de desarrollo (`read_ahead_kb` = 2 MB) la diferencia en frío es grande:
+
+| config | q21 en frío | leído del disco |
+|---|---|---|
+| `worker` | 3,84 s | 559 MB |
+| `io_uring` | 1,42 s | 271 MB |
+
+Para tablas columnar que no entran en memoria conviene `io_uring`.
 
 El worker aparece en la tabla de procesos como `postgres: dbengine
 maintenance`, pero **no** en `pg_stat_activity`: en F0 se registra con

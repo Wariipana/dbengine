@@ -36,6 +36,7 @@ bool		dbe_enable_compression = true;
 bool		dbe_enable_zonemap_pruning = true;
 bool		dbe_enable_granule_pruning = true;
 bool		dbe_enable_dict_quals = true;
+bool		dbe_kernel_readahead = false;
 bool		dbe_enable_learned_zonemaps = false;	/* F5, experimental */
 bool		dbe_enable_adaptive_clustering = false; /* F6 */
 int			dbe_retention_window = 86400;
@@ -213,6 +214,17 @@ dbe_define_gucs(void)
 							 "tienen el mismo código.",
 							 &dbe_enable_dict_quals,
 							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("dbengine.kernel_readahead",
+							 "Deja el readahead del kernel en los archivos columnar.",
+							 "Apagado, cada lectura avisa POSIX_FADV_RANDOM: el kernel "
+							 "trae de más las columnas vecinas, que la query no pidió. "
+							 "Solo tiene efecto con io_method = sync o io_uring.",
+							 &dbe_kernel_readahead,
+							 false,
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);

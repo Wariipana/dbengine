@@ -164,11 +164,17 @@ Tres hechos del código que ordenan la lista:
        que todas sus filas pasan el `WHERE`, se usan los metadatos sin
        evaluar nada — hoy un `WHERE` apaga todos los atajos. Ataca q30, q3,
        q4, q2, q8. Ref.: Moerkotte, *Small Materialized Aggregates*, VLDB 1998.
-2. [ ] **`read_stream` + AIO de PG 18** en `dbe_storage_read`: un segmento
-       es un rango contiguo de bloques (`READ_STREAM_SEQUENTIAL`). Medir en
-       frío, con `io_method` worker e io_uring. Revisar de paso la
-       `BufferAccessStrategy` (hoy ninguna: un scan grande desaloja todo
-       `shared_buffers`).
+2. [x] **`read_stream` + AIO de PG 18** en la carga del stripe: todos los
+       segmentos que pide la query en un solo stream (`READ_STREAM_FULL`),
+       con `dbe_storage_read_ranges`. Lo que más pesaba en frío no era la
+       latencia sino el **volumen**: con el `read_ahead_kb` de 2 MB de la
+       VM, el kernel traía de más las columnas vecinas (q21: 559 MB leídos
+       para usar 271). Ahora cada lectura avisa `POSIX_FADV_RANDOM`, que
+       solo sirve con `io_method` sync o io_uring (con worker leen los
+       procesos de I/O). En frío, 20 queries: media geométrica 0,882 con
+       worker y **0,735 con io_uring**; q21 3,0×, q22 2,8×, q25 4,6×, q4
+       3,5×. En caliente, sin cambios. La `BufferAccessStrategy` queda
+       pendiente: con 128 MB de `shared_buffers` la tabla no entra igual.
 3. [ ] **`count(DISTINCT)` por unión de diccionarios**: en un segmento con
        diccionario, las entradas *son* los valores distintos del stripe; sin
        filtro y con todo visible, alcanza con unir diccionarios (q6). Y

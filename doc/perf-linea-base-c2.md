@@ -117,3 +117,21 @@ vez por el motor de regexp en vez de ~3. Misma GUC, dos vueltas:
 | q34, q35 | | | ruido |
 
 Las 43 contra la línea base: media geométrica 0,879, suma 109,9 → 96,8 s.
+
+## Resultado: read stream y readahead (C2.1b, ítem 2)
+
+En frío (page cache de la relación soltado antes de cada query), las 20 de
+`cold.sh`, solo dbengine. El disco de la VM da ~150 MB/s secuenciales con
+bloques de 1 MB y 18 MB/s con lecturas sincrónicas de 8 kB.
+
+| | media geométrica | suma |
+|---|---|---|
+| antes (`ReadBuffer` por bloque, worker) | 1 | 86,3 s |
+| read stream, worker | 0,882 | 81,7 s |
+| read stream + `FADV_RANDOM`, io_uring | **0,735** | 72,2 s |
+
+Lo que encontró la medición: q21 pedía 274 MB y el disco leía 532. Con
+`read_ahead_kb` = 2048, el readahead del kernel es más grande que un segmento
+entero y trae las columnas de al lado. Con `FADV_RANDOM` se lee del disco
+exactamente lo pedido (271 MB). q24 (las 105 columnas) no cambia: lee la
+tabla entera y está en el techo del disco.

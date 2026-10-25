@@ -8,10 +8,16 @@
  */
 #include "postgres.h"
 
+#include <fcntl.h>
+
+
 #include "access/xloginsert.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
+#include "storage/md.h"
+#include "storage/read_stream.h"
+#include "storage/smgr.h"
 
 #include "dbengine/dbengine.h"
 #include "dbengine/storage.h"
@@ -323,4 +329,165 @@ dbe_storage_read(Relation rel, uint64 offset, char *dest, uint64 len)
 		dest += chunk;
 		len -= chunk;
 	}
+}
+
+/* --- Lectura con read stream -------------------------------------------- */
+
+typedef struct DbeRangeStream
+{
+	DbeReadRange *ranges;		/* ordenados por offset */
+	int			nranges;
+	int			next_range;
+	BlockNumber next_block;		/* nunca baja: un bloque compartido sale una vez */
+} DbeRangeStream;
+
+static int
+dbe_range_cmp(const void *a, const void *b)
+{
+	uint64		x = ((const DbeReadRange *) a)->offset;
+	uint64		y = ((const DbeReadRange *) b)->offset;
+
+	return (x > y) - (x < y);
+}
+
+static BlockNumber
+dbe_range_stream_next(ReadStream *stream, void *callback_private_data,
+					  void *per_buffer_data)
+{
+	DbeRangeStream *rs = (DbeRangeStream *) callback_private_data;
+
+	while (rs->next_range < rs->nranges)
+	{
+		DbeReadRange *r = &rs->ranges[rs->next_range];
+		BlockNumber first = DBE_BLOCK_OF(r->offset);
+		BlockNumber last = DBE_BLOCK_OF(r->offset + r->len - 1);
+
+		if (rs->next_block < first)
+			rs->next_block = first;
+		if (rs->next_block <= last)
+			return rs->next_block++;
+		rs->next_range++;
+	}
+	return InvalidBlockNumber;
+}
+
+/*
+ * Apaga el readahead del kernel en los archivos que vamos a leer.
+ *
+ * El kernel ve lecturas secuenciales dentro de un segmento y trae de más,
+ * y lo que trae de más son las columnas de al lado, que la query no pidió.
+ * Con el read_ahead_kb de 2 MB de la VM de desarrollo, más grande que un
+ * segmento entero, q21 en frío leía 559 MB del disco para usar 271.  El
+ * read stream ya pide por adelantado exactamente los bloques que hacen
+ * falta, así que el readahead del kernel solo suma volumen.
+ *
+ * POSIX_FADV_RANDOM vale para el descriptor de ESTE proceso.  Sirve con
+ * io_method = sync o io_uring, donde las lecturas salen del backend; con
+ * worker (el default de PG 18) las hacen los procesos de I/O con sus
+ * propios descriptores y no tiene efecto.  Se repite en cada lectura
+ * porque md.c puede cerrar y reabrir el archivo (el LRU de descriptores).
+ */
+static void
+dbe_storage_no_readahead(Relation rel, BlockNumber first, BlockNumber last)
+{
+#ifdef POSIX_FADV_RANDOM
+	BlockNumber seg;
+
+	for (seg = first / RELSEG_SIZE; seg <= last / RELSEG_SIZE; seg++)
+	{
+		uint32		off;
+		int			fd = mdfd(RelationGetSmgr(rel), MAIN_FORKNUM,
+							  seg * RELSEG_SIZE, &off);
+
+		(void) posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+	}
+#endif
+}
+
+void
+dbe_storage_read_ranges(Relation rel, DbeReadRange *ranges, int nranges,
+						BufferAccessStrategy strategy)
+{
+	DbeRangeStream rs;
+	ReadStream *stream;
+	BlockNumber nblocks;
+	int			first = 0;
+	int			n = 0;
+	int			i;
+
+	/* Los rangos vacíos no piden bloques: se sacan antes de ordenar. */
+	for (i = 0; i < nranges; i++)
+		if (ranges[i].len > 0)
+			ranges[n++] = ranges[i];
+	if (n == 0)
+		return;
+	qsort(ranges, n, sizeof(DbeReadRange), dbe_range_cmp);
+
+	nblocks = RelationGetNumberOfBlocks(rel);
+	{
+		DbeReadRange *r = &ranges[n - 1];
+		BlockNumber last = DBE_BLOCK_OF(r->offset + r->len - 1);
+
+		if (last >= nblocks)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("dbengine: lectura fuera del storage de \"%s\" "
+							"(bloque %u de %u)",
+							RelationGetRelationName(rel), last, nblocks)));
+	}
+
+	if (!dbe_kernel_readahead)
+		dbe_storage_no_readahead(rel, DBE_BLOCK_OF(ranges[0].offset),
+								 DBE_BLOCK_OF(ranges[n - 1].offset +
+											  ranges[n - 1].len - 1));
+
+	rs.ranges = ranges;
+	rs.nranges = n;
+	rs.next_range = 0;
+	rs.next_block = 0;
+
+	/*
+	 * READ_STREAM_FULL: ya se sabe que hacen falta todos los bloques, así
+	 * que no tiene sentido que el stream arranque de a poco.
+	 */
+	stream = read_stream_begin_relation(READ_STREAM_FULL, strategy, rel,
+										MAIN_FORKNUM, dbe_range_stream_next,
+										&rs, 0);
+
+	for (;;)
+	{
+		Buffer		buf = read_stream_next_buffer(stream, NULL);
+		BlockNumber blkno;
+		uint64		blk_lo;
+		uint64		blk_hi;
+		char	   *page;
+
+		if (buf == InvalidBuffer)
+			break;
+
+		blkno = BufferGetBlockNumber(buf);
+		blk_lo = (uint64) (blkno - DBE_FIRST_DATA_BLOCK) * DBE_PAGE_USABLE;
+		blk_hi = blk_lo + DBE_PAGE_USABLE;
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = (char *) BufferGetPage(buf);
+
+		/* Cada rango que toca este bloque se lleva su parte. */
+		for (i = first; i < n && ranges[i].offset < blk_hi; i++)
+		{
+			DbeReadRange *r = &ranges[i];
+			uint64		lo = Max(r->offset, blk_lo);
+			uint64		hi = Min(r->offset + r->len, blk_hi);
+
+			if (lo < hi)
+				memcpy(r->dest + (lo - r->offset),
+					   page + SizeOfPageHeaderData + (lo - blk_lo), hi - lo);
+			if (r->offset + r->len <= blk_hi && i == first)
+				first++;
+		}
+
+		UnlockReleaseBuffer(buf);
+	}
+
+	read_stream_end(stream);
 }

@@ -38,6 +38,7 @@ struct DbeRowCursor
 	DbeStripeVisibility stripe_vis;
 	DbeSegReader *cid_reader;	/* solo si stripe_vis == PARTIAL */
 	uint64		stripe_loads;	/* sube al soltar cada stripe: ver dbe_cursor_reader() */
+	BufferAccessStrategy strategy;	/* NULL: sin anillo (ver dbe_cursor_begin) */
 	uint64		row_in_stripe;
 
 	int			natts;
@@ -652,22 +653,40 @@ dbe_cursor_load_stripe(DbeRowCursor *cur, int index)
 			pfree(mask);
 	}
 
+	/*
+	 * Todos los segmentos del stripe en una sola lectura: un read stream
+	 * ve todos los bloques de antemano, combina los contiguos y los pide
+	 * en paralelo.  Leerlos de a uno con ReadBuffer era un pread de 8 kB
+	 * por vez, y en frío q21 pasaba el 75% esperando.
+	 *
+	 * palloc devuelve memoria alineada a MAXALIGN y el segmento arranca en
+	 * su byte 0, así que el área de datos queda alineada a 8 como espera el
+	 * reader.
+	 */
+	{
+		DbeReadRange *ranges = (DbeReadRange *) palloc(sizeof(DbeReadRange) * cur->natts);
+		int			nranges = 0;
+
+		for (i = 0; i < cur->natts; i++)
+		{
+			if (!cur->seg_found[i])
+				continue;
+			cur->segbufs[i] = (char *) palloc(segs[i].seg_length);
+			ranges[nranges].offset = stripe->data_offset + segs[i].seg_offset;
+			ranges[nranges].dest = cur->segbufs[i];
+			ranges[nranges].len = segs[i].seg_length;
+			nranges++;
+		}
+		dbe_storage_read_ranges(cur->rel, ranges, nranges, cur->strategy);
+		pfree(ranges);
+	}
+
 	for (i = 0; i < cur->natts; i++)
 	{
 		DbeStatus	st;
 
 		if (!cur->seg_found[i])
 			continue;
-
-		/*
-		 * palloc devuelve memoria alineada a MAXALIGN y el segmento
-		 * arranca en su byte 0, así que el área de datos queda alineada a 8
-		 * como espera el reader.
-		 */
-		cur->segbufs[i] = (char *) palloc(segs[i].seg_length);
-		dbe_storage_read(cur->rel, stripe->data_offset + segs[i].seg_offset,
-						 cur->segbufs[i], segs[i].seg_length);
-
 		st = dbe_segreader_open(cur->segbufs[i], (uint32) segs[i].seg_length,
 								&cur->readers[i]);
 		dbe_error_if_not_ok(&st, "abriendo un segmento de columna");

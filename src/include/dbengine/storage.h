@@ -25,6 +25,7 @@
 
 #include "postgres.h"
 
+#include "storage/buf.h"
 #include "storage/bufpage.h"
 #include "utils/rel.h"
 
@@ -87,5 +88,22 @@ extern void dbe_storage_write(Relation rel, uint64 offset,
 							  const char *data, uint64 len);
 extern void dbe_storage_read(Relation rel, uint64 offset,
 							 char *dest, uint64 len);
+
+/*
+ * Varias lecturas de una, con un read stream: el bufmgr combina bloques
+ * contiguos en lecturas grandes y las lanza por adelantado (AIO desde
+ * PG 18), en vez de un ReadBuffer sincrónico por bloque.  Los rangos no se
+ * pueden pisar; pueden venir en cualquier orden y compartir bloque.
+ */
+typedef struct DbeReadRange
+{
+	uint64		offset;
+	char	   *dest;
+	uint64		len;
+} DbeReadRange;
+
+extern void dbe_storage_read_ranges(Relation rel, DbeReadRange *ranges,
+									int nranges,
+									BufferAccessStrategy strategy);
 
 #endif							/* DBENGINE_STORAGE_H */

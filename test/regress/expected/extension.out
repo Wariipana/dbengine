@@ -35,11 +35,12 @@ ORDER BY name;
  dbengine.enable_learned_zonemaps    | off     |      | user
  dbengine.enable_vectorized          | on      |      | user
  dbengine.enable_zonemap_pruning     | on      |      | user
+ dbengine.kernel_readahead           | off     |      | user
  dbengine.max_blocks_per_compaction  | 64      |      | sighup
  dbengine.retention_window           | 86400   | s    | user
  dbengine.staging_threshold_rows     | 65536   |      | user
  dbengine.worker_naptime             | 60      | s    | sighup
-(16 rows)
+(17 rows)
 
 -- El prefijo está reservado: una GUC inventada bajo dbengine.* falla.
 DO $$
