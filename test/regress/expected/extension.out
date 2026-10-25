@@ -30,6 +30,7 @@ ORDER BY name;
  dbengine.enable_adaptive_clustering | off     |      | sighup
  dbengine.enable_agg_pushdown        | on      |      | user
  dbengine.enable_compression         | on      |      | user
+ dbengine.enable_dict_quals          | on      |      | user
  dbengine.enable_granule_pruning     | on      |      | user
  dbengine.enable_learned_zonemaps    | off     |      | user
  dbengine.enable_vectorized          | on      |      | user
@@ -38,7 +39,7 @@ ORDER BY name;
  dbengine.retention_window           | 86400   | s    | user
  dbengine.staging_threshold_rows     | 65536   |      | user
  dbengine.worker_naptime             | 60      | s    | sighup
-(15 rows)
+(16 rows)
 
 -- El prefijo está reservado: una GUC inventada bajo dbengine.* falla.
 DO $$

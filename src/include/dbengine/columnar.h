@@ -169,6 +169,11 @@ extern bool dbe_cursor_next_keys(DbeRowCursor *cur, TupleTableSlot *slot);
 extern bool dbe_cursor_next_keys_in_stripe(DbeRowCursor *cur,
 										   TupleTableSlot *slot);
 extern void dbe_cursor_fill_rest(DbeRowCursor *cur, TupleTableSlot *slot);
+/* Completa una sola columna de la fila que dejó next_keys(). */
+extern void dbe_cursor_fill_column(DbeRowCursor *cur, TupleTableSlot *slot,
+								   AttrNumber attnum);
+/* Fila (dentro del stripe) que dejó el último next_keys(). */
+extern uint64 dbe_cursor_current_row(DbeRowCursor *cur);
 
 extern bool dbe_cursor_next(DbeRowCursor *cur, TupleTableSlot *slot);
 extern bool dbe_cursor_fetch_rownum(DbeRowCursor *cur, uint64 rownum,
@@ -224,6 +229,15 @@ extern bool dbe_cursor_row_is_visible(DbeRowCursor *cur, uint64 row);
 /* Vista de una columna del stripe actual.  false si no se cargó. */
 extern bool dbe_cursor_column(DbeRowCursor *cur, AttrNumber attnum,
 							  DbeColumnVector *out);
+
+/*
+ * El lector del segmento de una columna en el stripe actual, o NULL.  En
+ * *generation queda un número que cambia cada vez que se suelta un stripe:
+ * comparar punteros no alcanza, porque el lector nuevo puede caer en la
+ * misma dirección que el anterior.
+ */
+extern DbeSegReader *dbe_cursor_reader(DbeRowCursor *cur, AttrNumber attnum,
+									   uint64 *generation);
 
 /* Cuántos stripes ve el cursor; lo usa el scan paralelo. */
 extern int	dbe_cursor_nstripes(DbeRowCursor *cur);

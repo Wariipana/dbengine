@@ -35,6 +35,7 @@ bool		dbe_enable_agg_pushdown = true;
 bool		dbe_enable_compression = true;
 bool		dbe_enable_zonemap_pruning = true;
 bool		dbe_enable_granule_pruning = true;
+bool		dbe_enable_dict_quals = true;
 bool		dbe_enable_learned_zonemaps = false;	/* F5, experimental */
 bool		dbe_enable_adaptive_clustering = false; /* F6 */
 int			dbe_retention_window = 86400;
@@ -199,6 +200,18 @@ dbe_define_gucs(void)
 							 "saltearse la mayoría de sus filas. No ahorra I/O: "
 							 "ahorra decodificar y evaluar el predicado.",
 							 &dbe_enable_granule_pruning,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("dbengine.enable_dict_quals",
+							 "Evalúa los predicados una vez por entrada del diccionario.",
+							 "Una cláusula que mira una sola columna con diccionario "
+							 "se evalúa la primera vez que aparece cada valor y el "
+							 "resultado se reusa en las demás filas del stripe que "
+							 "tienen el mismo código.",
+							 &dbe_enable_dict_quals,
 							 true,
 							 PGC_USERSET,
 							 0,

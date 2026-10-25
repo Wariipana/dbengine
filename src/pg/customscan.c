@@ -37,6 +37,7 @@
 #include "dbengine/columnar.h"
 #include "dbengine/customscan.h"
 #include "dbengine/dbengine.h"
+#include "dbengine/dictqual.h"
 #include "dbengine/workload.h"
 #include "dbengine/zonemap.h"
 
@@ -77,7 +78,7 @@ typedef struct DbeScanState
 	 * El predicado se evalúa acá adentro, no en plan.qual, para poder
 	 * hacerlo ANTES de terminar de armar la fila (late materialization).
 	 */
-	ExprState  *qual;
+	DbeDictQual *qual;
 	uint64		rows_filtered;
 	uint64		stripes_pruned;	/* total del plan, solo si totals_ready */
 	uint64		granules_pruned;
@@ -640,7 +641,10 @@ dbe_begin_scan(CustomScanState *node, EState *estate, int eflags)
 		Bitmapset  *cols = NULL;
 		int			x = -1;
 
-		state->qual = ExecInitQual(cscan->custom_exprs, &node->ss.ps);
+		state->qual = dbe_dictqual_build(cscan->custom_exprs,
+										 cscan->scan.scanrelid,
+										 RelationGetDescr(relation),
+										 &node->ss.ps, estate);
 
 		filter_cols = (bool *) palloc0(sizeof(bool) * natts);
 		foreach(lc, cscan->custom_exprs)
@@ -652,7 +656,13 @@ dbe_begin_scan(CustomScanState *node, EState *estate, int eflags)
 
 			if (a >= 1 && a <= natts)
 			{
-				filter_cols[a - 1] = true;
+				/*
+				 * Las perezosas no se cargan antes del predicado: si el
+				 * resultado para su código ya se conoce, no hace falta el
+				 * valor.  Quedan con el resto y se completan si la fila pasa.
+				 */
+				if (!dbe_dictqual_lazy_column(state->qual, a))
+					filter_cols[a - 1] = true;
 
 				/*
 				 * Una columna que el predicado mira tiene que leerse sí o
@@ -688,6 +698,15 @@ dbe_begin_scan(CustomScanState *node, EState *estate, int eflags)
  * Sin predicado la respuesta es siempre sí y no se evalúa nada — el cursor
  * ya llenó todo, porque set_filter_columns() no se llamó.
  */
+/* Carga en el slot una columna perezosa: ver dbe_dictqual_lazy_column(). */
+static void
+dbe_scan_fill_column(void *arg, AttrNumber attnum)
+{
+	DbeScanState *state = (DbeScanState *) arg;
+
+	dbe_cursor_fill_column(state->cursor, state->css.ss.ss_ScanTupleSlot, attnum);
+}
+
 static bool
 dbe_scan_row_passes(DbeScanState *state, TupleTableSlot *slot)
 {
@@ -705,13 +724,13 @@ dbe_scan_row_passes(DbeScanState *state, TupleTableSlot *slot)
 	}
 
 	econtext->ecxt_scantuple = slot;
-	if (!ExecQual(state->qual, econtext))
+	if (!dbe_dictqual_eval(state->qual, state->cursor,
+						   dbe_cursor_current_row(state->cursor), econtext,
+						   dbe_scan_fill_column, state))
 	{
 		state->rows_filtered++;
-		ResetExprContext(econtext);
 		return false;
 	}
-	ResetExprContext(econtext);
 
 	/* Recién ahora se decodifican las columnas que el predicado no mira. */
 	dbe_cursor_fill_rest(state->cursor, slot);
@@ -788,6 +807,7 @@ dbe_rescan_scan(CustomScanState *node)
 	state->totals_ready = false;
 	if (state->cursor != NULL)
 		dbe_cursor_rescan(state->cursor);
+	dbe_dictqual_reset(state->qual);
 }
 
 /* ------------------------------------------------------------------------

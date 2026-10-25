@@ -37,6 +37,7 @@ struct DbeRowCursor
 	DbeStripeDesc *stripe;
 	DbeStripeVisibility stripe_vis;
 	DbeSegReader *cid_reader;	/* solo si stripe_vis == PARTIAL */
+	uint64		stripe_loads;	/* sube al soltar cada stripe: ver dbe_cursor_reader() */
 	uint64		row_in_stripe;
 
 	int			natts;
@@ -341,6 +342,15 @@ dbe_cursor_column(DbeRowCursor *cur, AttrNumber attnum, DbeColumnVector *out)
 	return true;
 }
 
+DbeSegReader *
+dbe_cursor_reader(DbeRowCursor *cur, AttrNumber attnum, uint64 *generation)
+{
+	*generation = cur->stripe_loads;
+	if (attnum < 1 || attnum > cur->natts)
+		return NULL;
+	return cur->readers[attnum - 1];
+}
+
 Datum
 dbe_varlena_datum(const void *data, char attalign, MemoryContext cxt)
 {
@@ -476,6 +486,8 @@ static void
 dbe_cursor_unload_stripe(DbeRowCursor *cur)
 {
 	int			i;
+
+	cur->stripe_loads++;
 
 	for (i = 0; i < cur->natts; i++)
 	{
@@ -969,6 +981,20 @@ dbe_cursor_next_keys_in_stripe(DbeRowCursor *cur, TupleTableSlot *slot)
 		dbe_cursor_end_row(cur, row, slot);
 		return true;
 	}
+}
+
+void
+dbe_cursor_fill_column(DbeRowCursor *cur, TupleTableSlot *slot, AttrNumber attnum)
+{
+	int			att = attnum - 1;
+
+	dbe_cursor_fill_atts(cur, cur->last_row, slot, &att, 1);
+}
+
+uint64
+dbe_cursor_current_row(DbeRowCursor *cur)
+{
+	return cur->last_row;
 }
 
 void

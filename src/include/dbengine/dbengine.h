@@ -38,6 +38,7 @@ extern bool dbe_enable_agg_pushdown;
 extern bool dbe_enable_compression;
 extern bool dbe_enable_zonemap_pruning;
 extern bool dbe_enable_granule_pruning;
+extern bool dbe_enable_dict_quals;
 extern bool dbe_enable_learned_zonemaps;
 extern bool dbe_enable_adaptive_clustering;
 extern int	dbe_retention_window;	/* segundos */

@@ -182,12 +182,25 @@ Tres hechos del código que ordenan la lista:
 
 ### C2.2 — Trabajar sobre los datos comprimidos
 
-5. [ ] **Evaluar una vez por entrada del diccionario**: predicados (`LIKE`,
+5. [~] **Evaluar una vez por entrada del diccionario**: predicados (`LIKE`,
        `<> ''`, `=`) y expresiones inmutables (`length`, `REGEXP_REPLACE`,
        `extract`) se calculan por entrada y se guardan en un arreglo
        indexado por código. Ataca q21–q23, q28, q29 (20,8 s; 4,7 s son el
-       regexp), q11–q15, q37–q43. Solo funciones inmutables y con la
-       colación de la columna; se apaga si el diccionario ≈ las filas.
+       regexp), q11–q15, q37–q43.
+       - [x] **Predicados** (`src/pg/dictqual.c`, Custom Scan y pushdown de
+         agregados): una cláusula sin funciones volátiles que mira una sola
+         columna de largo variable se evalúa la primera vez que aparece cada
+         código del stripe; las demás filas leen un byte. Si ninguna otra
+         cláusula mira esa columna, ni siquiera se lee el valor de las filas
+         cuyo código ya se conoce. GUC `dbengine.enable_dict_quals`. A/B con
+         la GUC: q21 1,59×, q22 1,78×, **q23 2,2×**, q24 1,34×, q26 1,4×,
+         q27 1,35×. Contra la línea base, las 43: media geométrica 0,887.
+       - [ ] **Expresiones del SELECT** (`REGEXP_REPLACE` de q29,
+         `length(URL)` de q28): el mismo arreglo por código, pero para el
+         valor proyectado.
+       - De paso: el EXPLAIN de `DbengineVectorAgg` dentro de una subconsulta
+         fallaba ("invalid attnum 2 for relation v"): setrefs.c no corrige
+         los Var de `custom_private`.
 6. [ ] **`LIKE` sobre FSST sin descomprimir** (autómata sobre los códigos
        de símbolo): 2,5×–17× sobre descomprimir y comparar según Pop, Riedl
        y Neumann (TUM). Vortex lo implementa para `prefix%` y `%needle%`,

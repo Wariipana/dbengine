@@ -82,3 +82,25 @@ entre medio, mejor de 3 en caliente, dos vueltas:
 Las 43 contra la línea base: media geométrica de dbengine 0,993 del tiempo
 anterior; la suma no se mueve porque la dominan q29, q33 y q9/q10/q19, que
 no pasan por acá.
+
+## Resultado: predicados por entrada del diccionario (C2.2, ítem 5)
+
+Mismo binario, `dbengine.enable_dict_quals` apagado y prendido, dos vueltas
+(mejor de 3 en caliente):
+
+| query | apagado | prendido | |
+|---|---|---|---|
+| q21 `count(*) WHERE URL LIKE` | 1.088–1.096 ms | 687–688 ms | 1,59× |
+| q22 | 1.250–1.256 ms | 704–710 ms | 1,78× |
+| q23 `SELECT * WHERE Title LIKE ... AND URL NOT LIKE` | 2.111–2.129 ms | 959–971 ms | **2,2×** |
+| q24 | 1.602–1.606 ms | 1.198–1.203 ms | 1,34× |
+| q26 | 369–370 ms | 262–274 ms | 1,4× |
+| q27 | 427–428 ms | 316–317 ms | 1,35× |
+
+Dos partes: el resultado se guarda por código (un byte por entrada del
+diccionario) y la columna se lee recién cuando hay que evaluar de verdad.
+La primera sola daba 1,25×–1,43×; con la segunda sale `dbe_segreader_get`
+(21% de q21) del camino de las filas cuyo código ya se conoce.
+
+Las 43 contra la línea base, con esto y la apertura perezosa: media
+geométrica 0,887, suma 109,9 → 105,4 s.

@@ -62,10 +62,13 @@
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
+#include "rewrite/rewriteManip.h"
+
 #include "dbengine/catalog.h"
 #include "dbengine/columnar.h"
 #include "dbengine/customscan.h"
 #include "dbengine/dbengine.h"
+#include "dbengine/dictqual.h"
 #include "dbengine/zonemap.h"
 
 #define DBE_AGG_NAME "DbengineVectorAgg"
@@ -204,12 +207,14 @@ typedef struct DbeVectorAggState
 	 * varno que no sea INNER_VAR/OUTER_VAR a EEOP_SCAN_VAR, que lee
 	 * ecxt_scantuple por varattno.
 	 */
-	ExprState  *qual;
+	DbeDictQual *qual;
 	DbeFilterSet *filters;
 	int			nqualcols;
 	AttrNumber *qualcols;
 	DbeColumnVector *qualvecs;
 	bool	   *qualvec_ok;
+	bool	   *qual_lazy;		/* solo la miran cláusulas de diccionario */
+	uint64		qual_row;		/* fila que se está evaluando, para el fill */
 	int16	   *qual_typlen;
 	bool	   *qual_typbyval;
 	uint64		rows_filtered;
@@ -1745,7 +1750,9 @@ dbe_agg_begin(CustomScanState *node, EState *estate, int eflags)
 			 * que lee ecxt_scantuple.  Es lo mismo que hace
 			 * ExecPrepareQual() para los quals que no cuelgan de un nodo.
 			 */
-			state->qual = ExecPrepareQual(quals, estate);
+			state->qual = dbe_dictqual_build(quals,
+											 (Index) intVal(lthird(cscan->custom_private)),
+											 desc, NULL, estate);
 
 			foreach(lc, quals)
 				pull_varattnos((Node *) lfirst(lc),
@@ -1761,6 +1768,7 @@ dbe_agg_begin(CustomScanState *node, EState *estate, int eflags)
 		state->qualvec_ok = (bool *) palloc0(sizeof(bool) * Max(state->nqualcols, 1));
 		state->qual_typlen = (int16 *) palloc0(sizeof(int16) * Max(state->nqualcols, 1));
 		state->qual_typbyval = (bool *) palloc0(sizeof(bool) * Max(state->nqualcols, 1));
+		state->qual_lazy = (bool *) palloc0(sizeof(bool) * Max(state->nqualcols, 1));
 
 		i = 0;
 		while ((x = bms_next_member(cols, x)) >= 0)
@@ -1782,6 +1790,7 @@ dbe_agg_begin(CustomScanState *node, EState *estate, int eflags)
 			state->qualcols[i] = a;
 			state->qual_typlen[i] = att->attlen;
 			state->qual_typbyval[i] = att->attbyval;
+			state->qual_lazy[i] = dbe_dictqual_lazy_column(state->qual, a);
 			i++;
 		}
 	}
@@ -1845,13 +1854,32 @@ dbe_vec_value(DbeColumnVector *vec, uint64 row, bool typbyval, int16 typlen,
  *
  * Los stripes que el zone map descarta no llegan hasta acá.
  */
+/* Carga en el slot una columna perezosa: ver dbe_dictqual_lazy_column(). */
+static void
+dbe_agg_fill_qualcol(void *arg, AttrNumber attnum)
+{
+	DbeVectorAggState *state = (DbeVectorAggState *) arg;
+	TupleTableSlot *slot = state->rel_slot;
+	int			i;
+
+	for (i = 0; i < state->nqualcols; i++)
+	{
+		if (state->qualcols[i] != attnum || !state->qualvec_ok[i])
+			continue;
+		dbe_vec_value(&state->qualvecs[i], state->qual_row,
+					  state->qual_typbyval[i], state->qual_typlen[i],
+					  &slot->tts_values[attnum - 1],
+					  &slot->tts_isnull[attnum - 1]);
+		return;
+	}
+}
+
 static bool
 dbe_agg_row_passes(DbeVectorAggState *state, uint64 row)
 {
 	TupleTableSlot *slot = state->rel_slot;
 	ExprContext *econtext = state->css.ss.ps.ps_ExprContext;
 	int			i;
-	bool		pass;
 
 	/*
 	 * El slot se prepara una sola vez.  Es virtual y nadie lo materializa,
@@ -1872,8 +1900,8 @@ dbe_agg_row_passes(DbeVectorAggState *state, uint64 row)
 	{
 		AttrNumber	a = state->qualcols[i];
 
-		if (!state->qualvec_ok[i])
-			continue;			/* columna agregada después: queda NULL */
+		if (!state->qualvec_ok[i] || state->qual_lazy[i])
+			continue;			/* agregada después (queda NULL), o perezosa */
 
 		dbe_vec_value(&state->qualvecs[i], row, state->qual_typbyval[i],
 					  state->qual_typlen[i], &slot->tts_values[a - 1],
@@ -1881,10 +1909,9 @@ dbe_agg_row_passes(DbeVectorAggState *state, uint64 row)
 	}
 
 	econtext->ecxt_scantuple = slot;
-	pass = ExecQual(state->qual, econtext);
-	ResetExprContext(econtext);
-
-	return pass;
+	state->qual_row = row;
+	return dbe_dictqual_eval(state->qual, state->cursor, row, econtext,
+							 dbe_agg_fill_qualcol, state);
 }
 
 /* ------------------------------------------------------------------------
@@ -2806,6 +2833,7 @@ dbe_agg_rescan(CustomScanState *node)
 	state->published = false;
 	state->totals_ready = false;
 	dbe_cursor_rescan(state->cursor);
+	dbe_dictqual_reset(state->qual);
 }
 
 /*
@@ -2903,6 +2931,22 @@ dbe_agg_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 	{
 		List	   *context;
 		char	   *str;
+		Index		relid = (Index) intVal(lthird(cscan->custom_private));
+
+		/*
+		 * setrefs.c le suma a scanrelid el offset del range table aplanado,
+		 * pero no toca custom_private: dentro de una subconsulta los Var de
+		 * los quals siguen apuntando al índice viejo, que ahora es otra
+		 * relación ("invalid attnum 2 for relation v").  Para ejecutar da
+		 * igual —se evalúan contra el slot—, pero para imprimirlos hay que
+		 * llevarlos al índice nuevo.
+		 */
+		if (cscan->scan.scanrelid != relid)
+		{
+			quals = copyObject(quals);
+			OffsetVarNodes((Node *) quals,
+						   (int) cscan->scan.scanrelid - (int) relid, 0);
+		}
 
 		context = set_deparse_context_plan(es->deparse_cxt,
 										   node->ss.ps.plan, ancestors);
