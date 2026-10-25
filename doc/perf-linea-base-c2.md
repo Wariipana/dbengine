@@ -160,3 +160,23 @@ segmento en el catálogo por separado, 13.770 scans para 153 stripes; ahora
 se busca una vez por columna.
 
 Las 43 contra la línea base: media geométrica 0,699, suma 109,9 → 91,1 s.
+
+## Resultado: filas repetidas descartadas en el scan
+
+q9, q10 y q19 pasan casi todo el tiempo en el executor de Postgres, no en
+el scan: en q9 el scan tarda 1,5 s y el Sort de 10M filas `(RegionID,
+UserID)`, que vuelca 254 MB a disco con `work_mem` de 4 MB, otros 5 s. Con
+un `SELECT DISTINCT` previo escrito a mano baja a 2,3 s: hay 1,54M pares
+distintos.
+
+Si todos los agregados de un GROUP BY ignoran duplicados (`DISTINCT`,
+`min`, `max`), el scan descarta las filas iguales dentro de cada stripe y el
+plan de arriba es el de siempre. El descarte es exacto dentro del stripe y
+nada más, así que la memoria la acota un stripe; lo que se repite entre
+stripes lo resuelve el DISTINCT. En q9 sobreviven 1,61M filas de 10M, casi
+el piso. En paralelo cada worker descarta y ordena lo suyo, y un Gather
+Merge junta: **q9 6.261 → 1.068 ms (5,9×)**, q11 489 → 219 ms, q12
+587 → 244 ms, q14 1.286 → 1.050 ms. q10 y q19 tienen `count(*)` y `sum`,
+que sí cuentan repeticiones; siguen siendo Sort/HashAggregate de Postgres.
+
+Las 43 contra la línea base: media geométrica 0,655, suma 109,9 → 85,7 s.

@@ -36,6 +36,7 @@ bool		dbe_enable_compression = true;
 bool		dbe_enable_zonemap_pruning = true;
 bool		dbe_enable_granule_pruning = true;
 bool		dbe_enable_dict_quals = true;
+bool		dbe_enable_scan_dedup = true;
 bool		dbe_kernel_readahead = false;
 bool		dbe_enable_learned_zonemaps = false;	/* F5, experimental */
 bool		dbe_enable_adaptive_clustering = false; /* F6 */
@@ -213,6 +214,17 @@ dbe_define_gucs(void)
 							 "resultado se reusa en las demás filas del stripe que "
 							 "tienen el mismo código.",
 							 &dbe_enable_dict_quals,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("dbengine.enable_scan_dedup",
+							 "Descarta en el scan las filas repetidas debajo de un count(DISTINCT).",
+							 "Si todos los agregados de un GROUP BY ignoran los duplicados "
+							 "(DISTINCT, min, max), el scan descarta las filas iguales "
+							 "dentro de cada stripe y el Sort de arriba ordena menos.",
+							 &dbe_enable_scan_dedup,
 							 true,
 							 PGC_USERSET,
 							 0,

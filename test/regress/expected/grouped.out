@@ -503,7 +503,8 @@ SELECT (SELECT count(DISTINCT x) FROM nulos) = (SELECT count(DISTINCT x) FROM nu
  t
 (1 row)
 
--- Con GROUP BY no se empuja: haría falta un conjunto por grupo.
+-- Con GROUP BY no se empuja: haría falta un conjunto por grupo.  Queda el
+-- plan normal, con el scan descartando las filas repetidas por stripe.
 RESET enable_hashagg;
 RESET enable_sort;
 RESET parallel_setup_cost;
@@ -519,7 +520,8 @@ EXPLAIN (COSTS off) SELECT a, count(DISTINCT b) FROM hh GROUP BY a;
          Sort Key: a, b
          ->  Custom Scan (DbengineColumnarScan) on hh
                Columnas leídas: a, b
-(6 rows)
+               Repetidas descartadas por stripe: sí
+(7 rows)
 
 DROP TABLE hh, hhh, nulos, nulosh;
 DROP TABLE f, fh;

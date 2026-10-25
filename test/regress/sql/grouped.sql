@@ -324,7 +324,8 @@ CREATE TABLE nulosh AS SELECT * FROM nulos;
 SELECT (SELECT count(DISTINCT x) FROM nulos) = (SELECT count(DISTINCT x) FROM nulosh)
 	AS distinct_con_nulos_igual;
 
--- Con GROUP BY no se empuja: haría falta un conjunto por grupo.
+-- Con GROUP BY no se empuja: haría falta un conjunto por grupo.  Queda el
+-- plan normal, con el scan descartando las filas repetidas por stripe.
 RESET enable_hashagg;
 RESET enable_sort;
 RESET parallel_setup_cost;

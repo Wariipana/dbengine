@@ -39,6 +39,7 @@
 #include "dbengine/customscan.h"
 #include "dbengine/dbengine.h"
 #include "dbengine/dictqual.h"
+#include "dbengine/rowdedup.h"
 #include "dbengine/workload.h"
 #include "dbengine/zonemap.h"
 
@@ -65,6 +66,7 @@ typedef struct DbeParallelScanShared
 	pg_atomic_uint64 stripes_pruned;
 	pg_atomic_uint64 granules_pruned;
 	pg_atomic_uint64 rows_filtered;
+	pg_atomic_uint64 rows_deduped;
 } DbeParallelScanShared;
 
 /* Una columna de la salida cuando el nodo proyecta por su cuenta. */
@@ -97,6 +99,13 @@ typedef struct DbeScanState
 	DbeScanOutput *outputs;
 	int			noutputs;
 	int			ncached;
+
+	/*
+	 * Filas repetidas descartadas dentro del stripe, debajo de un agregado
+	 * que ignora duplicados.  NULL = no.  Ver dbe_scan_dedup_path().
+	 */
+	DbeRowDedup *dedup;
+	uint64		rows_deduped;
 
 	uint64		rows_filtered;
 	uint64		stripes_pruned;	/* total del plan, solo si totals_ready */
@@ -520,7 +529,7 @@ dbe_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		 * subconsulta, los varno dejaban de coincidir con scanrelid y el
 		 * descarte se apagaba en silencio.
 		 */
-		path->custom_private = list_make2(attnums, prunable);
+		path->custom_private = list_make3(attnums, prunable, NIL);
 	}
 
 	dbe_cost_scan(root, rel, relation, wanted, natts, nwanted, path);
@@ -580,6 +589,59 @@ dbe_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	table_close(relation, NoLock);
 }
 
+Path *
+dbe_scan_dedup_path(PlannerInfo *root, Path *path, double ratio)
+{
+	ProjectionPath *proj = NULL;
+	CustomPath *base;
+	CustomPath *copy;
+	List	   *cols = NIL;
+	ListCell   *lc;
+
+	if (IsA(path, ProjectionPath))
+	{
+		proj = (ProjectionPath *) path;
+		path = proj->subpath;
+	}
+	if (!IsA(path, CustomPath) ||
+		((CustomPath *) path)->methods != &dbe_path_methods)
+		return NULL;
+	base = (CustomPath *) path;
+	if (base->path.param_info != NULL)
+		return NULL;
+
+	/*
+	 * La clave son todas las columnas que suben: dos filas iguales en todas
+	 * dan lo mismo en cualquier expresión que se arme arriba con ellas.  Lo
+	 * que no sea un Var de esta relación —un PlaceHolderVar, la fila entera—
+	 * no se sabe comparar y se deja.
+	 */
+	foreach(lc, base->path.pathtarget->exprs)
+	{
+		Var		   *var = (Var *) lfirst(lc);
+
+		if (!IsA(var, Var) || var->varno != base->path.parent->relid ||
+			var->varattno < 1 || var->varlevelsup != 0)
+			return NULL;
+		cols = list_append_unique_int(cols, var->varattno);
+	}
+	if (cols == NIL || list_length(cols) > DBE_DEDUP_MAX_COLS)
+		return NULL;
+
+	copy = makeNode(CustomPath);
+	memcpy(copy, base, sizeof(CustomPath));
+	copy->custom_private = list_make3(linitial(base->custom_private),
+									  lsecond(base->custom_private), cols);
+	copy->path.rows = clamp_row_est(base->path.rows * ratio);
+	/* Un hash y una búsqueda por fila leída. */
+	copy->path.total_cost += cpu_operator_cost * base->path.rows;
+
+	if (proj == NULL)
+		return &copy->path;
+	return (Path *) create_projection_path(root, proj->path.parent,
+										   &copy->path, proj->path.pathtarget);
+}
+
 static Plan *
 dbe_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
 					 struct CustomPath *best_path, List *tlist,
@@ -601,7 +663,8 @@ dbe_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
 	cscan->scan.scanrelid = rel->relid;
 	cscan->flags = best_path->flags;
 	cscan->methods = &dbe_scan_methods;
-	cscan->custom_private = list_make1(linitial(best_path->custom_private));
+	cscan->custom_private = list_make2(linitial(best_path->custom_private),
+									   list_nth(best_path->custom_private, 2));
 	cscan->custom_scan_tlist = NIL;
 
 	return &cscan->scan.plan;
@@ -793,6 +856,10 @@ dbe_begin_scan(CustomScanState *node, EState *estate, int eflags)
 		pfree(filter_cols);
 	}
 
+	if (lsecond(cscan->custom_private) != NIL)
+		state->dedup = dbe_dedup_create(RelationGetDescr(relation),
+										(List *) lsecond(cscan->custom_private));
+
 	dbe_scan_init_projection(state, estate);
 }
 
@@ -812,6 +879,16 @@ dbe_scan_fill_column(void *arg, AttrNumber attnum)
 }
 
 static bool
+dbe_scan_repeated(DbeScanState *state, TupleTableSlot *slot)
+{
+	if (state->dedup == NULL ||
+		!dbe_dedup_repeated(state->dedup, state->cursor, slot))
+		return false;
+	state->rows_deduped++;
+	return true;
+}
+
+static bool
 dbe_scan_row_passes(DbeScanState *state, TupleTableSlot *slot)
 {
 	ExprContext *econtext = state->css.ss.ps.ps_ExprContext;
@@ -824,7 +901,7 @@ dbe_scan_row_passes(DbeScanState *state, TupleTableSlot *slot)
 	if (state->qual == NULL)
 	{
 		dbe_cursor_fill_rest(state->cursor, slot);
-		return true;
+		return !dbe_scan_repeated(state, slot);
 	}
 
 	econtext->ecxt_scantuple = slot;
@@ -838,7 +915,7 @@ dbe_scan_row_passes(DbeScanState *state, TupleTableSlot *slot)
 
 	/* Recién ahora se decodifican las columnas que el predicado no mira. */
 	dbe_cursor_fill_rest(state->cursor, slot);
-	return true;
+	return !dbe_scan_repeated(state, slot);
 }
 
 static TupleTableSlot *
@@ -921,6 +998,7 @@ dbe_rescan_scan(CustomScanState *node)
 	DbeScanState *state = (DbeScanState *) node;
 
 	state->rows_filtered = 0;
+	state->rows_deduped = 0;
 	state->stripes_pruned = 0;
 	state->granules_pruned = 0;
 	state->published = false;
@@ -928,6 +1006,8 @@ dbe_rescan_scan(CustomScanState *node)
 	if (state->cursor != NULL)
 		dbe_cursor_rescan(state->cursor);
 	dbe_dictqual_reset(state->qual);
+	if (state->dedup != NULL)
+		dbe_dedup_reset(state->dedup);
 	for (int i = 0; i < state->noutputs; i++)
 		dbe_dictexpr_reset(state->outputs[i].cached);
 }
@@ -958,6 +1038,7 @@ dbe_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	pg_atomic_init_u64(&shared->stripes_pruned, 0);
 	pg_atomic_init_u64(&shared->granules_pruned, 0);
 	pg_atomic_init_u64(&shared->rows_filtered, 0);
+	pg_atomic_init_u64(&shared->rows_deduped, 0);
 	state->shared = shared;
 	dbe_cursor_set_stripe(state->cursor, -1);
 }
@@ -972,6 +1053,7 @@ dbe_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	pg_atomic_write_u64(&shared->stripes_pruned, 0);
 	pg_atomic_write_u64(&shared->granules_pruned, 0);
 	pg_atomic_write_u64(&shared->rows_filtered, 0);
+	pg_atomic_write_u64(&shared->rows_deduped, 0);
 }
 
 static void
@@ -1007,6 +1089,8 @@ dbe_shutdown_scan(CustomScanState *node)
 
 	pg_atomic_fetch_add_u64(&state->shared->rows_filtered,
 							state->rows_filtered);
+	pg_atomic_fetch_add_u64(&state->shared->rows_deduped,
+							state->rows_deduped);
 	if (state->cursor != NULL)
 	{
 		pg_atomic_fetch_add_u64(&state->shared->stripes_pruned,
@@ -1018,6 +1102,7 @@ dbe_shutdown_scan(CustomScanState *node)
 	if (!IsParallelWorker())
 	{
 		state->rows_filtered = pg_atomic_read_u64(&state->shared->rows_filtered);
+		state->rows_deduped = pg_atomic_read_u64(&state->shared->rows_deduped);
 		state->stripes_pruned = pg_atomic_read_u64(&state->shared->stripes_pruned);
 		state->granules_pruned = pg_atomic_read_u64(&state->shared->granules_pruned);
 		state->totals_ready = true;
@@ -1076,6 +1161,13 @@ dbe_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 	if (state->ncached > 0)
 		ExplainPropertyInteger("Expresiones por diccionario", NULL,
 							   state->ncached, es);
+	if (state->dedup != NULL)
+	{
+		ExplainPropertyText("Repetidas descartadas por stripe", "sí", es);
+		if (es->analyze)
+			ExplainPropertyInteger("Filas repetidas descartadas", NULL,
+								   (int64) state->rows_deduped, es);
+	}
 	if (es->analyze && state->cursor != NULL)
 	{
 		int64		gran;

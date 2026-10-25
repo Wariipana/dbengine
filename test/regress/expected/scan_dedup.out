@@ -1,0 +1,324 @@
+--
+-- Filas repetidas descartadas en el scan (rowdedup.h).
+--
+-- Debajo de un GROUP BY cuyos agregados ignoran duplicados, el scan
+-- descarta las filas iguales dentro de cada stripe.  Todo se compara contra
+-- heap: el descarte no puede cambiar ningún resultado.
+--
+CREATE EXTENSION dbengine;
+CREATE TABLE dd (g int4, u int8, t text, f float8, n numeric, x int4)
+	USING dbengine_columnar;
+-- Tres stripes.  Los mismos valores se repiten dentro de cada uno y también
+-- entre stripes, con nulos en todas las columnas.
+INSERT INTO dd SELECT i % 7, (i / 3) % 50, 'v' || (i % 11), (i % 5) * 0.5,
+	(i % 4)::numeric / 3, i FROM generate_series(1, 3000) i;
+INSERT INTO dd SELECT CASE WHEN i % 9 = 0 THEN NULL ELSE i % 7 END,
+	CASE WHEN i % 13 = 0 THEN NULL ELSE (i / 3) % 50 END,
+	CASE WHEN i % 17 = 0 THEN NULL ELSE 'v' || (i % 11) END,
+	CASE WHEN i % 19 = 0 THEN NULL ELSE (i % 5) * 0.5 END,
+	NULL, i FROM generate_series(1, 3000) i;
+-- Texto sin diccionario: valores todos distintos.
+INSERT INTO dd SELECT i % 3, i % 2, md5(i::text) || md5((i * 7)::text), -0.0,
+	1, i FROM generate_series(1, 2000) i;
+ANALYZE dd;
+CREATE TABLE dd_heap AS SELECT * FROM dd;
+SET max_parallel_workers_per_gather = 0;
+-- El plan: Sort y GroupAggregate de siempre, con el descarte en el scan.
+EXPLAIN (COSTS OFF) SELECT g, count(DISTINCT u) FROM dd GROUP BY g;
+                      QUERY PLAN                      
+------------------------------------------------------
+ GroupAggregate
+   Group Key: g
+   ->  Sort
+         Sort Key: g, u
+         ->  Custom Scan (DbengineColumnarScan) on dd
+               Columnas leídas: g, u
+               Repetidas descartadas por stripe: sí
+(7 rows)
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT g, count(DISTINCT u) FROM dd GROUP BY g;
+                                    QUERY PLAN                                     
+-----------------------------------------------------------------------------------
+ GroupAggregate (actual rows=8.00 loops=1)
+   Group Key: g
+   ->  Sort (actual rows=764.00 loops=1)
+         Sort Key: g, u
+         Sort Method: quicksort  Memory: 48kB
+         ->  Custom Scan (DbengineColumnarScan) on dd (actual rows=764.00 loops=1)
+               Columnas leídas: g, u
+               Repetidas descartadas por stripe: sí
+               Filas repetidas descartadas: 7236
+               Stripes descartados: 0
+(10 rows)
+
+SELECT g, count(DISTINCT u) FROM dd GROUP BY g ORDER BY g;
+ g | count 
+---+-------
+ 0 |    50
+ 1 |    50
+ 2 |    50
+ 3 |    50
+ 4 |    50
+ 5 |    50
+ 6 |    50
+   |    50
+(8 rows)
+
+SELECT g, count(DISTINCT u) FROM dd_heap GROUP BY g ORDER BY g;
+ g | count 
+---+-------
+ 0 |    50
+ 1 |    50
+ 2 |    50
+ 3 |    50
+ 4 |    50
+ 5 |    50
+ 6 |    50
+   |    50
+(8 rows)
+
+-- min y max sin DISTINCT, otros agregados con DISTINCT, varias columnas.
+SELECT g, min(t), max(u), count(DISTINCT t), sum(DISTINCT u), max(f)
+FROM dd GROUP BY g ORDER BY g;
+ g |                               min                                | max | count | sum  | max 
+---+------------------------------------------------------------------+-----+-------+------+-----
+ 0 | 00411460f7c92d2124a67ea0f4cb5f85e92d74ccacdc984afa0c517ad0d557a6 |  49 |   677 | 1225 |   2
+ 1 | 00ac8ed3b4327bdd4ebbebcb2ba10a0039b8f721582654655a6999aabe905204 |  49 |   678 | 1225 |   2
+ 2 | 0004d0b59e19461ff126e3a08a814c33b270a720f6ac2e8a8c53d968243d5971 |  49 |   678 | 1225 |   2
+ 3 | v0                                                               |  49 |    11 | 1225 |   2
+ 4 | v0                                                               |  49 |    11 | 1225 |   2
+ 5 | v0                                                               |  49 |    11 | 1225 |   2
+ 6 | v0                                                               |  49 |    11 | 1225 |   2
+   | v0                                                               |  49 |    11 | 1225 |   2
+(8 rows)
+
+SELECT g, min(t), max(u), count(DISTINCT t), sum(DISTINCT u), max(f)
+FROM dd_heap GROUP BY g ORDER BY g;
+ g |                               min                                | max | count | sum  | max 
+---+------------------------------------------------------------------+-----+-------+------+-----
+ 0 | 00411460f7c92d2124a67ea0f4cb5f85e92d74ccacdc984afa0c517ad0d557a6 |  49 |   677 | 1225 |   2
+ 1 | 00ac8ed3b4327bdd4ebbebcb2ba10a0039b8f721582654655a6999aabe905204 |  49 |   678 | 1225 |   2
+ 2 | 0004d0b59e19461ff126e3a08a814c33b270a720f6ac2e8a8c53d968243d5971 |  49 |   678 | 1225 |   2
+ 3 | v0                                                               |  49 |    11 | 1225 |   2
+ 4 | v0                                                               |  49 |    11 | 1225 |   2
+ 5 | v0                                                               |  49 |    11 | 1225 |   2
+ 6 | v0                                                               |  49 |    11 | 1225 |   2
+   | v0                                                               |  49 |    11 | 1225 |   2
+(8 rows)
+
+-- Agrupando por texto, con WHERE y HAVING.
+SELECT t, count(DISTINCT g) FROM dd WHERE x % 2 = 0 GROUP BY t
+HAVING count(DISTINCT u) > 3 ORDER BY t;
+  t  | count 
+-----+-------
+ v0  |     7
+ v1  |     7
+ v10 |     7
+ v2  |     7
+ v3  |     7
+ v4  |     7
+ v5  |     7
+ v6  |     7
+ v7  |     7
+ v8  |     7
+ v9  |     7
+     |     7
+(12 rows)
+
+SELECT t, count(DISTINCT g) FROM dd_heap WHERE x % 2 = 0 GROUP BY t
+HAVING count(DISTINCT u) > 3 ORDER BY t;
+  t  | count 
+-----+-------
+ v0  |     7
+ v1  |     7
+ v10 |     7
+ v2  |     7
+ v3  |     7
+ v4  |     7
+ v5  |     7
+ v6  |     7
+ v7  |     7
+ v8  |     7
+ v9  |     7
+     |     7
+(12 rows)
+
+-- Una columna que no es por valor ni tiene diccionario (numeric): esos
+-- stripes pasan enteros, y el resultado es el mismo.
+SELECT g, count(DISTINCT n) FROM dd GROUP BY g ORDER BY g;
+ g | count 
+---+-------
+ 0 |     4
+ 1 |     4
+ 2 |     4
+ 3 |     4
+ 4 |     4
+ 5 |     4
+ 6 |     4
+   |     0
+(8 rows)
+
+SELECT g, count(DISTINCT n) FROM dd_heap GROUP BY g ORDER BY g;
+ g | count 
+---+-------
+ 0 |     4
+ 1 |     4
+ 2 |     4
+ 3 |     4
+ 4 |     4
+ 5 |     4
+ 6 |     4
+   |     0
+(8 rows)
+
+-- -0 y 0 son iguales para float8 pero distintos en binario: suben los dos y
+-- el DISTINCT de arriba los junta.
+SELECT g, count(DISTINCT f) FROM dd WHERE x <= 2000 GROUP BY g ORDER BY g;
+ g | count 
+---+-------
+ 0 |     5
+ 1 |     5
+ 2 |     5
+ 3 |     5
+ 4 |     5
+ 5 |     5
+ 6 |     5
+   |     5
+(8 rows)
+
+SELECT g, count(DISTINCT f) FROM dd_heap WHERE x <= 2000 GROUP BY g ORDER BY g;
+ g | count 
+---+-------
+ 0 |     5
+ 1 |     5
+ 2 |     5
+ 3 |     5
+ 4 |     5
+ 5 |     5
+ 6 |     5
+   |     5
+(8 rows)
+
+-- Un count(*) cuenta repeticiones: con él no hay descarte.
+EXPLAIN (COSTS OFF) SELECT g, count(DISTINCT u), count(*) FROM dd GROUP BY g;
+                      QUERY PLAN                      
+------------------------------------------------------
+ GroupAggregate
+   Group Key: g
+   ->  Sort
+         Sort Key: g, u
+         ->  Custom Scan (DbengineColumnarScan) on dd
+               Columnas leídas: g, u
+(6 rows)
+
+-- Ni con una función volátil, que vería menos filas.
+EXPLAIN (COSTS OFF)
+SELECT (g + random() * 0)::int AS r, count(DISTINCT u) FROM dd GROUP BY 1;
+                                           QUERY PLAN                                           
+------------------------------------------------------------------------------------------------
+ GroupAggregate
+   Group Key: ((((g)::double precision + (random() * '0'::double precision)))::integer)
+   ->  Sort
+         Sort Key: ((((g)::double precision + (random() * '0'::double precision)))::integer), u
+         ->  Custom Scan (DbengineColumnarScan) on dd
+               Columnas leídas: g, u
+(6 rows)
+
+-- Rescan: el scan del lado de adentro de un nested loop se recorre de nuevo
+-- por cada fila de afuera y el descarte arranca de cero cada vez.
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_material = off;
+SELECT k, (SELECT count(*) FROM (SELECT g, count(DISTINCT u) FROM dd
+		   WHERE g IS NOT NULL AND g <= k GROUP BY g) s)
+FROM generate_series(0, 3) k;
+ k | count 
+---+-------
+ 0 |     1
+ 1 |     2
+ 2 |     3
+ 3 |     4
+(4 rows)
+
+SELECT k, (SELECT count(*) FROM (SELECT g, count(DISTINCT u) FROM dd_heap
+		   WHERE g IS NOT NULL AND g <= k GROUP BY g) s)
+FROM generate_series(0, 3) k;
+ k | count 
+---+-------
+ 0 |     1
+ 1 |     2
+ 2 |     3
+ 3 |     4
+(4 rows)
+
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_material;
+-- En paralelo: cada worker descarta en sus stripes y ordena, y un Gather
+-- Merge junta.
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 2;
+EXPLAIN (COSTS OFF) SELECT g, count(DISTINCT u) FROM dd GROUP BY g;
+                             QUERY PLAN                              
+---------------------------------------------------------------------
+ GroupAggregate
+   Group Key: g
+   ->  Gather Merge
+         Workers Planned: 2
+         ->  Sort
+               Sort Key: g, u
+               ->  Parallel Custom Scan (DbengineColumnarScan) on dd
+                     Columnas leídas: g, u
+                     Repetidas descartadas por stripe: sí
+(9 rows)
+
+SELECT g, count(DISTINCT u), min(t) FROM dd GROUP BY g ORDER BY g;
+ g | count |                               min                                
+---+-------+------------------------------------------------------------------
+ 0 |    50 | 00411460f7c92d2124a67ea0f4cb5f85e92d74ccacdc984afa0c517ad0d557a6
+ 1 |    50 | 00ac8ed3b4327bdd4ebbebcb2ba10a0039b8f721582654655a6999aabe905204
+ 2 |    50 | 0004d0b59e19461ff126e3a08a814c33b270a720f6ac2e8a8c53d968243d5971
+ 3 |    50 | v0
+ 4 |    50 | v0
+ 5 |    50 | v0
+ 6 |    50 | v0
+   |    50 | v0
+(8 rows)
+
+SELECT g, count(DISTINCT u), min(t) FROM dd_heap GROUP BY g ORDER BY g;
+ g | count |                               min                                
+---+-------+------------------------------------------------------------------
+ 0 |    50 | 00411460f7c92d2124a67ea0f4cb5f85e92d74ccacdc984afa0c517ad0d557a6
+ 1 |    50 | 00ac8ed3b4327bdd4ebbebcb2ba10a0039b8f721582654655a6999aabe905204
+ 2 |    50 | 0004d0b59e19461ff126e3a08a814c33b270a720f6ac2e8a8c53d968243d5971
+ 3 |    50 | v0
+ 4 |    50 | v0
+ 5 |    50 | v0
+ 6 |    50 | v0
+   |    50 | v0
+(8 rows)
+
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+SET max_parallel_workers_per_gather = 0;
+-- Apagado, el plan normal.
+SET dbengine.enable_scan_dedup = off;
+EXPLAIN (COSTS OFF) SELECT g, count(DISTINCT u) FROM dd GROUP BY g;
+                      QUERY PLAN                      
+------------------------------------------------------
+ GroupAggregate
+   Group Key: g
+   ->  Sort
+         Sort Key: g, u
+         ->  Custom Scan (DbengineColumnarScan) on dd
+               Columnas leídas: g, u
+(6 rows)
+
+RESET dbengine.enable_scan_dedup;
+DROP TABLE dd, dd_heap;
+RESET max_parallel_workers_per_gather;
+DROP EXTENSION dbengine CASCADE;

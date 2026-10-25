@@ -1351,6 +1351,7 @@ tools/        guarda de arquitectura y cluster de desarrollo
 | `dbengine.debug_backtrace` | `off` | sighup | diagnóstico |
 | `dbengine.enable_dict_quals` | `on` | user | C2: predicados y expresiones por entrada del diccionario |
 | `dbengine.kernel_readahead` | `off` | user | C2: readahead del kernel en los archivos columnar |
+| `dbengine.enable_scan_dedup` | `on` | user | C2: el scan descarta filas repetidas debajo de `count(DISTINCT)`, `min` y `max` agrupados |
 
 `dbengine.debug_backtrace` hace que un backend imprima su propio backtrace
 en el log si recibe `SIGSEGV`. Sirve donde no hay core dumps ni `ptrace`

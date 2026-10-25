@@ -25,6 +25,8 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
 #include "access/htup_details.h"
 #include "access/tupmacs.h"
 #include "access/table.h"
@@ -51,6 +53,7 @@
 #include "optimizer/cost.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/planner.h"
+#include "optimizer/prep.h"
 #include "parser/parse_agg.h"
 #include "common/int.h"
 #include "utils/array.h"
@@ -655,6 +658,149 @@ dbe_add_parallel_agg_path(PlannerInfo *root, RelOptInfo *input_rel,
 	add_path(output_rel, final);
 }
 
+/*
+ * ¿Da lo mismo el agregado si una fila de entrada aparece dos veces?  Con
+ * DISTINCT sí, por definición.  Sin DISTINCT, los que tienen aggsortop
+ * —min, max, bool_and, bool_or—, que devuelven un elemento extremo.
+ */
+static bool
+dbe_agg_ignores_duplicates(Aggref *ref)
+{
+	HeapTuple	tup;
+	Oid			sortop;
+
+	if (ref->aggkind != AGGKIND_NORMAL || ref->aggsplit != AGGSPLIT_SIMPLE)
+		return false;
+	if (ref->aggdistinct != NIL)
+		return true;
+	if (ref->aggstar || ref->aggorder != NIL)
+		return false;
+
+	tup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(ref->aggfnoid));
+	if (!HeapTupleIsValid(tup))
+		return false;
+	sortop = ((Form_pg_aggregate) GETSTRUCT(tup))->aggsortop;
+	ReleaseSysCache(tup);
+	return OidIsValid(sortop);
+}
+
+/*
+ * GROUP BY con agregados que ignoran duplicados: el plan normal con un scan
+ * que descarta las filas repetidas por stripe (rowdedup.h).
+ *
+ * Es el plan de siempre —Sort por las claves del grupo y GroupAggregate— y
+ * lo arma el planner con sus propias funciones; lo único distinto es el
+ * scan de abajo, que entrega menos filas.  En q9 de ClickBench el Sort pasa
+ * de 10M filas a las que sobreviven al descarte.
+ */
+static void
+dbe_add_dedup_agg_path(PlannerInfo *root, RelOptInfo *input_rel,
+					   RelOptInfo *output_rel, GroupPathExtraData *extra)
+{
+	Query	   *parse = root->parse;
+	List	   *exprs;
+	ListCell   *lc;
+	double		nrows;
+	double		ndistinct;
+	double		ngroups;
+	AggClauseCosts costs;
+
+	if (!dbe_enable_vectorized || !dbe_enable_scan_dedup || extra == NULL ||
+		extra->patype != PARTITIONWISE_AGGREGATE_NONE)
+		return;
+	if (parse->groupClause == NIL || parse->groupingSets != NIL ||
+		!parse->hasAggs || input_rel->reloptkind != RELOPT_BASEREL)
+		return;
+
+	/*
+	 * Con una función volátil, cuántas veces se evalúa es parte del
+	 * resultado: `GROUP BY random()` reparte distinto si llegan menos filas.
+	 */
+	if (contain_volatile_functions((Node *) parse->targetList) ||
+		contain_volatile_functions(parse->havingQual))
+		return;
+
+	exprs = pull_var_clause((Node *) list_make2(output_rel->reltarget->exprs,
+												extra->havingQual),
+							PVC_INCLUDE_AGGREGATES |
+							PVC_RECURSE_WINDOWFUNCS |
+							PVC_RECURSE_PLACEHOLDERS);
+	foreach(lc, exprs)
+		if (IsA(lfirst(lc), Aggref) &&
+			!dbe_agg_ignores_duplicates((Aggref *) lfirst(lc)))
+			return;
+
+	nrows = input_rel->rows;
+	if (nrows < 2)
+		return;
+
+	/*
+	 * Cuántas filas sobreviven no se sabe al planificar: depende de cuánto
+	 * se repitan dentro de un stripe, que es una propiedad del orden físico.
+	 * Las combinaciones distintas en toda la tabla son el piso, y la tabla
+	 * entera el techo; se toma la media geométrica.  Si el planner cree que
+	 * casi todas las filas son distintas, la estimación queda cerca de la
+	 * tabla y el plan normal, que no paga el hash, gana solo.
+	 */
+	ndistinct = estimate_num_groups(root, input_rel->reltarget->exprs, nrows,
+									NULL, NULL);
+	ndistinct = clamp_row_est(sqrt(Min(ndistinct, nrows) * nrows));
+	ngroups = estimate_num_groups(root,
+								  get_sortgrouplist_exprs(root->processed_groupClause,
+														  parse->targetList),
+								  nrows, NULL, NULL);
+
+	MemSet(&costs, 0, sizeof(costs));
+	get_agg_clause_costs(root, AGGSPLIT_SIMPLE, &costs);
+
+	/*
+	 * Serial y paralelo.  En paralelo cada worker descarta y ordena sus
+	 * stripes, y un Gather Merge intercala las salidas ya ordenadas: el
+	 * GroupAggregate de arriba ve lo mismo que en serial.  Un duplicado
+	 * entre workers es uno más entre stripes, y lo resuelve el DISTINCT.
+	 */
+	for (int pass = 0; pass < 2; pass++)
+	{
+		List	   *paths = pass == 0 ? input_rel->pathlist
+			: input_rel->partial_pathlist;
+
+		if (pass == 1 && !output_rel->consider_parallel)
+			break;
+
+		foreach(lc, paths)
+		{
+			Path	   *path = dbe_scan_dedup_path(root, (Path *) lfirst(lc),
+												   ndistinct / nrows);
+			GroupByOrdering *info;
+
+			if (path == NULL)
+				continue;
+
+			info = (GroupByOrdering *)
+				linitial(get_useful_group_keys_orderings(root, path));
+			if (!pathkeys_contained_in(info->pathkeys, path->pathkeys))
+				path = (Path *) create_sort_path(root, output_rel, path,
+												 info->pathkeys, -1.0);
+			if (pass == 1)
+			{
+				double		total = path->rows * path->parallel_workers;
+
+				path = (Path *) create_gather_merge_path(root, output_rel, path,
+														 path->pathtarget,
+														 info->pathkeys, NULL,
+														 &total);
+			}
+			add_path(output_rel, (Path *)
+					 create_agg_path(root, output_rel, path,
+									 output_rel->reltarget, AGG_SORTED,
+									 AGGSPLIT_SIMPLE, info->clauses,
+									 (List *) extra->havingQual, &costs,
+									 ngroups));
+			break;
+		}
+	}
+}
+
 static void
 dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 					   RelOptInfo *input_rel, RelOptInfo *output_rel,
@@ -683,6 +829,10 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 
 	if (prev_create_upper_paths_hook)
 		prev_create_upper_paths_hook(root, stage, input_rel, output_rel, extra);
+
+	if (stage == UPPERREL_GROUP_AGG)
+		dbe_add_dedup_agg_path(root, input_rel, output_rel,
+							   (GroupPathExtraData *) extra);
 
 	if (stage != UPPERREL_GROUP_AGG || !dbe_enable_vectorized ||
 		!dbe_enable_agg_pushdown)

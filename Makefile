@@ -35,7 +35,7 @@ SHLIB_LINK   = -lstdc++
 DBE_CXX_STD ?= c++20
 
 # --- Tests -------------------------------------------------------------------
-REGRESS      = extension bridge columnar columnar_mvcc columnar_compress columnar_scan columnar_ddl columnar_compat granule pgm workload bloom clustering grouped merge timetravel dict_quals sma
+REGRESS      = extension bridge columnar columnar_mvcc columnar_compress columnar_scan columnar_ddl columnar_compat granule pgm workload bloom clustering grouped merge timetravel dict_quals sma scan_dedup
 REGRESS_OPTS = --inputdir=test/regress --outputdir=test/regress
 
 # Concurrencia: dos sesiones intercaladas con isolationtester.  Corre en

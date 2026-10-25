@@ -24,4 +24,13 @@
 extern void dbe_customscan_init(void);
 extern void dbe_vectoragg_init(void);
 
+/*
+ * El mismo scan que `path` —el Custom Scan, serial o paralelo, o una
+ * proyección sobre él— descartando las filas repetidas dentro de cada
+ * stripe; `ratio` es la fracción de filas que se estima que sobreviven.
+ * NULL si `path` no es un Custom Scan de dbengine o si sus columnas no se
+ * pueden deduplicar.  Ver rowdedup.h.
+ */
+extern Path *dbe_scan_dedup_path(PlannerInfo *root, Path *path, double ratio);
+
 #endif							/* DBENGINE_CUSTOMSCAN_H */

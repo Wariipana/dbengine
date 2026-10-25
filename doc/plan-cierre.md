@@ -225,6 +225,11 @@ Tres hechos del código que ordenan la lista:
        - De paso: el EXPLAIN de `DbengineVectorAgg` dentro de una subconsulta
          fallaba ("invalid attnum 2 for relation v"): setrefs.c no corrige
          los Var de `custom_private`.
+       - [x] **Filas repetidas descartadas en el scan**
+         (`src/pg/rowdedup.c`): debajo de un GROUP BY con agregados que
+         ignoran duplicados, exacto por stripe y con Gather Merge en
+         paralelo. GUC `dbengine.enable_scan_dedup`. **q9 6,26 → 1,07 s**,
+         q11 y q12 2,2×. Las 43: media geométrica 0,655, suma 85,7 s.
 6. [ ] **`LIKE` sobre FSST sin descomprimir** (autómata sobre los códigos
        de símbolo): 2,5×–17× sobre descomprimir y comparar según Pop, Riedl
        y Neumann (TUM). Vortex lo implementa para `prefix%` y `%needle%`,
