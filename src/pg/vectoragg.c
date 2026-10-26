@@ -56,10 +56,12 @@
 #include "optimizer/planner.h"
 #include "optimizer/prep.h"
 #include "parser/parse_agg.h"
+#include "parser/scansup.h"
 #include "port/pg_bitutils.h"
 #include "common/int.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/datetime.h"
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
@@ -187,6 +189,7 @@ typedef struct DbeAggState
 	bool		is_group;
 	AttrNumber	group_attnum;
 	int			group_idx;
+	Expr	   *group_expr;		/* clave que es una expresión sobre la columna */
 
 	/*
 	 * Una constante del tlist (solo con la tabla propia): viaja como columna
@@ -384,6 +387,15 @@ typedef struct DbeVectorAggState
 	 * dónde empieza en los estados de `flatagg` el agregado j de `flatdist`,
 	 * o -1 si es un count(DISTINCT), que suma 1 por valor no nulo.
 	 */
+	/*
+	 * Claves que son una expresión sobre la columna (NULL donde es la
+	 * columna sola), con su propio ExprContext: el de los argumentos de los
+	 * agregados se resetea en cada uno, y el valor de la clave tiene que
+	 * durar hasta que la tabla lo copie.
+	 */
+	ExprState **group_exprs;
+	ExprContext *key_econtext;
+
 	DbeFlatAgg *flatdist;
 	int			flat_dist;
 	int		   *flat_map;
@@ -619,6 +631,98 @@ dbe_flat_key_ok(Oid typid, Oid eqop, Oid collid)
 	}
 	tc = lookup_type_cache(typid, TYPECACHE_EQ_OPR);
 	return OidIsValid(eqop) && eqop == tc->eq_opr;
+}
+
+/*
+ * ¿`extract(campo FROM ts)` con un campo de resultado entero?  Postgres arma
+ * ese numeric con int64_to_numeric() —o con numeric_in() para un timestamp
+ * infinito—, siempre con la misma escala, así que dos resultados iguales
+ * tienen los mismos bytes.  Con second, epoch o julian no: tienen
+ * decimales.
+ */
+static bool
+dbe_flat_extract_integral(Node *expr)
+{
+	FuncExpr   *f = (FuncExpr *) expr;
+	Const	   *c;
+	char	   *units;
+	char	   *low;
+	int			val = 0;
+	int			type;
+
+	if (!IsA(f, FuncExpr) || list_length(f->args) != 2 ||
+		(f->funcid != F_EXTRACT_TEXT_TIMESTAMP &&
+		 f->funcid != F_EXTRACT_TEXT_TIMESTAMPTZ))
+		return false;
+	c = (Const *) linitial(f->args);
+	if (!IsA(c, Const) || c->constisnull || c->consttype != TEXTOID)
+		return false;
+	units = TextDatumGetCString(c->constvalue);
+	low = downcase_truncate_identifier(units, strlen(units), false);
+	type = DecodeUnits(0, low, &val);
+	if (type != UNITS)
+		return false;
+	switch (val)
+	{
+		case DTK_MICROSEC:
+		case DTK_MINUTE:
+		case DTK_HOUR:
+		case DTK_DAY:
+		case DTK_MONTH:
+		case DTK_QUARTER:
+		case DTK_WEEK:
+		case DTK_YEAR:
+		case DTK_DECADE:
+		case DTK_CENTURY:
+		case DTK_MILLENNIUM:
+		case DTK_ISOYEAR:
+		case DTK_DOW:
+		case DTK_ISODOW:
+		case DTK_DOY:
+			return true;
+		default:
+			return false;
+	}
+}
+
+/*
+ * ¿Una expresión del GROUP BY puede ser clave de la tabla propia?  Tiene que
+ * mirar una sola columna de la relación —se calcula fila por fila contra el
+ * slot con esa columna cargada, como el argumento de un agregado—, no ser
+ * volátil, y dar un tipo que sirva de clave (dbe_flat_key_ok()), o el
+ * numeric de un extract() con campo entero.  *attnum queda con la columna.
+ */
+static bool
+dbe_flat_expr_key_ok(Node *expr, Oid eqop, Index relid, AttrNumber *attnum)
+{
+	List	   *vars;
+	ListCell   *lc;
+	Oid			typid = exprType(expr);
+
+	if (contain_volatile_functions(expr) || contain_subplans(expr) ||
+		expression_returns_set(expr) || contain_agg_clause(expr) ||
+		contain_window_function(expr))
+		return false;
+
+	*attnum = InvalidAttrNumber;
+	vars = pull_var_clause(expr, 0);
+	foreach(lc, vars)
+	{
+		Var		   *var = (Var *) lfirst(lc);
+
+		if (var->varno != (int) relid || var->varattno <= 0 ||
+			var->varlevelsup != 0 ||
+			(*attnum != InvalidAttrNumber && var->varattno != *attnum))
+			return false;
+		*attnum = var->varattno;
+	}
+	if (*attnum == InvalidAttrNumber)
+		return false;
+
+	if (dbe_flat_key_ok(typid, eqop, exprCollation(expr)))
+		return true;
+	return typid == NUMERICOID && dbe_flat_extract_integral(expr) &&
+		eqop == lookup_type_cache(NUMERICOID, TYPECACHE_EQ_OPR)->eq_opr;
 }
 
 /*
@@ -1117,6 +1221,7 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	bool		flat_ok;
 	bool		partial_ok = true;
 	bool		has_const = false;
+	bool		has_expr_key = false;
 	int			nflat_aggs = 0;
 	AttrNumber	dist_attnum = InvalidAttrNumber;
 	Node	   *dist_expr = NULL;
@@ -1211,6 +1316,13 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	{
 		Path	   *p = (Path *) lfirst(lc);
 
+		/*
+		 * Con una expresión en el GROUP BY el planner la calcula en el scan,
+		 * con una proyección encima.  Este nodo la calcula por su cuenta
+		 * desde las columnas.
+		 */
+		if (IsA(p, ProjectionPath))
+			p = ((ProjectionPath *) p)->subpath;
 		if (IsA(p, CustomPath) &&
 			strcmp(((CustomPath *) p)->methods->CustomName,
 				   "DbengineColumnarScan") == 0)
@@ -1340,6 +1452,29 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		}
 
 		/*
+		 * Una expresión del GROUP BY sobre una columna —`ClientIP - 1` en
+		 * q36, `extract(minute FROM EventTime)` en q19— la calcula la tabla
+		 * propia fila por fila.  Los demás caminos no saben.
+		 */
+		if (grouped && tle->ressortgroupref != 0 && !IsA(tle->expr, Const))
+		{
+			SortGroupClause *sgc;
+			AttrNumber	col;
+
+			sgc = get_sortgroupref_clause_noerr(tle->ressortgroupref,
+												parse->groupClause);
+			if (sgc == NULL || !OidIsValid(sgc->eqop) || !flat_ok ||
+				!dbe_flat_expr_key_ok((Node *) tle->expr, sgc->eqop,
+									  input_rel->relid, &col))
+				return;
+			has_expr_key = true;
+			agg_attnums = lappend_int(agg_attnums, col);
+			group_attnums = lappend_int(group_attnums, col);
+			group_eqops = lappend_oid(group_eqops, sgc->eqop);
+			continue;
+		}
+
+		/*
 		 * Una constante en el SELECT —`SELECT 1, URL, count(*)` en q35— la
 		 * emite la tabla propia tal cual.  Los demás caminos no saben.
 		 */
@@ -1378,7 +1513,7 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		partial_ok = false;
 	}
 
-	if (has_const)
+	if (has_const || has_expr_key)
 	{
 		if (!flat_ok)
 			return;
@@ -2786,6 +2921,8 @@ dbe_agg_begin(CustomScanState *node, EState *estate, int eflags)
 			agg->is_group = true;
 			agg->group_attnum = (AttrNumber) lfirst_int(lc2);
 			agg->group_idx = state->ngroupcols++;
+			if (!IsA(tle->expr, Var))
+				agg->group_expr = tle->expr;
 			continue;
 		}
 
@@ -2863,20 +3000,40 @@ dbe_agg_begin(CustomScanState *node, EState *estate, int eflags)
 			g = agg->group_idx;
 			state->groupcols[g] = agg->group_attnum;
 			att = TupleDescAttr(desc, agg->group_attnum - 1);
-			state->group_typlen[g] = att->attlen;
-			state->group_typbyval[g] = att->attbyval;
-			state->group_collation[g] = att->attcollation;
+			if (agg->group_expr != NULL)
+			{
+				Oid			typid = exprType((Node *) agg->group_expr);
 
-			/*
-			 * La igualdad es la del opclass btree por defecto del tipo, que
-			 * es la misma con la que se ordenó.  Tiene que serlo: si el
-			 * corte de grupo usara otra noción de igualdad que el orden,
-			 * dos filas "iguales" podrían quedar separadas.
-			 */
-			tc = lookup_type_cache(att->atttypid, TYPECACHE_EQ_OPR_FINFO);
+				/* Con parent NULL los Var se leen de ecxt_scantuple. */
+				if (state->group_exprs == NULL)
+				{
+					state->group_exprs = (ExprState **)
+						palloc0(sizeof(ExprState *) * state->ngroupcols);
+					state->key_econtext = CreateExprContext(estate);
+				}
+				state->group_exprs[g] = ExecInitExpr(agg->group_expr, NULL);
+				get_typlenbyval(typid, &state->group_typlen[g],
+								&state->group_typbyval[g]);
+				state->group_collation[g] = exprCollation((Node *) agg->group_expr);
+				tc = lookup_type_cache(typid, TYPECACHE_EQ_OPR_FINFO);
+			}
+			else
+			{
+				state->group_typlen[g] = att->attlen;
+				state->group_typbyval[g] = att->attbyval;
+				state->group_collation[g] = att->attcollation;
+
+				/*
+				 * La igualdad es la del opclass btree por defecto del tipo,
+				 * que es la misma con la que se ordenó.  Tiene que serlo: si
+				 * el corte de grupo usara otra noción de igualdad que el
+				 * orden, dos filas "iguales" podrían quedar separadas.
+				 */
+				tc = lookup_type_cache(att->atttypid, TYPECACHE_EQ_OPR_FINFO);
+			}
 			if (!OidIsValid(tc->eq_opr_finfo.fn_oid))
 				elog(ERROR, "dbengine: el tipo %u no tiene igualdad btree",
-					 att->atttypid);
+					 tc->type_id);
 			fmgr_info_copy(&state->group_eq[g], &tc->eq_opr_finfo,
 						   CurrentMemoryContext);
 		}
@@ -3885,6 +4042,53 @@ dbe_agg_flat_stats(DbeVectorAggState *state, uint64 *groups, int *parts,
 }
 
 /*
+ * Las claves de la fila, en flat_keys, cuando alguna es una expresión del
+ * GROUP BY: esa se calcula sobre su columna, cargada en el slot de la
+ * relación.  Una columna que el stripe no tiene vale su DEFAULT.  Va
+ * aparte del lazo de las columnas solas, que es el de siempre: con la
+ * rama adentro, q18 tardaba 11% más.
+ */
+static pg_noinline void
+dbe_agg_flat_keys_expr(DbeVectorAggState *state, uint64 row)
+{
+	TupleTableSlot *slot = dbe_agg_qual_slot(state);
+
+	ResetExprContext(state->key_econtext);
+	state->key_econtext->ecxt_scantuple = slot;
+	for (int g = 0; g < state->ngroupcols; g++)
+	{
+		Datum	   *key = &state->flat_keys[g];
+		bool	   *isnull = &state->flat_keynulls[g];
+		AttrNumber	a = state->groupcols[g];
+		Form_pg_attribute att;
+
+		if (state->group_exprs[g] == NULL)
+		{
+			if (!state->groupvec_ok[g])
+				dbe_agg_missing_value(state, a, key, isnull);
+			else
+				dbe_vec_value(&state->groupvecs[g], row,
+							  state->group_typbyval[g],
+							  state->group_typlen[g], key, isnull);
+			continue;
+		}
+
+		if (!state->groupvec_ok[g])
+			dbe_agg_missing_value(state, a, &slot->tts_values[a - 1],
+								  &slot->tts_isnull[a - 1]);
+		else
+		{
+			att = TupleDescAttr(slot->tts_tupleDescriptor, a - 1);
+			dbe_vec_value(&state->groupvecs[g], row, att->attbyval,
+						  att->attlen, &slot->tts_values[a - 1],
+						  &slot->tts_isnull[a - 1]);
+		}
+		*key = ExecEvalExprSwitchContext(state->group_exprs[g],
+										 state->key_econtext, isnull);
+	}
+}
+
+/*
  * Una corrida de filas seguidas con las mismas claves (de ancho fijo), que
  * va a la tabla una sola vez.  La tabla de ClickBench está ordenada por
  * CounterID, fecha y UserID: en q9, de 10M filas 8,4M repiten el par
@@ -4079,8 +4283,8 @@ dbe_agg_fill_flat(DbeVectorAggState *state, int bucket, uint32 nbuckets)
 		 * otro balde, y <= -3 el estado parcial número -3 - v.
 		 */
 		dict_size = 0;
-		if (dist == NULL && state->ngroupcols == 1 &&
-			state->group_typlen[0] == -1 &&
+		if (dist == NULL && state->group_exprs == NULL &&
+			state->ngroupcols == 1 && state->group_typlen[0] == -1 &&
 			state->groupvec_ok[0] && state->groupvecs[0].reader != NULL)
 		{
 			int32_t		is_dict = 0;
@@ -4178,20 +4382,25 @@ dbe_agg_fill_flat(DbeVectorAggState *state, int bucket, uint32 nbuckets)
 					continue;	/* de otro balde */
 			}
 
-			for (i = 0; i < state->ngroupcols && (cached == NULL || *cached == -2); i++)
+			if (state->group_exprs == NULL)
 			{
-				/* Columna que el stripe no tiene: su valor por omisión. */
-				if (!state->groupvec_ok[i])
-					dbe_agg_missing_value(state, state->groupcols[i],
-										  &state->flat_keys[i],
-										  &state->flat_keynulls[i]);
-				else
-					dbe_vec_value(&state->groupvecs[i], row,
-								  state->group_typbyval[i],
-								  state->group_typlen[i],
-								  &state->flat_keys[i],
-								  &state->flat_keynulls[i]);
+				for (i = 0; i < state->ngroupcols && (cached == NULL || *cached == -2); i++)
+				{
+					/* Columna que el stripe no tiene: su valor por omisión. */
+					if (!state->groupvec_ok[i])
+						dbe_agg_missing_value(state, state->groupcols[i],
+											  &state->flat_keys[i],
+											  &state->flat_keynulls[i]);
+					else
+						dbe_vec_value(&state->groupvecs[i], row,
+									  state->group_typbyval[i],
+									  state->group_typlen[i],
+									  &state->flat_keys[i],
+									  &state->flat_keynulls[i]);
+				}
 			}
+			else
+				dbe_agg_flat_keys_expr(state, row);
 			if (dist != NULL)
 			{
 				if (!dist->has_vector)

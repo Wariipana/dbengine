@@ -442,6 +442,8 @@ SELECT fx_check('SELECT a, b, count(*), count(v), count(s), sum(v), sum(w), avg(
 SELECT fx_check('SELECT c, d, min(c), max(d), min(t), max(t), count(*) FROM fx GROUP BY c, d') AS int8_fecha;
 SELECT fx_check('SELECT t, f, count(*), sum(v), avg(v) FROM fx GROUP BY t, f') AS timestamp_bool;
 SELECT fx_check('SELECT b, count(*), avg(w) FROM fx WHERE s = ''x1'' AND v > 0 GROUP BY b') AS con_where;
+SELECT fx_check('SELECT b, count(*) FROM fx WHERE a = 2 AND w >= 50 AND d < ''2020-01-20'' AND c <> 0 GROUP BY b') AS con_where_enteros;
+SELECT fx_check('SELECT b, count(*) FROM fx WHERE v = -500 OR v > 400 GROUP BY b') AS con_where_or;
 -- Un grupo sin ningún valor no nulo: sum, avg, min y max dan NULL, count 0.
 SELECT fx_check('SELECT a, count(v), sum(v), avg(v), min(v), max(v) FROM fx WHERE v IS NULL GROUP BY a') AS todo_nulo;
 SELECT a, count(v), sum(v), avg(v), min(v), max(v) FROM fx WHERE v IS NULL GROUP BY a ORDER BY a;
@@ -454,6 +456,20 @@ INSERT INTO fx (a, b, k, v) SELECT 1, i % 3, i % 4, i FROM generate_series(1, 10
 INSERT INTO fxh (a, b, k, v) SELECT 1, i % 3, i % 4, i FROM generate_series(1, 100) i;
 SELECT fx_check('SELECT k, count(*), sum(k), min(k) FROM fx GROUP BY k') AS columna_nueva;
 SELECT k, count(*) FROM fx GROUP BY k ORDER BY k;
+
+-- Claves que son una expresión sobre una columna: se calculan fila por
+-- fila.  Con nulos, texto, el DEFAULT de una columna nueva, y el numeric de
+-- extract() con campos enteros, que tiene una sola forma por valor.
+EXPLAIN (COSTS OFF) SELECT b - 1, count(*) FROM fx GROUP BY 1;
+SELECT fx_check('SELECT b - 1, count(*), sum(v) FROM fx GROUP BY 1') AS expresion;
+SELECT fx_check('SELECT a, b * 2, nullif(c, 0), count(*) FROM fx GROUP BY a, b * 2, nullif(c, 0)') AS expresiones;
+SELECT fx_check('SELECT lower(s), count(*), min(v) FROM fx GROUP BY 1') AS expresion_texto;
+SELECT fx_check('SELECT k + 1, count(*) FROM fx GROUP BY 1') AS expresion_columna_nueva;
+SELECT fx_check('SELECT extract(hour FROM t), extract(dow FROM t), count(*), avg(v) FROM fx GROUP BY 1, 2') AS extract_entero;
+SELECT extract(hour FROM t) AS h, count(*) FROM fx GROUP BY 1 ORDER BY 1 LIMIT 3;
+-- Con decimales no: 1.0 y 1.00 son iguales con bytes distintos.
+EXPLAIN (COSTS OFF) SELECT extract(second FROM t), count(*) FROM fx GROUP BY 1;
+EXPLAIN (COSTS OFF) SELECT v / 2.0, count(*) FROM fx GROUP BY 1;
 
 -- Volcado: con work_mem al mínimo y una estimación mala (se analiza con
 -- pocos grupos y se insertan muchos más), varios niveles de particiones.
@@ -474,6 +490,7 @@ SELECT (SELECT sum(hashtext(g || ':' || coalesce(h, -1) || ':' || c || ':' || co
 	 = (SELECT sum(hashtext(g || ':' || coalesce(h, -1) || ':' || c || ':' || coalesce(s, -1) || ':' || coalesce(a::text, '-'))::bigint)
 		FROM (SELECT g, h, count(*) c, sum(v) s, avg(v) a FROM fxsh GROUP BY g, h) y)
 	AS volcado_igual;
+SELECT fx_check('SELECT g + 1, h, count(*) FROM fxs GROUP BY 1, 2', 'fxs') AS volcado_expresion;
 RESET work_mem;
 
 -- Corridas: filas seguidas con las mismas claves van a la tabla una vez,
@@ -562,6 +579,10 @@ SELECT fx_check('SELECT v, count(DISTINCT u), count(DISTINCT n) FROM ft GROUP BY
 SELECT fx_check('SELECT v, count(*) FROM ft WHERE u <> ''u3'' GROUP BY v', 'ft') AS prefiltro;
 SELECT fx_check('SELECT v, count(*) FROM ft WHERE u IS NULL OR u LIKE ''%ñ%'' GROUP BY v', 'ft') AS prefiltro_nulos;
 SELECT fx_check('SELECT v, count(*), sum(n) FROM ft WHERE u > ''url/2'' AND v <> ''v3'' AND n % 2 = 0 GROUP BY v', 'ft') AS prefiltro_y_resto;
+-- Columna entera contra una constante: sobre el arreglo del stripe, con
+-- int2/int4/int8 cruzados, la constante a la izquierda, <>, y nulos.
+SELECT fx_check('SELECT v, count(*), sum(n) FROM ft WHERE n > 500 AND n <= 900 GROUP BY v', 'ft') AS prefiltro_enteros;
+SELECT fx_check('SELECT v, count(*) FROM ft WHERE 10::int8 < n AND n <> 700::int2 AND u <> ''u3'' GROUP BY v', 'ft') AS prefiltro_enteros_texto;
 RESET work_mem;
 DROP TABLE ft, fth;
 
@@ -601,6 +622,7 @@ SELECT (SELECT sum(hashtext(k || ':' || c || ':' || s)::bigint)
 EXPLAIN (COSTS OFF) SELECT v, count(DISTINCT k), count(*) FROM fpt GROUP BY v;
 SELECT fx_check('SELECT v, count(DISTINCT k), count(*) FROM fpt GROUP BY v', 'fpt') AS paralelo_distinct;
 SELECT fx_check('SELECT k, v, count(*) FROM fpt GROUP BY k, v', 'fpt') AS paralelo_texto_y_entero;
+SELECT fx_check('SELECT upper(k), v % 7, count(*) FROM fpt GROUP BY 1, 2', 'fpt') AS paralelo_expresiones;
 SET max_parallel_workers = 0;
 SELECT count(*) AS grupos, sum(c) AS filas
 FROM (SELECT g, h, count(*) c FROM fxs GROUP BY g, h) x;

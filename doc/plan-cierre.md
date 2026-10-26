@@ -275,8 +275,11 @@ Tres hechos del código que ordenan la lista:
        Después, varias claves con texto, `count(DISTINCT)` por grupo en dos
        niveles, corridas de claves repetidas y el WHERE de diccionario
        decidido por stripe: q10 6,6×, q17 1,6×, q15 1,7×; las 43: media
-       geométrica 0,432, suma 49,1 s. Falta: claves que son expresiones
-       (q19).
+       geométrica 0,432, suma 49,1 s. Después, claves que son expresiones
+       sobre una columna (con el numeric de `extract()` de campos enteros)
+       y las comparaciones de enteros contra constantes sobre el arreglo
+       del stripe: q19 1,6×, q36 1,8×, q2 4,2×; las 43: media geométrica
+       0,364, suma 43,7 s.
 10. [ ] **Decodificación por lotes** (`decode_range` de 1024 filas a través
        del airlock) con desempaquetado de bits por ancho estilo FastLanes,
        escrito para que el compilador lo vectorice en NEON.

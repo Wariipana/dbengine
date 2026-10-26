@@ -26,6 +26,11 @@
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
 #include "optimizer/optimizer.h"
+#include "access/nbtree.h"
+#include "access/stratnum.h"
+#include "catalog/pg_am_d.h"
+#include "commands/defrem.h"
+#include "utils/date.h"
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
@@ -68,16 +73,124 @@ typedef struct DbeDictClause
 	uint8		null_result;
 } DbeDictClause;
 
+/*
+ * `col op const` sobre un entero o una fecha, con op del btree del tipo (o
+ * su negador `<>`): el prefiltro la evalúa sobre el arreglo de la columna.
+ * Sigue también en `rest`, que es lo que se evalúa fila por fila.
+ */
+typedef struct DbeVecClause
+{
+	AttrNumber	attnum;
+	int			strategy;		/* BT*StrategyNumber, o 0 para <> */
+	int64		value;
+} DbeVecClause;
+
 struct DbeDictQual
 {
 	int			nclauses;
 	DbeDictClause *clauses;
 	ExprState  *rest;			/* las que no califican; NULL si ninguna */
 	Bitmapset  *rest_cols;		/* columnas que miran las de `rest` */
+	int			nvec;
+	DbeVecClause *vec;
+	bool		rest_all_vec;	/* todas las de `rest` están en `vec` */
 	MemoryContext cxt;			/* el del nodo: dura lo que dura el scan */
 	uint32	   *codes;			/* los de un stripe, para el prefiltro */
 	uint32		codes_cap;
 };
+
+/* ¿Entero (o fecha) que se lee como int64 de su ancho? */
+static bool
+dbe_vec_type(Oid typid)
+{
+	return typid == INT2OID || typid == INT4OID || typid == INT8OID ||
+		typid == DATEOID;
+}
+
+static bool
+dbe_vec_const(Const *c, int64 *value)
+{
+	if (c->constisnull)
+		return false;
+	switch (c->consttype)
+	{
+		case INT2OID:
+			*value = DatumGetInt16(c->constvalue);
+			return true;
+		case INT4OID:
+			*value = DatumGetInt32(c->constvalue);
+			return true;
+		case INT8OID:
+			*value = DatumGetInt64(c->constvalue);
+			return true;
+		case DATEOID:
+			*value = DatumGetDateADT(c->constvalue);
+			return true;
+		default:
+			return false;
+	}
+}
+
+/*
+ * ¿La cláusula es `col op const` (o `const op col`) que el prefiltro sabe
+ * evaluar?  El operador tiene que estar en la familia btree por omisión del
+ * tipo de la columna —integer_ops cruza int2, int4 e int8—, así que
+ * compara los valores como enteros.
+ */
+static bool
+dbe_vec_clause(Node *clause, Index varno, DbeVecClause *out)
+{
+	OpExpr	   *op = (OpExpr *) clause;
+	Node	   *l;
+	Node	   *r;
+	Var		   *var;
+	Const	   *c;
+	bool		commuted = false;
+	Oid			opfamily;
+	Oid			opclass;
+	int			strategy;
+
+	if (!IsA(op, OpExpr) || list_length(op->args) != 2)
+		return false;
+	l = linitial(op->args);
+	r = lsecond(op->args);
+	if (IsA(l, Var) && IsA(r, Const))
+	{
+		var = (Var *) l;
+		c = (Const *) r;
+	}
+	else if (IsA(l, Const) && IsA(r, Var))
+	{
+		var = (Var *) r;
+		c = (Const *) l;
+		commuted = true;
+	}
+	else
+		return false;
+	if (var->varno != (int) varno || var->varattno <= 0 ||
+		var->varlevelsup != 0 || !dbe_vec_type(var->vartype) ||
+		!dbe_vec_const(c, &out->value))
+		return false;
+
+	opclass = GetDefaultOpClass(var->vartype, BTREE_AM_OID);
+	if (!OidIsValid(opclass))
+		return false;
+	opfamily = get_opclass_family(opclass);
+	strategy = get_op_opfamily_strategy(op->opno, opfamily);
+	if (strategy == 0)
+	{
+		Oid			neg = get_negator(op->opno);
+
+		if (!OidIsValid(neg) ||
+			get_op_opfamily_strategy(neg, opfamily) != BTEqualStrategyNumber)
+			return false;
+	}
+	else if (commuted)
+		strategy = BTCommuteStrategyNumber(strategy);
+	out->attnum = var->varattno;
+	out->strategy = strategy;
+	return true;
+}
 
 /*
  * ¿La cláusula depende solo de una columna de largo variable de esta
@@ -333,8 +446,17 @@ dbe_dictqual_build(List *quals, Index varno, TupleDesc desc,
 
 		if (attnum == InvalidAttrNumber)
 		{
+			DbeVecClause vc;
+
 			rest = lappend(rest, clause);
 			pull_varattnos(clause, varno, &dq->rest_cols);
+			if (dbe_enable_dict_quals && dbe_vec_clause(clause, varno, &vc))
+			{
+				if (dq->vec == NULL)
+					dq->vec = (DbeVecClause *)
+						palloc(sizeof(DbeVecClause) * list_length(quals));
+				dq->vec[dq->nvec++] = vc;
+			}
 			continue;
 		}
 
@@ -347,6 +469,7 @@ dbe_dictqual_build(List *quals, Index varno, TupleDesc desc,
 
 	if (rest != NIL)
 		dq->rest = dbe_dictqual_compile(rest, parent, estate);
+	dq->rest_all_vec = (dq->nvec == list_length(rest));
 	for (int i = 0; i < dq->nclauses; i++)
 		dq->clauses[i].lazy =
 			!bms_is_member(dq->clauses[i].attnum - FirstLowInvalidHeapAttributeNumber,
@@ -562,16 +685,96 @@ dbe_dictqual_eval(DbeDictQual *dq, DbeRowCursor *cur, uint64 row,
 	return pass;
 }
 
+/*
+ * Una cláusula de arreglo sobre todas las filas del stripe: las que no la
+ * pasan, o tienen la columna nula, quedan en DBE_SEL_FAIL.  false si la
+ * columna no tiene arreglo de ancho fijo en este stripe.
+ */
+#define DBE_VEC_LOOP(T, CMP) \
+	do { \
+		const T    *d = (const T *) vec.data; \
+		for (uint32 r = 0; r < nrows; r++) \
+		{ \
+			int64		x = d[r]; \
+			if (!(CMP)) \
+				sel[r] = DBE_SEL_FAIL; \
+		} \
+	} while (0)
+
+#define DBE_VEC_BY_WIDTH(CMP) \
+	do { \
+		switch (vec.width) \
+		{ \
+			case 2: DBE_VEC_LOOP(int16, CMP); break; \
+			case 4: DBE_VEC_LOOP(int32, CMP); break; \
+			default: DBE_VEC_LOOP(int64, CMP); break; \
+		} \
+	} while (0)
+
+static bool
+dbe_vec_prefilter(const DbeVecClause *vc, DbeRowCursor *cur, uint32 nrows,
+				  uint8 *sel)
+{
+	DbeColumnVector vec;
+	int64		k = vc->value;
+
+	if (!dbe_cursor_column(cur, vc->attnum, &vec) || !vec.contiguous ||
+		(vec.width != 2 && vec.width != 4 && vec.width != 8))
+		return false;
+
+	switch (vc->strategy)
+	{
+		case BTLessStrategyNumber:
+			DBE_VEC_BY_WIDTH(x < k);
+			break;
+		case BTLessEqualStrategyNumber:
+			DBE_VEC_BY_WIDTH(x <= k);
+			break;
+		case BTEqualStrategyNumber:
+			DBE_VEC_BY_WIDTH(x == k);
+			break;
+		case BTGreaterEqualStrategyNumber:
+			DBE_VEC_BY_WIDTH(x >= k);
+			break;
+		case BTGreaterStrategyNumber:
+			DBE_VEC_BY_WIDTH(x > k);
+			break;
+		default:
+			DBE_VEC_BY_WIDTH(x != k);
+			break;
+	}
+
+	/* Una comparación con NULL no es verdadera: no pasa. */
+	if (vec.nulls != NULL)
+		for (uint32 r = 0; r < nrows; r++)
+			if ((vec.nulls[r / 8] & (1 << (r % 8))) == 0)
+				sel[r] = DBE_SEL_FAIL;
+	return true;
+}
+
 bool
 dbe_dictqual_prefilter(DbeDictQual *dq, DbeRowCursor *cur, uint32 nrows,
 					   uint8 *sel, ExprContext *econtext)
 {
 	bool		any = false;
 
-	/* Sin cláusulas de diccionario no hay nada que decidir por código. */
-	if (dq->nclauses == 0)
+	/* Sin cláusulas de diccionario ni de arreglo no hay nada que decidir. */
+	if (dq->nclauses == 0 && dq->nvec == 0)
 		return false;
-	memset(sel, dq->rest != NULL ? DBE_SEL_CHECK : DBE_SEL_PASS, nrows);
+	memset(sel, dq->rest != NULL && !dq->rest_all_vec ? DBE_SEL_CHECK
+		   : DBE_SEL_PASS, nrows);
+	for (int i = 0; i < dq->nvec; i++)
+	{
+		if (!dbe_vec_prefilter(&dq->vec[i], cur, nrows, sel))
+		{
+			/* Esa columna no tiene arreglo en este stripe: fila por fila. */
+			for (uint32 r = 0; r < nrows; r++)
+				if (sel[r] == DBE_SEL_PASS)
+					sel[r] = DBE_SEL_CHECK;
+			continue;
+		}
+		any = true;
+	}
 	for (int i = 0; i < dq->nclauses; i++)
 	{
 		DbeDictClause *c = &dq->clauses[i];

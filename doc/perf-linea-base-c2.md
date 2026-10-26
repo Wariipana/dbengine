@@ -390,6 +390,35 @@ diccionario, la fila que repite el valor de la anterior se saltea.
 
 q29 (11,9 s) no cambia: la regex ya se calcula una vez por código (52 s
 sin eso, 25 s con eso, en serie), pero son 3,4M valores distintos por
-stripe a unos 6,5 µs cada uno en el motor de regex de Postgres. q19
-agrupa por `extract(minute FROM EventTime)`, una expresión, que la tabla
-todavía no acepta como clave.
+stripe a unos 6,5 µs cada uno en el motor de regex de Postgres.
+
+## Resultado: claves que son expresiones y comparaciones sobre el arreglo
+
+**Claves que son expresiones.** Una expresión del GROUP BY sobre una
+columna —`ClientIP - 1` en q36, `extract(minute FROM EventTime)` en q19—
+se calcula fila por fila contra el slot de la relación, en un
+`ExprContext` propio: el de los argumentos de los agregados se resetea en
+cada uno y liberaba la clave antes de que la tabla la copiara. El tipo
+tiene que servir de clave, con una excepción: el `numeric` de `extract()`
+con un campo entero (minute, hour, day, dow…). En general dos numeric
+iguales pueden tener bytes distintos (1.0 y 1.00), pero Postgres arma esos
+con `int64_to_numeric()`, siempre con la misma forma. Con second o epoch no:
+tienen decimales, y quedan en el plan de Postgres. Para que el camino se
+ofreciera hubo que mirar debajo del `ProjectionPath` que el planner pone
+encima del scan para calcular la expresión. La lectura de las claves con
+expresión va en una función aparte: con la rama adentro del lazo de
+siempre, q18 tardaba 11% más.
+
+**Comparaciones sobre el arreglo.** `col op const` sobre int2/int4/int8 o
+date, con el operador en la familia btree del tipo (o su `<>`), se evalúa
+en el prefiltro sobre el arreglo del stripe entero, sin armar el slot por
+fila. La cláusula sigue en la evaluación fila por fila, que es la que usan
+el scan y las filas que el prefiltro no decide; el prefiltro solo descarta,
+o marca "pasa" cuando todo lo que queda del WHERE es de este tipo. q43
+agrupa por `date_trunc('minute', EventTime)` y con la tabla propia en
+serie tardaba 155 ms contra 135 del plan paralelo de Postgres: el tiempo
+era el WHERE de cinco cláusulas enteras, no la expresión.
+
+**q19 7,02 → 4,28 s, q36 2,68 → 1,47 s, q2 122 → 29 ms, q8 128 → 35 ms,
+q42 42 → 25 ms, q41 58 → 40 ms, q39 44 → 30 ms, q37 364 → 311 ms.** Las 43
+contra la línea base: media geométrica 0,364, suma 109,9 → 43,7 s.

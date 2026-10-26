@@ -703,6 +703,18 @@ SELECT fx_check('SELECT b, count(*), avg(w) FROM fx WHERE s = ''x1'' AND v > 0 G
  t
 (1 row)
 
+SELECT fx_check('SELECT b, count(*) FROM fx WHERE a = 2 AND w >= 50 AND d < ''2020-01-20'' AND c <> 0 GROUP BY b') AS con_where_enteros;
+ con_where_enteros 
+-------------------
+ t
+(1 row)
+
+SELECT fx_check('SELECT b, count(*) FROM fx WHERE v = -500 OR v > 400 GROUP BY b') AS con_where_or;
+ con_where_or 
+--------------
+ t
+(1 row)
+
 -- Un grupo sin ningún valor no nulo: sum, avg, min y max dan NULL, count 0.
 SELECT fx_check('SELECT a, count(v), sum(v), avg(v), min(v), max(v) FROM fx WHERE v IS NULL GROUP BY a') AS todo_nulo;
  todo_nulo 
@@ -743,6 +755,74 @@ SELECT k, count(*) FROM fx GROUP BY k ORDER BY k;
  7 | 30000
 (5 rows)
 
+-- Claves que son una expresión sobre una columna: se calculan fila por
+-- fila.  Con nulos, texto, el DEFAULT de una columna nueva, y el numeric de
+-- extract() con campos enteros, que tiene una sola forma por valor.
+EXPLAIN (COSTS OFF) SELECT b - 1, count(*) FROM fx GROUP BY 1;
+              QUERY PLAN               
+---------------------------------------
+ Custom Scan (DbengineVectorAgg) on fx
+   Agregados empujados al scan: 2
+   Agrupación: tabla de hash propia
+(3 rows)
+
+SELECT fx_check('SELECT b - 1, count(*), sum(v) FROM fx GROUP BY 1') AS expresion;
+ expresion 
+-----------
+ t
+(1 row)
+
+SELECT fx_check('SELECT a, b * 2, nullif(c, 0), count(*) FROM fx GROUP BY a, b * 2, nullif(c, 0)') AS expresiones;
+ expresiones 
+-------------
+ t
+(1 row)
+
+SELECT fx_check('SELECT lower(s), count(*), min(v) FROM fx GROUP BY 1') AS expresion_texto;
+ expresion_texto 
+-----------------
+ t
+(1 row)
+
+SELECT fx_check('SELECT k + 1, count(*) FROM fx GROUP BY 1') AS expresion_columna_nueva;
+ expresion_columna_nueva 
+-------------------------
+ t
+(1 row)
+
+SELECT fx_check('SELECT extract(hour FROM t), extract(dow FROM t), count(*), avg(v) FROM fx GROUP BY 1, 2') AS extract_entero;
+ extract_entero 
+----------------
+ t
+(1 row)
+
+SELECT extract(hour FROM t) AS h, count(*) FROM fx GROUP BY 1 ORDER BY 1 LIMIT 3;
+ h | count 
+---+-------
+ 0 |  2727
+ 1 |  2728
+ 2 |  2728
+(3 rows)
+
+-- Con decimales no: 1.0 y 1.00 son iguales con bytes distintos.
+EXPLAIN (COSTS OFF) SELECT extract(second FROM t), count(*) FROM fx GROUP BY 1;
+                   QUERY PLAN                   
+------------------------------------------------
+ HashAggregate
+   Group Key: EXTRACT(second FROM t)
+   ->  Custom Scan (DbengineColumnarScan) on fx
+         Columnas leídas: t
+(4 rows)
+
+EXPLAIN (COSTS OFF) SELECT v / 2.0, count(*) FROM fx GROUP BY 1;
+                   QUERY PLAN                   
+------------------------------------------------
+ HashAggregate
+   Group Key: ((v)::numeric / 2.0)
+   ->  Custom Scan (DbengineColumnarScan) on fx
+         Columnas leídas: v
+(4 rows)
+
 -- Volcado: con work_mem al mínimo y una estimación mala (se analiza con
 -- pocos grupos y se insertan muchos más), varios niveles de particiones.
 CREATE TABLE fxs (g int8, h int4, v int4) USING dbengine_columnar;
@@ -781,6 +861,12 @@ SELECT (SELECT sum(hashtext(g || ':' || coalesce(h, -1) || ':' || c || ':' || co
 	AS volcado_igual;
  volcado_igual 
 ---------------
+ t
+(1 row)
+
+SELECT fx_check('SELECT g + 1, h, count(*) FROM fxs GROUP BY 1, 2', 'fxs') AS volcado_expresion;
+ volcado_expresion 
+-------------------
  t
 (1 row)
 
@@ -1020,6 +1106,20 @@ SELECT fx_check('SELECT v, count(*), sum(n) FROM ft WHERE u > ''url/2'' AND v <>
  t
 (1 row)
 
+-- Columna entera contra una constante: sobre el arreglo del stripe, con
+-- int2/int4/int8 cruzados, la constante a la izquierda, <>, y nulos.
+SELECT fx_check('SELECT v, count(*), sum(n) FROM ft WHERE n > 500 AND n <= 900 GROUP BY v', 'ft') AS prefiltro_enteros;
+ prefiltro_enteros 
+-------------------
+ t
+(1 row)
+
+SELECT fx_check('SELECT v, count(*) FROM ft WHERE 10::int8 < n AND n <> 700::int2 AND u <> ''u3'' GROUP BY v', 'ft') AS prefiltro_enteros_texto;
+ prefiltro_enteros_texto 
+-------------------------
+ t
+(1 row)
+
 RESET work_mem;
 DROP TABLE ft, fth;
 -- En paralelo: los participantes se reparten baldes de grupos por el hash de
@@ -1110,6 +1210,12 @@ SELECT fx_check('SELECT v, count(DISTINCT k), count(*) FROM fpt GROUP BY v', 'fp
 SELECT fx_check('SELECT k, v, count(*) FROM fpt GROUP BY k, v', 'fpt') AS paralelo_texto_y_entero;
  paralelo_texto_y_entero 
 -------------------------
+ t
+(1 row)
+
+SELECT fx_check('SELECT upper(k), v % 7, count(*) FROM fpt GROUP BY 1, 2', 'fpt') AS paralelo_expresiones;
+ paralelo_expresiones 
+----------------------
  t
 (1 row)
 
