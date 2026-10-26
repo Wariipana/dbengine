@@ -68,6 +68,7 @@
 #include "utils/selfuncs.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/sortsupport.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
@@ -396,6 +397,33 @@ typedef struct DbeVectorAggState
 	ExprState **group_exprs;
 	ExprContext *key_econtext;
 
+	/*
+	 * Top-N (dbe_flat_topn_spec()): los k mejores grupos según el ORDER BY,
+	 * en un heap con el peor arriba.  Cada entrada guarda las claves, los
+	 * estados y los valores de orden; los demás agregados se calculan
+	 * recién al emitir.  topn_src[j] es de dónde sale el valor de orden j:
+	 * >= 0 una clave, <= -1 el agregado -1 - v de la tabla que se emite.
+	 */
+	int			topn_k;
+	int			topn_nsort;
+	int		   *topn_src;
+	bool	   *topn_byval;
+	int16	   *topn_len;
+	SortSupport topn_ssup;
+	int			topn_n;
+	int			topn_emit;
+	bool		topn_filled;	/* ya se llenó para el balde actual */
+	int		   *topn_heap;
+	Datum	   *topn_keys;
+	bool	   *topn_keynulls;
+	uint64	   *topn_states;
+	Datum	   *topn_sv;
+	bool	   *topn_svnull;
+	Datum	   *topn_cand;
+	bool	   *topn_candnull;
+	MemoryContext topn_cxt;		/* copias de lo que está en el heap */
+	MemoryContext topn_tmpcxt;	/* lo de un candidato o una fila emitida */
+
 	DbeFlatAgg *flatdist;
 	int			flat_dist;
 	int		   *flat_map;
@@ -723,6 +751,81 @@ dbe_flat_expr_key_ok(Node *expr, Oid eqop, Index relid, AttrNumber *attnum)
 		return true;
 	return typid == NUMERICOID && dbe_flat_extract_integral(expr) &&
 		eqop == lookup_type_cache(NUMERICOID, TYPECACHE_EQ_OPR)->eq_opr;
+}
+
+/* Más que esto no se guarda en el top-N: con un LIMIT grande no conviene. */
+#define DBE_TOPN_MAX	10000
+
+/* Una constante entera no nula del LIMIT/OFFSET, 0 si no hay, o -1. */
+static int64
+dbe_limit_const(Node *n)
+{
+	Const	   *c = (Const *) n;
+
+	if (n == NULL)
+		return 0;
+	if (!IsA(c, Const) || c->constisnull || c->consttype != INT8OID)
+		return -1;
+	return DatumGetInt64(c->constvalue);
+}
+
+/*
+ * ¿El `ORDER BY ... LIMIT k` de la query se puede resolver con un top-N
+ * adentro de la tabla propia?  Cada participante emite grupos completos,
+ * así que los k primeros del total están entre los k primeros de alguno:
+ * alcanza con que cada uno emita los suyos, y el Sort y el Limit de arriba
+ * siguen igual.  Con agregados el planner no calcula el límite
+ * (root->limit_tuples queda en -1): sale de las constantes.  Sin WITH
+ * TIES, que necesita todos los empates.
+ *
+ * Devuelve [k, posiciones en tlist, sortops, collations, nulls_first], o
+ * NIL.
+ */
+static List *
+dbe_flat_topn_spec(PlannerInfo *root, List *tlist, double *k)
+{
+	Query	   *parse = root->parse;
+	int64		count = dbe_limit_const(parse->limitCount);
+	int64		offset = dbe_limit_const(parse->limitOffset);
+	List	   *pos = NIL;
+	List	   *ops = NIL;
+	List	   *colls = NIL;
+	List	   *nf = NIL;
+	ListCell   *lc;
+
+	if (parse->sortClause == NIL || parse->limitCount == NULL ||
+		parse->limitOption != LIMIT_OPTION_COUNT ||
+		count <= 0 || offset < 0 || count + offset > DBE_TOPN_MAX)
+		return NIL;
+
+	foreach(lc, parse->sortClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		TargetEntry *ste = get_sortgroupclause_tle(sgc, root->processed_tlist);
+		ListCell   *lt;
+		int			j = 0;
+		int			found = -1;
+
+		if (!OidIsValid(sgc->sortop))
+			return NIL;
+		foreach(lt, tlist)
+		{
+			if (equal(((TargetEntry *) lfirst(lt))->expr, ste->expr))
+			{
+				found = j;
+				break;
+			}
+			j++;
+		}
+		if (found < 0)
+			return NIL;
+		pos = lappend_int(pos, found);
+		ops = lappend_oid(ops, sgc->sortop);
+		colls = lappend_oid(colls, exprCollation((Node *) ste->expr));
+		nf = lappend_int(nf, sgc->nulls_first ? 1 : 0);
+	}
+	*k = (double) (count + offset);
+	return list_make5(makeInteger((int) (count + offset)), pos, ops, colls, nf);
 }
 
 /*
@@ -1821,12 +1924,18 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 			Size		entry = sizeof(uint64) * (2 + list_length(agg_attnums) * 2) + 8;
 			double		hash_mem = (double) get_hash_memory_limit();
 			List	   *fprivate = list_copy(private);
+			List	   *topn;
+			double		topn_k = 0;
 
 			llast(fprivate) = makeInteger(2);
 			fprivate = lappend(fprivate,
 							   makeInteger((int) Min(ngroups, (double) PG_INT32_MAX)));
+			topn = dbe_flat_topn_spec(root, tlist, &topn_k);
+			fprivate = lappend(fprivate, topn);
 			path->custom_private = fprivate;
 			path->path.pathkeys = NIL;	/* sale en el orden de la tabla */
+			if (topn != NIL)
+				path->path.rows = Min(ngroups, topn_k);
 
 			/*
 			 * Una búsqueda por fila en una tabla plana, sin armar tuplas ni
@@ -1846,6 +1955,14 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 					(in_rows * (double) (entry / 2) / BLCKSZ);
 			path->path.total_cost = path->path.startup_cost +
 				cpu_tuple_cost * ngroups;
+
+			/*
+			 * Con top-N se recorren igual todos los grupos, pero salen k: lo
+			 * que se ahorra es el Gather y el Sort de arriba.
+			 */
+			if (topn != NIL)
+				path->path.total_cost = path->path.startup_cost +
+					cpu_operator_cost * ngroups + cpu_tuple_cost * path->path.rows;
 
 			/*
 			 * La versión paralela no se reparte stripes sino grupos: cada
@@ -1878,6 +1995,12 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 					pp->path.parallel_aware = true;
 					pp->path.parallel_workers = workers;
 					pp->path.rows = clamp_row_est(ngroups / parts);
+					if (topn != NIL)
+					{
+						/* Cada participante emite sus k mejores. */
+						pp->path.rows = Min(pp->path.rows, topn_k);
+						rows = pp->path.rows * parts;
+					}
 					pp->path.startup_cost = scan + work / parts;
 					pp->path.total_cost = pp->path.startup_cost +
 						cpu_tuple_cost * pp->path.rows;
@@ -2738,6 +2861,265 @@ dbe_agg_try_metadata(DbeVectorAggState *state, TupleTableSlot *slot)
  * un estado que ella sabe llevar; si acá no, es que el plan y el código
  * dejaron de coincidir, y seguir daría resultados de otro agregado.
  */
+/* Prepara el top-N con lo que dejó dbe_flat_topn_spec(). */
+static void
+dbe_agg_begin_topn(DbeVectorAggState *state, CustomScan *cscan, List *spec)
+{
+	List	   *pos = (List *) lsecond(spec);
+	List	   *ops = (List *) lthird(spec);
+	List	   *colls = (List *) lfourth(spec);
+	List	   *nf = (List *) list_nth(spec, 4);
+	DbeFlatAgg *out = state->flatdist != NULL ? state->flatdist : state->flatagg;
+	int			k = intVal(linitial(spec));
+	int			ns = list_length(pos);
+	int			nk = state->ngroupcols;
+	int			nst = dbe_flat_nstates(out);
+
+	state->topn_k = k;
+	state->topn_nsort = ns;
+	state->topn_src = (int *) palloc(sizeof(int) * ns);
+	state->topn_byval = (bool *) palloc(sizeof(bool) * ns);
+	state->topn_len = (int16 *) palloc(sizeof(int16) * ns);
+	state->topn_ssup = (SortSupport) palloc0(sizeof(SortSupportData) * ns);
+	for (int j = 0; j < ns; j++)
+	{
+		int			p = list_nth_int(pos, j);
+		TargetEntry *tle = (TargetEntry *) list_nth(cscan->custom_scan_tlist, p);
+		DbeAggState *agg = &state->aggs[p];
+		SortSupport ss = &state->topn_ssup[j];
+
+		if (agg->is_const)
+			elog(ERROR, "dbengine: top-N por una constante");
+		if (agg->is_group)
+			state->topn_src[j] = agg->group_idx;
+		else
+		{
+			int			v = 0;
+
+			/* Los agregados de la tabla que se emite van en el orden del tlist. */
+			for (int i = 0; i < p; i++)
+				if (!state->aggs[i].is_group)
+					v++;
+			state->topn_src[j] = -1 - v;
+		}
+		get_typlenbyval(exprType((Node *) tle->expr), &state->topn_len[j],
+						&state->topn_byval[j]);
+		ss->ssup_cxt = CurrentMemoryContext;
+		ss->ssup_collation = list_nth_oid(colls, j);
+		ss->ssup_nulls_first = list_nth_int(nf, j) != 0;
+		PrepareSortSupportFromOrderingOp(list_nth_oid(ops, j), ss);
+	}
+	state->topn_heap = (int *) palloc(sizeof(int) * k);
+	state->topn_keys = (Datum *) palloc(sizeof(Datum) * k * Max(nk, 1));
+	state->topn_keynulls = (bool *) palloc(sizeof(bool) * k * Max(nk, 1));
+	state->topn_states = (uint64 *) palloc(sizeof(uint64) * k * Max(nst, 1));
+	state->topn_sv = (Datum *) palloc(sizeof(Datum) * k * ns);
+	state->topn_svnull = (bool *) palloc(sizeof(bool) * k * ns);
+	state->topn_cand = (Datum *) palloc(sizeof(Datum) * ns);
+	state->topn_candnull = (bool *) palloc(sizeof(bool) * ns);
+	state->topn_cxt = AllocSetContextCreate(CurrentMemoryContext,
+											"dbengine top-N",
+											ALLOCSET_DEFAULT_SIZES);
+	state->topn_tmpcxt = AllocSetContextCreate(CurrentMemoryContext,
+											   "dbengine top-N candidato",
+											   ALLOCSET_SMALL_SIZES);
+}
+
+/* Compara los valores de orden de dos entradas, o de una con el candidato. */
+static int
+dbe_agg_topn_cmp(DbeVectorAggState *state, const Datum *a, const bool *an,
+				 const Datum *b, const bool *bn)
+{
+	for (int j = 0; j < state->topn_nsort; j++)
+	{
+		int			r = ApplySortComparator(a[j], an[j], b[j], bn[j],
+											&state->topn_ssup[j]);
+
+		if (r != 0)
+			return r;
+	}
+	return 0;
+}
+
+static inline int
+dbe_agg_topn_cmp_slots(DbeVectorAggState *state, int x, int y)
+{
+	int			ns = state->topn_nsort;
+
+	return dbe_agg_topn_cmp(state, &state->topn_sv[x * ns], &state->topn_svnull[x * ns],
+							&state->topn_sv[y * ns], &state->topn_svnull[y * ns]);
+}
+
+/* El heap tiene arriba la entrada que va última en el orden. */
+static void
+dbe_agg_topn_sift_up(DbeVectorAggState *state, int i)
+{
+	int		   *h = state->topn_heap;
+
+	while (i > 0)
+	{
+		int			parent = (i - 1) / 2;
+		int			t;
+
+		if (dbe_agg_topn_cmp_slots(state, h[i], h[parent]) <= 0)
+			break;
+		t = h[i];
+		h[i] = h[parent];
+		h[parent] = t;
+		i = parent;
+	}
+}
+
+static void
+dbe_agg_topn_sift_down(DbeVectorAggState *state)
+{
+	int		   *h = state->topn_heap;
+	int			n = state->topn_n;
+	int			i = 0;
+
+	for (;;)
+	{
+		int			l = 2 * i + 1;
+		int			m = i;
+		int			t;
+
+		if (l < n && dbe_agg_topn_cmp_slots(state, h[l], h[m]) > 0)
+			m = l;
+		if (l + 1 < n && dbe_agg_topn_cmp_slots(state, h[l + 1], h[m]) > 0)
+			m = l + 1;
+		if (m == i)
+			break;
+		t = h[i];
+		h[i] = h[m];
+		h[m] = t;
+		i = m;
+	}
+}
+
+/* Guarda en la entrada `e` el grupo cuyos valores de orden son el candidato. */
+static void
+dbe_agg_topn_store(DbeVectorAggState *state, DbeFlatAgg *out, int e,
+				   const uint64 *st, bool replacing)
+{
+	int			nk = state->ngroupcols;
+	int			ns = state->topn_nsort;
+	int			nst = dbe_flat_nstates(out);
+	MemoryContext old = MemoryContextSwitchTo(state->topn_cxt);
+
+	for (int g = 0; g < nk; g++)
+	{
+		Datum	   *d = &state->topn_keys[e * nk + g];
+
+		if (replacing && !state->group_typbyval[g] && !state->topn_keynulls[e * nk + g])
+			pfree(DatumGetPointer(*d));
+		state->topn_keynulls[e * nk + g] = state->flat_keynulls[g];
+		*d = state->flat_keynulls[g] ? (Datum) 0
+			: datumCopy(state->flat_keys[g], state->group_typbyval[g],
+						state->group_typlen[g]);
+	}
+	for (int j = 0; j < ns; j++)
+	{
+		Datum	   *d = &state->topn_sv[e * ns + j];
+
+		if (replacing && !state->topn_byval[j] && !state->topn_svnull[e * ns + j])
+			pfree(DatumGetPointer(*d));
+		state->topn_svnull[e * ns + j] = state->topn_candnull[j];
+		*d = state->topn_candnull[j] ? (Datum) 0
+			: datumCopy(state->topn_cand[j], state->topn_byval[j],
+						state->topn_len[j]);
+	}
+	memcpy(&state->topn_states[(Size) e * nst], st, sizeof(uint64) * nst);
+	MemoryContextSwitchTo(old);
+}
+
+/*
+ * Recorre los grupos de la tabla que se emite y se queda con los k
+ * mejores.  De cada grupo se calculan solo los valores de orden; el resto
+ * de los agregados, al emitir.
+ */
+static void
+dbe_agg_topn_fill(DbeVectorAggState *state)
+{
+	DbeFlatAgg *out = state->flatdist != NULL ? state->flatdist : state->flatagg;
+	int			ns = state->topn_nsort;
+	const uint64 *st;
+
+	MemoryContextReset(state->topn_cxt);
+	state->topn_n = 0;
+	state->topn_emit = 0;
+	while (dbe_flat_next_states(out, state->flat_keys, state->flat_keynulls, &st))
+	{
+		MemoryContext old;
+
+		MemoryContextReset(state->topn_tmpcxt);
+		old = MemoryContextSwitchTo(state->topn_tmpcxt);
+		for (int j = 0; j < ns; j++)
+		{
+			int			src = state->topn_src[j];
+
+			if (src >= 0)
+			{
+				state->topn_cand[j] = state->flat_keys[src];
+				state->topn_candnull[j] = state->flat_keynulls[src];
+			}
+			else
+				state->topn_cand[j] = dbe_flat_final(out, -1 - src, st,
+													 &state->topn_candnull[j]);
+		}
+		MemoryContextSwitchTo(old);
+
+		if (state->topn_n < state->topn_k)
+		{
+			int			e = state->topn_n++;
+
+			dbe_agg_topn_store(state, out, e, st, false);
+			state->topn_heap[e] = e;
+			dbe_agg_topn_sift_up(state, e);
+		}
+		else
+		{
+			int			top = state->topn_heap[0];
+
+			if (dbe_agg_topn_cmp(state, state->topn_cand, state->topn_candnull,
+								 &state->topn_sv[top * ns],
+								 &state->topn_svnull[top * ns]) >= 0)
+				continue;
+			dbe_agg_topn_store(state, out, top, st, true);
+			dbe_agg_topn_sift_down(state);
+		}
+	}
+}
+
+/* La próxima entrada del top-N, en flat_keys y flat_outs.  false al final. */
+static bool
+dbe_agg_topn_next(DbeVectorAggState *state)
+{
+	DbeFlatAgg *out = state->flatdist != NULL ? state->flatdist : state->flatagg;
+	int			nk = state->ngroupcols;
+	int			nst = dbe_flat_nstates(out);
+	int			e;
+	MemoryContext old;
+	int			v = 0;
+
+	if (state->topn_emit >= state->topn_n)
+		return false;
+	e = state->topn_emit++;
+	memcpy(state->flat_keys, &state->topn_keys[e * nk], sizeof(Datum) * nk);
+	memcpy(state->flat_keynulls, &state->topn_keynulls[e * nk], sizeof(bool) * nk);
+	MemoryContextReset(state->topn_tmpcxt);
+	old = MemoryContextSwitchTo(state->topn_tmpcxt);
+	for (int i = 0; i < state->naggs; i++)
+	{
+		if (state->aggs[i].is_group)
+			continue;
+		state->flat_outs[v] = dbe_flat_final(out, v, &state->topn_states[(Size) e * nst],
+											 &state->flat_outnulls[v]);
+		v++;
+	}
+	MemoryContextSwitchTo(old);
+	return true;
+}
+
 static void
 dbe_agg_begin_flat(DbeVectorAggState *state, CustomScan *cscan, int eflags)
 {
@@ -2832,6 +3214,10 @@ dbe_agg_begin_flat(DbeVectorAggState *state, CustomScan *cscan, int eflags)
 	state->flat_outs = (Datum *) palloc0(sizeof(Datum) * Max(n2, 1));
 	state->flat_outnulls = (bool *) palloc0(sizeof(bool) * Max(n2, 1));
 	pfree(defs);
+
+	if (list_length(cscan->custom_private) > 8 &&
+		list_nth(cscan->custom_private, 8) != NIL)
+		dbe_agg_begin_topn(state, cscan, (List *) list_nth(cscan->custom_private, 8));
 }
 
 /*
@@ -4618,10 +5004,20 @@ dbe_agg_exec_flat(CustomScanState *node)
 				dbe_agg_fill_flat(state, -1, 0);
 		}
 
-		if (dbe_flat_next(state->flatdist != NULL ? state->flatdist
-						  : state->flatagg, state->flat_keys,
-						  state->flat_keynulls, state->flat_outs,
-						  state->flat_outnulls))
+		if (state->topn_k > 0)
+		{
+			if (!state->topn_filled)
+			{
+				dbe_agg_topn_fill(state);
+				state->topn_filled = true;
+			}
+			if (dbe_agg_topn_next(state))
+				break;
+		}
+		else if (dbe_flat_next(state->flatdist != NULL ? state->flatdist
+							   : state->flatagg, state->flat_keys,
+							   state->flat_keynulls, state->flat_outs,
+							   state->flat_outnulls))
 			break;
 		if (state->shared == NULL)
 		{
@@ -4629,6 +5025,7 @@ dbe_agg_exec_flat(CustomScanState *node)
 			return NULL;
 		}
 		state->flat_filled = false;
+		state->topn_filled = false;
 	}
 
 	ExecClearTuple(slot);
@@ -5139,6 +5536,7 @@ dbe_agg_rescan(CustomScanState *node)
 	{
 		dbe_agg_flat_reset(state);
 		state->flat_filled = false;
+		state->topn_filled = false;
 	}
 
 	/* El recorrido por grupos arranca de cero. */
@@ -5297,7 +5695,12 @@ dbe_agg_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 						   state->naggs, es);
 	if (state->flat)
 	{
+		List	   *cp = ((CustomScan *) node->ss.ps.plan)->custom_private;
+		List	   *topn = list_length(cp) > 8 ? (List *) list_nth(cp, 8) : NIL;
+
 		ExplainPropertyText("Agrupación", "tabla de hash propia", es);
+		if (topn != NIL)
+			ExplainPropertyInteger("Top-N", NULL, intVal(linitial(topn)), es);
 		if (node->ss.ps.plan->parallel_aware)
 			ExplainPropertyText("Reparto", "grupos por hash entre participantes",
 								es);

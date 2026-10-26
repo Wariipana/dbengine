@@ -928,6 +928,29 @@ FROM generate_series(0, 4) k ORDER BY k;
  4 |     3
 (5 rows)
 
+-- Y con top-N: el heap también se vacía en cada rescan.
+SELECT k, (SELECT b FROM fx WHERE a = k GROUP BY b ORDER BY count(*) DESC, b LIMIT 1)
+FROM generate_series(0, 4) k ORDER BY k;
+ k | b 
+---+---
+ 0 | 1
+ 1 | 1
+ 2 | 1
+ 3 | 1
+ 4 | 1
+(5 rows)
+
+SELECT k, (SELECT b FROM fxh WHERE a = k GROUP BY b ORDER BY count(*) DESC, b LIMIT 1)
+FROM generate_series(0, 4) k ORDER BY k;
+ k | b 
+---+---
+ 0 | 1
+ 1 | 1
+ 2 | 1
+ 3 | 1
+ 4 | 1
+(5 rows)
+
 RESET enable_hashjoin;
 RESET enable_mergejoin;
 RESET enable_material;
@@ -1114,6 +1137,76 @@ SELECT fx_check('SELECT v, count(*), sum(n) FROM ft WHERE n > 500 AND n <= 900 G
  t
 (1 row)
 
+-- Top-N: con ORDER BY y LIMIT constantes la tabla emite solo sus k
+-- mejores grupos, y el Sort de arriba hace el resto.  El último criterio es
+-- la clave, para que el orden sea total y el resultado comparable.
+EXPLAIN (COSTS OFF) SELECT u, count(*) c FROM ft GROUP BY u ORDER BY c DESC, u LIMIT 5;
+                    QUERY PLAN                     
+---------------------------------------------------
+ Limit
+   ->  Sort
+         Sort Key: (count(*)) DESC, u
+         ->  Custom Scan (DbengineVectorAgg) on ft
+               Agregados empujados al scan: 2
+               Agrupación: tabla de hash propia
+               Top-N: 5
+(7 rows)
+
+SELECT fx_check('SELECT u, count(*) c FROM ft GROUP BY u ORDER BY c DESC, u LIMIT 5', 'ft') AS topn_volcado;
+ topn_volcado 
+--------------
+ t
+(1 row)
+
+SELECT fx_check('SELECT u, n, count(*) c, avg(n) a FROM ft GROUP BY u, n ORDER BY a DESC NULLS LAST, u, n LIMIT 7 OFFSET 3', 'ft') AS topn_avg_offset;
+ topn_avg_offset 
+-----------------
+ t
+(1 row)
+
+SELECT fx_check('SELECT u, max(n) m FROM ft GROUP BY u ORDER BY u DESC NULLS FIRST LIMIT 4', 'ft') AS topn_texto_nulos;
+ topn_texto_nulos 
+------------------
+ t
+(1 row)
+
+SELECT fx_check('SELECT v, count(DISTINCT u) d FROM ft GROUP BY v ORDER BY d, v LIMIT 3', 'ft') AS topn_distinct;
+ topn_distinct 
+---------------
+ t
+(1 row)
+
+SELECT u, count(*) c FROM ft GROUP BY u ORDER BY c DESC, u LIMIT 3;
+ u  |  c   
+----+------
+    | 1546
+ u0 |   40
+ u1 |   40
+(3 rows)
+
+-- Sin LIMIT constante, con WITH TIES o con un LIMIT grande, no.
+EXPLAIN (COSTS OFF) SELECT u, count(*) c FROM ft GROUP BY u ORDER BY c DESC FETCH FIRST 5 ROWS WITH TIES;
+                    QUERY PLAN                     
+---------------------------------------------------
+ Limit
+   ->  Sort
+         Sort Key: (count(*)) DESC
+         ->  Custom Scan (DbengineVectorAgg) on ft
+               Agregados empujados al scan: 2
+               Agrupación: tabla de hash propia
+(6 rows)
+
+EXPLAIN (COSTS OFF) SELECT u, count(*) c FROM ft GROUP BY u ORDER BY c DESC LIMIT 20000;
+                    QUERY PLAN                     
+---------------------------------------------------
+ Limit
+   ->  Sort
+         Sort Key: (count(*)) DESC
+         ->  Custom Scan (DbengineVectorAgg) on ft
+               Agregados empujados al scan: 2
+               Agrupación: tabla de hash propia
+(6 rows)
+
 SELECT fx_check('SELECT v, count(*) FROM ft WHERE 10::int8 < n AND n <> 700::int2 AND u <> ''u3'' GROUP BY v', 'ft') AS prefiltro_enteros_texto;
  prefiltro_enteros_texto 
 -------------------------
@@ -1216,6 +1309,34 @@ SELECT fx_check('SELECT k, v, count(*) FROM fpt GROUP BY k, v', 'fpt') AS parale
 SELECT fx_check('SELECT upper(k), v % 7, count(*) FROM fpt GROUP BY 1, 2', 'fpt') AS paralelo_expresiones;
  paralelo_expresiones 
 ----------------------
+ t
+(1 row)
+
+-- Top-N en paralelo: cada participante emite sus k mejores.
+EXPLAIN (COSTS OFF) SELECT k, sum(v) s FROM fpt GROUP BY k ORDER BY s DESC, k LIMIT 10;
+                            QUERY PLAN                             
+-------------------------------------------------------------------
+ Limit
+   ->  Sort
+         Sort Key: (sum(v)) DESC, k
+         ->  Gather
+               Workers Planned: 2
+               ->  Parallel Custom Scan (DbengineVectorAgg) on fpt
+                     Agregados empujados al scan: 2
+                     Agrupación: tabla de hash propia
+                     Top-N: 10
+                     Reparto: grupos por hash entre participantes
+(10 rows)
+
+SELECT fx_check('SELECT k, sum(v) s FROM fpt GROUP BY k ORDER BY s DESC, k LIMIT 10', 'fpt') AS paralelo_topn;
+ paralelo_topn 
+---------------
+ t
+(1 row)
+
+SELECT fx_check('SELECT v, count(DISTINCT k) d FROM fpt GROUP BY v ORDER BY d DESC, v LIMIT 5', 'fpt') AS paralelo_topn_distinct;
+ paralelo_topn_distinct 
+------------------------
  t
 (1 row)
 

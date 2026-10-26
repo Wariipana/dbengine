@@ -422,3 +422,24 @@ era el WHERE de cinco cláusulas enteras, no la expresión.
 **q19 7,02 → 4,28 s, q36 2,68 → 1,47 s, q2 122 → 29 ms, q8 128 → 35 ms,
 q42 42 → 25 ms, q41 58 → 40 ms, q39 44 → 30 ms, q37 364 → 311 ms.** Las 43
 contra la línea base: media geométrica 0,364, suma 109,9 → 43,7 s.
+
+## Resultado: top-N adentro de la tabla propia
+
+En q33 los participantes terminaban de agrupar a los 1,7 s, y el resto
+hasta 4,8 s era emitir 10M grupos por el Gather y ordenarlos para quedarse
+con 10. Con `ORDER BY ... LIMIT k` constantes (sin `WITH TIES`, k hasta
+10.000), cada participante guarda sus k mejores grupos en un heap y emite
+solo esos; el Sort y el Limit de arriba quedan como estaban. Es correcto
+porque en la tabla propia cada participante emite grupos completos: los k
+primeros del total están entre los k primeros de alguno. De cada grupo se
+calculan solo los valores de orden —comparados con el `SortSupport` del
+operador del ORDER BY, así que vale para cualquier tipo y collation—; los
+demás agregados, como el numeric de `avg`, se calculan al emitir. Con
+agregados el planner no calcula el límite (`root->limit_tuples` queda en
+-1): sale de las constantes del LIMIT y el OFFSET.
+
+**q33 3,63 → 1,90 s, q19 4,28 → 3,53 s, q32 0,91 → 0,68 s, q17 2,03 → 1,62
+s, q16 0,71 → 0,58 s, q31 0,64 → 0,52 s, q15 0,75 → 0,61 s, q34/q35 2,6 →
+2,26 s.** Las 43 contra la línea base: media geométrica 0,344, suma 109,9 →
+39,0 s. Con empates en el límite el conjunto puede diferir del de
+Postgres, que tampoco lo fija (q33: todos los grupos tienen `c = 1`).

@@ -140,6 +140,14 @@ extern bool dbe_flat_next(DbeFlatAgg *fa, Datum *keys, bool *keynulls,
 extern bool dbe_flat_next_states(DbeFlatAgg *fa, Datum *keys, bool *keynulls,
 								 const uint64 **states);
 
+/*
+ * El resultado del agregado `i` a partir de los estados de un grupo (los de
+ * dbe_flat_next_states()).  Un valor por referencia (el numeric de avg) se
+ * arma en el contexto de quien llama.
+ */
+extern Datum dbe_flat_final(DbeFlatAgg *fa, int i, const uint64 *states,
+							bool *isnull);
+
 /* Vacía todo para volver a empezar: rescan. */
 extern void dbe_flat_reset(DbeFlatAgg *fa);
 

@@ -518,6 +518,11 @@ SELECT k, (SELECT count(*) FROM (SELECT b, count(*) FROM fx WHERE a = k GROUP BY
 FROM generate_series(0, 4) k ORDER BY k;
 SELECT k, (SELECT count(*) FROM (SELECT b, count(*) FROM fxh WHERE a = k GROUP BY b) s)
 FROM generate_series(0, 4) k ORDER BY k;
+-- Y con top-N: el heap también se vacía en cada rescan.
+SELECT k, (SELECT b FROM fx WHERE a = k GROUP BY b ORDER BY count(*) DESC, b LIMIT 1)
+FROM generate_series(0, 4) k ORDER BY k;
+SELECT k, (SELECT b FROM fxh WHERE a = k GROUP BY b ORDER BY count(*) DESC, b LIMIT 1)
+FROM generate_series(0, 4) k ORDER BY k;
 RESET enable_hashjoin;
 RESET enable_mergejoin;
 RESET enable_material;
@@ -582,6 +587,18 @@ SELECT fx_check('SELECT v, count(*), sum(n) FROM ft WHERE u > ''url/2'' AND v <>
 -- Columna entera contra una constante: sobre el arreglo del stripe, con
 -- int2/int4/int8 cruzados, la constante a la izquierda, <>, y nulos.
 SELECT fx_check('SELECT v, count(*), sum(n) FROM ft WHERE n > 500 AND n <= 900 GROUP BY v', 'ft') AS prefiltro_enteros;
+-- Top-N: con ORDER BY y LIMIT constantes la tabla emite solo sus k
+-- mejores grupos, y el Sort de arriba hace el resto.  El último criterio es
+-- la clave, para que el orden sea total y el resultado comparable.
+EXPLAIN (COSTS OFF) SELECT u, count(*) c FROM ft GROUP BY u ORDER BY c DESC, u LIMIT 5;
+SELECT fx_check('SELECT u, count(*) c FROM ft GROUP BY u ORDER BY c DESC, u LIMIT 5', 'ft') AS topn_volcado;
+SELECT fx_check('SELECT u, n, count(*) c, avg(n) a FROM ft GROUP BY u, n ORDER BY a DESC NULLS LAST, u, n LIMIT 7 OFFSET 3', 'ft') AS topn_avg_offset;
+SELECT fx_check('SELECT u, max(n) m FROM ft GROUP BY u ORDER BY u DESC NULLS FIRST LIMIT 4', 'ft') AS topn_texto_nulos;
+SELECT fx_check('SELECT v, count(DISTINCT u) d FROM ft GROUP BY v ORDER BY d, v LIMIT 3', 'ft') AS topn_distinct;
+SELECT u, count(*) c FROM ft GROUP BY u ORDER BY c DESC, u LIMIT 3;
+-- Sin LIMIT constante, con WITH TIES o con un LIMIT grande, no.
+EXPLAIN (COSTS OFF) SELECT u, count(*) c FROM ft GROUP BY u ORDER BY c DESC FETCH FIRST 5 ROWS WITH TIES;
+EXPLAIN (COSTS OFF) SELECT u, count(*) c FROM ft GROUP BY u ORDER BY c DESC LIMIT 20000;
 SELECT fx_check('SELECT v, count(*) FROM ft WHERE 10::int8 < n AND n <> 700::int2 AND u <> ''u3'' GROUP BY v', 'ft') AS prefiltro_enteros_texto;
 RESET work_mem;
 DROP TABLE ft, fth;
@@ -623,6 +640,10 @@ EXPLAIN (COSTS OFF) SELECT v, count(DISTINCT k), count(*) FROM fpt GROUP BY v;
 SELECT fx_check('SELECT v, count(DISTINCT k), count(*) FROM fpt GROUP BY v', 'fpt') AS paralelo_distinct;
 SELECT fx_check('SELECT k, v, count(*) FROM fpt GROUP BY k, v', 'fpt') AS paralelo_texto_y_entero;
 SELECT fx_check('SELECT upper(k), v % 7, count(*) FROM fpt GROUP BY 1, 2', 'fpt') AS paralelo_expresiones;
+-- Top-N en paralelo: cada participante emite sus k mejores.
+EXPLAIN (COSTS OFF) SELECT k, sum(v) s FROM fpt GROUP BY k ORDER BY s DESC, k LIMIT 10;
+SELECT fx_check('SELECT k, sum(v) s FROM fpt GROUP BY k ORDER BY s DESC, k LIMIT 10', 'fpt') AS paralelo_topn;
+SELECT fx_check('SELECT v, count(DISTINCT k) d FROM fpt GROUP BY v ORDER BY d DESC, v LIMIT 5', 'fpt') AS paralelo_topn_distinct;
 SET max_parallel_workers = 0;
 SELECT count(*) AS grupos, sum(c) AS filas
 FROM (SELECT g, h, count(*) c FROM fxs GROUP BY g, h) x;

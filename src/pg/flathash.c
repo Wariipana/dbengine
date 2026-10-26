@@ -1191,60 +1191,61 @@ dbe_flat_next_states(DbeFlatAgg *fa, Datum *keys, bool *keynulls,
 	return true;
 }
 
+Datum
+dbe_flat_final(DbeFlatAgg *fa, int i, const uint64 *states, bool *isnull)
+{
+	const uint64 *s = states + (fa->stateoff[i] - 1 - fa->nkeys);
+	const DbeFlatAggDef *d = &fa->defs[i];
+
+	*isnull = false;
+	switch (d->kind)
+	{
+		case DBE_FLAT_COUNT_STAR:
+		case DBE_FLAT_COUNT:
+			return Int64GetDatum((int64) s[0]);
+		case DBE_FLAT_SUM:
+			*isnull = (s[1] == 0);
+			return *isnull ? (Datum) 0 : Int64GetDatum((int64) s[0]);
+		case DBE_FLAT_AVG:
+			if (s[1] == 0)
+			{
+				*isnull = true;
+				return (Datum) 0;
+			}
+			else
+			{
+				/* El mismo cálculo que avg(int4): int8_avg sobre {n, suma}. */
+				int64	   *st = (int64 *) ARR_DATA_PTR(fa->avgarr);
+
+				st[0] = (int64) s[1];
+				st[1] = (int64) s[0];
+				return DirectFunctionCall1(int8_avg, PointerGetDatum(fa->avgarr));
+			}
+		case DBE_FLAT_MIN:
+		case DBE_FLAT_MAX:
+			*isnull = (s[1] == 0);
+			return *isnull ? (Datum) 0 : dbe_flat_datum((int64) s[0], d->vallen);
+	}
+	*isnull = true;
+	return (Datum) 0;
+}
+
 bool
 dbe_flat_next(DbeFlatAgg *fa, Datum *keys, bool *keynulls, Datum *outs,
 			  bool *outnulls)
 {
 	const uint64 *e;
+	MemoryContext old;
 
 	MemoryContextReset(fa->outcxt);
 	e = dbe_flat_next_entry(fa, keys, keynulls);
 	if (e == NULL)
 		return false;
 
+	old = MemoryContextSwitchTo(fa->outcxt);
 	for (int i = 0; i < fa->naggs; i++)
-	{
-		const uint64 *s = e + fa->stateoff[i];
-		const DbeFlatAggDef *d = &fa->defs[i];
-
-		outnulls[i] = false;
-		switch (d->kind)
-		{
-			case DBE_FLAT_COUNT_STAR:
-			case DBE_FLAT_COUNT:
-				outs[i] = Int64GetDatum((int64) s[0]);
-				break;
-			case DBE_FLAT_SUM:
-				outnulls[i] = (s[1] == 0);
-				outs[i] = outnulls[i] ? (Datum) 0 : Int64GetDatum((int64) s[0]);
-				break;
-			case DBE_FLAT_AVG:
-				if (s[1] == 0)
-				{
-					outnulls[i] = true;
-					outs[i] = (Datum) 0;
-				}
-				else
-				{
-					/* El mismo cálculo que avg(int4): int8_avg sobre {n, suma}. */
-					int64	   *st = (int64 *) ARR_DATA_PTR(fa->avgarr);
-					MemoryContext old = MemoryContextSwitchTo(fa->outcxt);
-
-					st[0] = (int64) s[1];
-					st[1] = (int64) s[0];
-					outs[i] = DirectFunctionCall1(int8_avg,
-												  PointerGetDatum(fa->avgarr));
-					MemoryContextSwitchTo(old);
-				}
-				break;
-			case DBE_FLAT_MIN:
-			case DBE_FLAT_MAX:
-				outnulls[i] = (s[1] == 0);
-				outs[i] = outnulls[i] ? (Datum) 0
-					: dbe_flat_datum((int64) s[0], d->vallen);
-				break;
-		}
-	}
+		outs[i] = dbe_flat_final(fa, i, e + 1 + fa->nkeys, &outnulls[i]);
+	MemoryContextSwitchTo(old);
 	return true;
 }
 

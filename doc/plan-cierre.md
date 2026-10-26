@@ -255,13 +255,16 @@ Tres hechos del código que ordenan la lista:
 
 ### C2.3 — Lo grueso
 
-8. [ ] **Top-N con materialización tardía y umbral dinámico** para
+8. [~] **Top-N con materialización tardía y umbral dinámico** para
        `ORDER BY ... LIMIT k`: calcular solo la clave de orden y el filtro,
        mantener los k mejores, descartar gránulos cuyo min/max no puede
        entrar y leer las demás columnas **solo de las k filas** por TID.
        Ataca q24 (3,3 s, pierde 0,64×), q25–q27 y `SELECT * LIMIT`. Revisa
        el veredicto "estructural" sobre q24. Ref.: DuckDB 1.3 (3–10× con
        LIMIT), Doris y DataFusion (filtros dinámicos al scan).
+       Hecho el top-N sobre los grupos de la tabla propia: cada
+       participante emite sus k mejores (q33 1,9×, q19 1,2×); las 43:
+       media geométrica 0,344, suma 39,0 s. Falta el del scan (q24–q27).
 9. [~] **Tabla de hash propia** para claves `int2/4/8` y códigos de
        diccionario: direccionamiento abierto, estados de agregado en un
        arreglo plano, sin `TupleHashTable` ni `MinimalTuple`; agregación
