@@ -206,6 +206,20 @@ typedef struct DbeAggState
 	MemoryContext dist_cxt;
 	MemoryContext dist_tempcxt;
 	uint64		dist_since_reset;
+
+	/*
+	 * Para no buscar lo que ya se buscó, dentro de un stripe: con
+	 * diccionario, cada código una vez (dist_codes son los de todas las
+	 * filas, dist_seen un byte por código); sin diccionario, la fila que
+	 * repite el valor de la anterior se saltea.
+	 */
+	bool		dist_dict;
+	uint32	   *dist_codes;
+	uint8	   *dist_seen;
+	uint32		dist_cap;
+	uint32		dist_seen_cap;
+	Datum		dist_prev;
+	bool		dist_has_prev;
 } DbeAggState;
 
 typedef struct DbeAggParallelShared
@@ -4546,6 +4560,76 @@ dbe_agg_exec_grouped(CustomScanState *node)
 	}
 }
 
+/* Prepara los atajos de count(DISTINCT) para el stripe cargado. */
+static void
+dbe_agg_distinct_stripe(DbeAggState *agg, uint64 nrows)
+{
+	int32_t		is_dict = 0;
+	uint32_t	n = 0;
+
+	agg->dist_has_prev = false;
+	agg->dist_dict = false;
+	if (!agg->has_vector || agg->vec.reader == NULL || agg->inputtyplen != -1)
+		return;
+	{
+		DbeStatus	st = dbe_segreader_dict(agg->vec.reader, &is_dict, &n);
+
+		dbe_error_if_not_ok(&st, "consultando el diccionario del segmento");
+	}
+	if (!is_dict || n == 0)
+		return;
+
+	if (agg->dist_cap < nrows)
+	{
+		if (agg->dist_codes != NULL)
+			pfree(agg->dist_codes);
+		agg->dist_codes = (uint32 *) MemoryContextAlloc(agg->dist_cxt->parent,
+														sizeof(uint32) * nrows);
+		agg->dist_cap = (uint32) nrows;
+	}
+	if (agg->dist_seen_cap < n)
+	{
+		if (agg->dist_seen != NULL)
+			pfree(agg->dist_seen);
+		agg->dist_seen = (uint8 *) MemoryContextAlloc(agg->dist_cxt->parent, n);
+		agg->dist_seen_cap = n;
+	}
+	{
+		DbeStatus	st = dbe_segreader_codes(agg->vec.reader, 0, (uint32) nrows,
+											 agg->dist_codes);
+
+		dbe_error_if_not_ok(&st, "leyendo los códigos de diccionario");
+	}
+	memset(agg->dist_seen, 0, n);
+	agg->dist_dict = true;
+}
+
+/*
+ * ¿Ya se buscó este valor en el stripe?  Si no, lo marca.  Con diccionario
+ * no hace falta ni leer el valor para saberlo.
+ */
+static pg_attribute_always_inline bool
+dbe_agg_distinct_seen(DbeAggState *agg, uint64 row, Datum value, bool isnull)
+{
+	if (agg->dist_dict)
+	{
+		uint32		c = agg->dist_codes[row];
+
+		if (c == DBE_NULL_CODE || agg->dist_seen[c])
+			return true;
+		agg->dist_seen[c] = 1;
+		return false;
+	}
+	if (isnull)
+		return true;
+	if (agg->dist_has_prev &&
+		datumIsEqual(value, agg->dist_prev, agg->inputtypbyval, agg->inputtyplen))
+		return true;
+	agg->dist_prev = value;
+	agg->dist_has_prev = true;
+	return false;
+}
+
 static TupleTableSlot *
 dbe_agg_exec(CustomScanState *node)
 {
@@ -4654,6 +4738,8 @@ dbe_agg_exec(CustomScanState *node)
 			/* Los que ya avanzó el SMA no necesitan la columna. */
 			agg->has_vector = !agg->is_count_star && !agg->sma_now &&
 				dbe_cursor_column(state->cursor, agg->attnum, &agg->vec);
+			if (agg->is_distinct)
+				dbe_agg_distinct_stripe(agg, nrows);
 		}
 
 		for (i = 0; i < state->nqualcols; i++)
@@ -4725,23 +4811,37 @@ dbe_agg_exec(CustomScanState *node)
 					continue;
 				}
 
-				dbe_vec_value(&agg->vec, row, agg->inputtypbyval,
-							  agg->inputtyplen, &value, &isnull);
-
 				if (agg->is_distinct)
 				{
 					bool		isnew;
 
 					/*
+					 * count() no cuenta nulos, con DISTINCT tampoco.  Con
+					 * diccionario el código dice si es nulo o si ya se vio
+					 * sin leer el valor.
+					 */
+					if (agg->dist_dict)
+					{
+						if (dbe_agg_distinct_seen(agg, row, (Datum) 0, false))
+							continue;
+						dbe_vec_value(&agg->vec, row, agg->inputtypbyval,
+									  agg->inputtyplen, &value, &isnull);
+					}
+					else
+					{
+						dbe_vec_value(&agg->vec, row, agg->inputtypbyval,
+									  agg->inputtyplen, &value, &isnull);
+						if (dbe_agg_distinct_seen(agg, row, value, isnull))
+							continue;
+					}
+
+					/*
 					 * LookupTupleHashEntry() arma el hash en el tempcxt y no
-					 * lo resetea; es del que llama.  Cada 1024 filas alcanza.
+					 * lo resetea; es del que llama.  Cada 1024 búsquedas
+					 * alcanza.
 					 */
 					if ((++agg->dist_since_reset & 1023) == 0)
 						MemoryContextReset(agg->dist_tempcxt);
-
-					/* count() no cuenta nulos, con DISTINCT tampoco. */
-					if (isnull)
-						continue;
 
 					ExecClearTuple(agg->dist_slot);
 					agg->dist_slot->tts_values[0] = value;
@@ -4755,6 +4855,8 @@ dbe_agg_exec(CustomScanState *node)
 					continue;
 				}
 
+				dbe_vec_value(&agg->vec, row, agg->inputtypbyval,
+							  agg->inputtyplen, &value, &isnull);
 				dbe_agg_advance(agg, value, isnull, aggcxt, state->agg_context);
 			}
 		}

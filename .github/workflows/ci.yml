@@ -21,7 +21,7 @@ jobs:
       PGHOST: /home/runner/.dbengine/pg${{ matrix.pg }}/run
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Instalar PostgreSQL ${{ matrix.pg }} desde PGDG
         run: |
@@ -84,7 +84,7 @@ jobs:
 
       - name: Artefactos del fallo
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: regress-pg${{ matrix.pg }}
           path: |
@@ -126,11 +126,11 @@ jobs:
       PGHOST: /home/runner/.dbengine/pg${{ matrix.pg_major }}/run
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Cache de PostgreSQL ${{ matrix.pg_version }}
         id: pgcache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             /home/runner/.dbengine/pg${{ matrix.pg_major }}-install

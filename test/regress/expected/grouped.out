@@ -593,8 +593,29 @@ SELECT (SELECT count(DISTINCT x) FROM nulos) = (SELECT count(DISTINCT x) FROM nu
  t
 (1 row)
 
--- Con GROUP BY no se empuja: haría falta un conjunto por grupo.  Queda el
--- plan normal, con el scan descartando las filas repetidas por stripe.
+-- Dentro de un stripe cada código del diccionario se busca una vez, y sin
+-- diccionario se saltea la fila que repite el valor de la anterior.  Texto
+-- con y sin diccionario, corridas, nulos en el medio, y WHERE.
+CREATE TABLE dr (t text, n int8) USING dbengine_columnar;
+INSERT INTO dr SELECT CASE WHEN i % 13 = 0 THEN NULL ELSE 'v' || (i / 5) % 300 END,
+	i / 4 FROM generate_series(1, 100000) i;
+INSERT INTO dr SELECT md5((i / 2)::text), NULL FROM generate_series(1, 30000) i;
+CREATE TABLE drh AS SELECT * FROM dr;
+SELECT (SELECT count(DISTINCT t) FROM dr) = (SELECT count(DISTINCT t) FROM drh)
+	AS distinct_codigos_y_corridas,
+	(SELECT count(DISTINCT n) FROM dr) = (SELECT count(DISTINCT n) FROM drh)
+	AS distinct_corridas_enteras,
+	(SELECT count(DISTINCT t) FROM dr WHERE n % 3 = 0)
+	= (SELECT count(DISTINCT t) FROM drh WHERE n % 3 = 0) AS distinct_codigos_where;
+ distinct_codigos_y_corridas | distinct_corridas_enteras | distinct_codigos_where 
+-----------------------------+---------------------------+------------------------
+ t                           | t                         | t
+(1 row)
+
+DROP TABLE dr, drh;
+-- Con GROUP BY y sin la tabla propia no se empuja: haría falta un conjunto
+-- por grupo.  Queda el plan normal, con el scan descartando las filas
+-- repetidas por stripe.
 RESET enable_hashagg;
 RESET enable_sort;
 RESET parallel_setup_cost;

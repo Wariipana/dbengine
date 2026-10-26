@@ -381,6 +381,13 @@ base: media geométrica 0,432, suma 109,9 → 49,1 s. q2 y q8 (WHERE sobre un
 entero) quedaron 1–2% arriba en la comparación alternando los dos `.so`,
 dentro del ruido.
 
+**`count(DISTINCT)` sin GROUP BY** sigue con el conjunto de hash de
+Postgres, pero dentro de un stripe no busca lo que ya buscó: con
+diccionario, cada código una vez (los códigos se leen de una vez y ni
+siquiera hace falta leer el valor de las filas repetidas); sin
+diccionario, la fila que repite el valor de la anterior se saltea.
+**q5 1,16 → 0,62 s, q6 1,62 → 0,54 s.**
+
 q29 (11,9 s) no cambia: la regex ya se calcula una vez por código (52 s
 sin eso, 25 s con eso, en serie), pero son 3,4M valores distintos por
 stripe a unos 6,5 µs cada uno en el motor de regex de Postgres. q19
