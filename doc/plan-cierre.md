@@ -266,8 +266,12 @@ Tres hechos del código que ordenan la lista:
        Primera parte hecha (`src/pg/flathash.c`): claves de ancho fijo,
        count/sum/avg/min/max de enteros, serial y con volcado propio. q33
        1,83×, q31 1,20×, q32 1,14×; las 43: media geométrica 0,529, suma
-       69,6 s. Falta: claves de texto, `count(DISTINCT)`, claves que son
-       expresiones y el camino paralelo.
+       69,6 s. Después, claves de texto con estado parcial por código al
+       volcar, y ANALYZE con la muestra repartida por toda la tabla: q35
+       1,89×; las 43: media geométrica 0,511, suma 66,6 s. Falta:
+       `count(DISTINCT)`, claves que son expresiones, y un camino paralelo
+       que reparta los grupos por hash entre los workers (cada uno agrega
+       grupos completos y el Gather solo concatena, sin Finalize).
 10. [ ] **Decodificación por lotes** (`decode_range` de 1024 filas a través
        del airlock) con desempaquetado de bits por ancho estilo FastLanes,
        escrito para que el compilador lo vectorice en NEON.

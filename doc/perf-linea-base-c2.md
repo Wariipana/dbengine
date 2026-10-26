@@ -271,3 +271,35 @@ cambios. Las 43 contra la línea base: media geométrica 0,529, suma 109,9 →
 Lo que no cubre todavía: claves de texto (q34, q35), `count(DISTINCT)` (q10),
 claves que son expresiones (q19, q36) y el camino paralelo. En q33 queda
 además 1,5 s del Sort top-N de Postgres sobre los 10M grupos.
+
+## Resultado: texto en la tabla propia y ANALYZE repartido
+
+**Claves de texto.** La tabla propia acepta texto con collation
+determinista, donde `texteq` compara bytes: la entrada guarda un puntero a
+una copia en un arena que comparte el presupuesto. Con una sola clave de
+texto y diccionario, el grupo se busca una vez por código y stripe. Cuando
+el grupo no entra, sus filas del stripe se suman a un estado parcial propio
+y se vuelca un registro por código al terminar el stripe, no uno por fila:
+en q34 las filas volcadas bajan de 9,5M a 3,8M. Los registros de una
+partición pueden traer filas o estados, y al leerlos se combinan como en un
+Finalize. Con texto el registro lleva también el hash, que recalcular es la
+mitad de la búsqueda; con claves enteras no, porque 8 bytes más por fila
+costaban más que recalcularlo. Con más de una clave, si alguna es texto,
+no se ofrece: sin caché por código se hashea el texto en cada fila y el
+camino paralelo gana (q17 y q18).
+
+**ANALYZE.** La muestra salía recorriendo el cursor desde el principio, y
+como analyze.c muestrea el 13% de los bloques, era el primer 13% de la
+tabla. n_distinct daba la mitad que heap con las mismas columnas (39.249
+UserID contra 78.851; hay 1,53M). Ahora cada bloque muestreado se lleva a
+la misma posición proporcional en el orden de las filas: n_distinct queda
+como en heap y el ANALYZE de hits pasa de 5,4 a 6,5 s. Con eso el planner
+elige la tabla propia en q35.
+
+**q35 7,24 → 3,84 s, q40 1,23 → 0,94 s, q42 124 → 43 ms**; q43 90 → 105 ms
+por un plan distinto con las estadísticas nuevas. Las 43 contra la línea
+base: media geométrica 0,511, suma 109,9 → 66,6 s.
+
+q34 sigue eligiendo el camino paralelo con Finalize (5,5 s; la tabla propia
+tarda 3,7 s): el estimador de Postgres con 30.000 filas de muestra cree que
+hay 96K URLs y hay 2,6M, y con esa cuenta el Finalize parece barato.

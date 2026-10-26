@@ -97,6 +97,10 @@ typedef struct DbeScanDescData
 	BlockNumber analyze_total_blocks;
 	BlockNumber analyze_blocks_done;
 	uint64		analyze_rows_done;
+	uint64	   *analyze_cum;	/* filas antes de cada stripe; nstripes + 1 */
+	int			analyze_nstripes;
+	uint64		analyze_pos;	/* próxima posición a leer, en orden de filas */
+	bool		analyze_wrapped;
 
 	/*
 	 * Bitmap scan: offsets del bloque de TID que se está recorriendo.  Un
@@ -236,6 +240,16 @@ dbe_scan_begin(Relation relation, Snapshot snapshot, int nkeys, ScanKey key,
 		scan->analyze_total_rows = dbe_cursor_total_rows(scan->cursor);
 		scan->analyze_blocks_done = 0;
 		scan->analyze_rows_done = 0;
+
+		scan->analyze_nstripes = dbe_cursor_nstripes(scan->cursor);
+		scan->analyze_cum = (uint64 *)
+			palloc(sizeof(uint64) * (scan->analyze_nstripes + 1));
+		scan->analyze_cum[0] = 0;
+		for (int i = 0; i < scan->analyze_nstripes; i++)
+			scan->analyze_cum[i + 1] = scan->analyze_cum[i] +
+				dbe_cursor_stripe_at(scan->cursor, i)->row_count;
+		scan->analyze_pos = 0;
+		scan->analyze_wrapped = false;
 	}
 
 	return (TableScanDesc) scan;
@@ -970,8 +984,18 @@ dbe_relation_vacuum(Relation rel, DBE_VACUUM_PARAMS params,
  *     totalrows = (liverows / bs.m) * totalblocks
  * donde bs.m es la cantidad de bloques que muestreó.  Si por cada bloque
  * muestreado devolvemos (filas_totales / totalblocks) filas, la cuenta da
- * exactamente filas_totales.  Las filas salen recorriendo el cursor, así
- * que la muestra cubre toda la tabla.
+ * exactamente filas_totales.
+ *
+ * De dónde salen esas filas importa tanto como cuántas son.  Antes salían
+ * recorriendo el cursor desde el principio, y como analyze.c muestrea un
+ * 13% de los bloques de hits, la muestra era el primer 13% de la tabla: un
+ * pedazo de la historia, con los mismos usuarios repitiéndose.  n_distinct
+ * daba la mitad que en heap con las mismas columnas (39.249 UserID contra
+ * 78.851; hay 1,53M), y con eso el planner elegía agregaciones pensadas
+ * para pocos grupos.  Ahora cada bloque muestreado se lleva a la misma
+ * posición proporcional en el orden de las filas (bloque / bloques ×
+ * filas), y su cuota se lee desde ahí: la muestra queda repartida por toda
+ * la tabla, como en heap.
  *
  * La cuota se calcula como un ACUMULADO, no sumando una fracción por
  * bloque: sumar 240,9759... ochenta y tres veces no da 20001 sino
@@ -1002,7 +1026,11 @@ dbe_scan_analyze_next_block(TableScanDesc sscan, ReadStream *stream)
 	if (!BufferIsValid(buf))
 		return false;
 
-	/* No nos interesa el contenido del bloque, solo llevar la cuenta. */
+	/* El contenido no interesa: el número de bloque dice desde dónde leer. */
+	if (scan->analyze_total_blocks > 0)
+		scan->analyze_pos = (uint64)
+			((double) BufferGetBlockNumber(buf) * scan->analyze_total_rows /
+			 scan->analyze_total_blocks);
 	ReleaseBuffer(buf);
 
 	scan->analyze_blocks_done++;
@@ -1017,11 +1045,42 @@ dbe_scan_analyze_next_tuple(DBE_ANALYZE_TUPLE_ARGS)
 	if (scan->analyze_rows_done >= dbe_analyze_quota(scan, scan->analyze_blocks_done))
 		return false;
 
-	if (!dbe_cursor_next(scan->cursor, slot))
+	/*
+	 * La fila en la posición siguiente.  Las invisibles se saltean; si se
+	 * llega al final se sigue desde el principio una vez, para que los
+	 * últimos bloques también completen su cuota.
+	 */
+	for (;;)
 	{
-		/* Se acabaron las filas antes que los bloques. */
-		scan->analyze_total_rows = scan->analyze_rows_done;
-		return false;
+		int			lo = 0;
+		int			hi = scan->analyze_nstripes;
+		uint64		pos;
+		const DbeStripeDesc *st;
+
+		if (scan->analyze_pos >= scan->analyze_total_rows)
+		{
+			if (scan->analyze_wrapped || scan->analyze_total_rows == 0)
+				return false;
+			scan->analyze_wrapped = true;
+			scan->analyze_pos = 0;
+		}
+		pos = scan->analyze_pos++;
+
+		/* El stripe con analyze_cum[i] <= pos < analyze_cum[i + 1]. */
+		while (hi - lo > 1)
+		{
+			int			mid = (lo + hi) / 2;
+
+			if (scan->analyze_cum[mid] <= pos)
+				lo = mid;
+			else
+				hi = mid;
+		}
+		st = dbe_cursor_stripe_at(scan->cursor, lo);
+		if (dbe_cursor_fetch_rownum(scan->cursor,
+									st->first_row_number +
+									(pos - scan->analyze_cum[lo]), slot))
+			break;
 	}
 
 	scan->analyze_rows_done++;

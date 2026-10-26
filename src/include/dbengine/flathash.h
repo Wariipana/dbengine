@@ -10,12 +10,13 @@
  * lo mismo con work_mem de 4 MB que con 2 GB, unos 175 bytes y más de un
  * microsegundo por grupo.
  *
- * Esta tabla sirve para claves de ancho fijo cuya igualdad es la binaria
- * (enteros, fechas, timestamps) y para los agregados cuyo estado es un par
- * de enteros: count, sum y avg de smallint/integer, min y max de enteros.
- * Una entrada es un arreglo de uint64 —hash, máscara de nulos, claves,
- * estados— en un arreglo denso, con un directorio de direccionamiento
- * abierto encima.
+ * Esta tabla sirve para claves cuya igualdad es la binaria —enteros,
+ * fechas, timestamps, y texto con collation determinista— y para los
+ * agregados cuyo estado es un par de enteros: count, sum y avg de
+ * smallint/integer, min y max de enteros.  Una entrada es un arreglo de
+ * uint64 —hash, máscara de nulos, claves, estados— en un arreglo denso, con
+ * un directorio de direccionamiento abierto encima; un texto es un puntero a
+ * una copia en un arena de la tabla.
  *
  * La memoria la acota hash_mem.  Cuando la tabla se llena, los grupos que
  * ya están se siguen agregando en memoria y las filas de grupos nuevos se
@@ -52,7 +53,8 @@ typedef struct DbeFlatAggDef
 typedef struct DbeFlatAgg DbeFlatAgg;
 
 /*
- * `keylen`: ancho de cada clave (por valor: 1, 2, 4 u 8).  `budget`: bytes
+ * `keylen`: ancho de cada clave (por valor: 1, 2, 4 u 8), o -1 si es texto
+ * (varlena comparado por bytes).  `budget`: bytes
  * de memoria para la tabla y los buffers de las particiones.
  * `est_groups`: la estimación del planner, solo para el tamaño inicial de la
  * tabla; si es mala, la tabla crece hasta el presupuesto.
@@ -65,6 +67,30 @@ extern DbeFlatAgg *dbe_flat_create(int nkeys, const int16 *keylen,
 extern void dbe_flat_add(DbeFlatAgg *fa, const Datum *keys,
 						 const bool *keynulls, const Datum *vals,
 						 const bool *valnulls);
+
+/*
+ * Para quien agrupa por un código de diccionario y busca el grupo una vez
+ * por código:
+ *
+ * dbe_flat_find() devuelve el índice del grupo, creándolo si no está, o -1
+ * si no está y no hay lugar.  No agrega nada.  El índice vale mientras dure
+ * la entrada (hasta dbe_flat_input_done()), y las filas del grupo se suman
+ * con dbe_flat_add_to().
+ *
+ * Con -1, en vez de volcar fila por fila, quien llama puede llevar un
+ * estado parcial propio de dbe_flat_nstates() palabras, en cero, sumarle
+ * las filas con dbe_flat_accum() y entregarlo una vez con
+ * dbe_flat_spill_states(): un registro por código y no uno por fila.
+ */
+extern int64 dbe_flat_find(DbeFlatAgg *fa, const Datum *keys,
+						   const bool *keynulls);
+extern void dbe_flat_add_to(DbeFlatAgg *fa, int64 idx, const Datum *vals,
+							const bool *valnulls);
+extern int	dbe_flat_nstates(DbeFlatAgg *fa);
+extern void dbe_flat_accum(DbeFlatAgg *fa, uint64 *states, const Datum *vals,
+						   const bool *valnulls);
+extern void dbe_flat_spill_states(DbeFlatAgg *fa, const Datum *keys,
+								  const bool *keynulls, const uint64 *states);
 
 /* No hay más filas de entrada: lo que sigue es emitir. */
 extern void dbe_flat_input_done(DbeFlatAgg *fa);

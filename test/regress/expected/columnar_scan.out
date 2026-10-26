@@ -45,6 +45,9 @@ EXPLAIN (COSTS OFF) SELECT sum(monto) FROM s;
    Agregados empujados al scan: 1
 (2 rows)
 
+-- La tabla de hash propia agregaría adentro del scan y no se verían las
+-- columnas; acá lo que se prueba es la poda.
+SET dbengine.enable_flat_hash = off;
 EXPLAIN (COSTS OFF) SELECT region, count(*) FROM s GROUP BY region;
                   QUERY PLAN                   
 -----------------------------------------------
@@ -54,6 +57,7 @@ EXPLAIN (COSTS OFF) SELECT region, count(*) FROM s GROUP BY region;
          Columnas leídas: region
 (4 rows)
 
+RESET dbengine.enable_flat_hash;
 -- ===========================================================================
 -- Descarte de stripes por zone maps
 -- ===========================================================================
@@ -598,16 +602,15 @@ SELECT igual('SELECT avg(b) FROM snulos');
  igual: NULL
 (1 row)
 
--- GROUP BY sí se empuja, pero a esta escala el plan normal cuesta menos y
--- gana; lo que se prueba en test/regress/sql/grouped.sql.
+-- GROUP BY por una columna de texto se empuja con la tabla de hash propia
+-- (grouped.sql prueba los resultados).
 EXPLAIN (COSTS OFF) SELECT region, count(*) FROM s GROUP BY region;
-                  QUERY PLAN                   
------------------------------------------------
- HashAggregate
-   Group Key: region
-   ->  Custom Scan (DbengineColumnarScan) on s
-         Columnas leídas: region
-(4 rows)
+              QUERY PLAN              
+--------------------------------------
+ Custom Scan (DbengineVectorAgg) on s
+   Agregados empujados al scan: 2
+   Agrupación: tabla de hash propia
+(3 rows)
 
 -- count(DISTINCT) sin GROUP BY sí: un conjunto de hash sobre la columna.
 EXPLAIN (COSTS OFF) SELECT count(DISTINCT region) FROM s;

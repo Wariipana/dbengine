@@ -36,7 +36,11 @@ WHERE relfilenode = pg_relation_filenode('s');
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM s;
 EXPLAIN (COSTS OFF) SELECT sum(monto) FROM s;
+-- La tabla de hash propia agregaría adentro del scan y no se verían las
+-- columnas; acá lo que se prueba es la poda.
+SET dbengine.enable_flat_hash = off;
 EXPLAIN (COSTS OFF) SELECT region, count(*) FROM s GROUP BY region;
+RESET dbengine.enable_flat_hash;
 
 -- ===========================================================================
 -- Descarte de stripes por zone maps
@@ -250,8 +254,8 @@ SELECT igual('SELECT count(a) FROM snulos');
 SELECT igual('SELECT sum(a) FROM snulos');
 SELECT igual('SELECT avg(b) FROM snulos');
 
--- GROUP BY sí se empuja, pero a esta escala el plan normal cuesta menos y
--- gana; lo que se prueba en test/regress/sql/grouped.sql.
+-- GROUP BY por una columna de texto se empuja con la tabla de hash propia
+-- (grouped.sql prueba los resultados).
 EXPLAIN (COSTS OFF) SELECT region, count(*) FROM s GROUP BY region;
 -- count(DISTINCT) sin GROUP BY sí: un conjunto de hash sobre la columna.
 EXPLAIN (COSTS OFF) SELECT count(DISTINCT region) FROM s;

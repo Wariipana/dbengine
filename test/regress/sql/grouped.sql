@@ -470,6 +470,44 @@ RESET enable_hashjoin;
 RESET enable_mergejoin;
 RESET enable_material;
 
+-- Claves de texto: una sola, con diccionario, se busca una vez por código y
+-- stripe; con work_mem al mínimo los grupos que no entran se vuelcan como un
+-- estado parcial por código (registros de estados) mezclados con filas
+-- sueltas de los stripes sin diccionario.  Con nulos, multibyte y varchar.
+CREATE TABLE ft (u text, v varchar(20), n int4) USING dbengine_columnar;
+INSERT INTO ft SELECT 'u' || (i % 50), 'v' || (i % 7), i FROM generate_series(1, 2000) i;
+ANALYZE ft;
+INSERT INTO ft SELECT CASE WHEN i % 97 = 0 THEN NULL
+						   ELSE 'url/' || (i % 30000) || CASE WHEN i % 5 = 0 THEN 'ñ日' ELSE '' END END,
+	'v' || (i % 7), i % 1000
+	FROM generate_series(1, 150000) i;
+INSERT INTO ft SELECT md5(i::text), NULL, i FROM generate_series(1, 20000) i;
+CREATE TABLE fth AS SELECT * FROM ft;
+SET work_mem = '64kB';
+EXPLAIN (COSTS OFF) SELECT u, count(*), sum(n) FROM ft GROUP BY u;
+SELECT (SELECT sum(hashtext(coalesce(u, '-') || ':' || c || ':' || s || ':' || a)::bigint)
+		FROM (SELECT u, count(*) c, sum(n) s, avg(n) a FROM ft GROUP BY u) x)
+	 = (SELECT sum(hashtext(coalesce(u, '-') || ':' || c || ':' || s || ':' || a)::bigint)
+		FROM (SELECT u, count(*) c, sum(n) s, avg(n) a FROM fth GROUP BY u) y)
+	AS texto_volcado_igual;
+SELECT (SELECT count(*) FROM (SELECT u FROM ft GROUP BY u) x)
+	 = (SELECT count(*) FROM (SELECT u FROM fth GROUP BY u) y) AS texto_grupos;
+SELECT fx_check('SELECT v, count(*), min(n), max(n) FROM ft GROUP BY v') AS varchar_igual;
+-- Una constante en el SELECT sale tal cual (q35: SELECT 1, URL, count(*)).
+EXPLAIN (COSTS OFF) SELECT 1, u, count(*) FROM ft GROUP BY 1, u;
+SELECT (SELECT sum(hashtext(k || ':' || coalesce(u, '-') || ':' || c)::bigint)
+		FROM (SELECT 1 AS k, u, count(*) c FROM ft GROUP BY 1, u) x)
+	 = (SELECT sum(hashtext(k || ':' || coalesce(u, '-') || ':' || c)::bigint)
+		FROM (SELECT 1 AS k, u, count(*) c FROM fth GROUP BY 1, u) y)
+	AS constante_igual;
+-- Un LIMIT corta con particiones sin procesar: se tienen que cerrar al
+-- terminar el nodo, sin WARNING de archivos abiertos.
+SELECT count(*) FROM (SELECT u, count(*) FROM ft GROUP BY u LIMIT 5) x;
+RESET work_mem;
+-- Texto junto a otra clave: sin caché por código, al plan de siempre.
+EXPLAIN (COSTS OFF) SELECT u, n, count(*) FROM ft GROUP BY u, n;
+DROP TABLE ft, fth;
+
 -- Lo que no entra: un float como clave (0 y -0 son iguales), sum(int8) y un
 -- HAVING, que la tabla no puede dejarle a un Finalize.
 EXPLAIN (COSTS OFF) SELECT v::float8, count(*) FROM fx GROUP BY 1;
