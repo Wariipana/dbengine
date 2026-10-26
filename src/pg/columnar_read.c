@@ -80,6 +80,18 @@ struct DbeRowCursor
 	uint32		gran_count;
 	uint64		granules_pruned;
 
+	/*
+	 * Selección por stripe (dbe_cursor_set_selector()): un byte por fila
+	 * del stripe, calculado al tomar su primera fila.  sel_gen es el
+	 * stripe_loads con el que se calculó.
+	 */
+	DbeRowSelectFn sel_fn;
+	void	   *sel_arg;
+	const uint8 *sel;
+	uint64		sel_gen;
+	uint8		row_sel;		/* el byte de la última fila tomada */
+	uint64		sel_skipped;	/* visibles que la selección salteó */
+
 	MemoryContext cxt;			/* contexto del cursor */
 	MemoryContext stripe_cxt;	/* se resetea al cambiar de stripe */
 	bool		own_snapshot;
@@ -243,6 +255,8 @@ dbe_cursor_rescan(DbeRowCursor *cur)
 	dbe_cursor_unload_stripe(cur);
 	cur->stripe_idx = -1;
 	cur->row_in_stripe = 0;
+	cur->sel = NULL;
+	cur->sel_gen = UINT64_MAX;
 }
 
 const DbeStripeDesc *
@@ -966,6 +980,30 @@ dbe_cursor_set_filter_columns(DbeRowCursor *cur, const bool *cols)
 	}
 }
 
+void
+dbe_cursor_set_selector(DbeRowCursor *cur, DbeRowSelectFn fn, void *arg)
+{
+	cur->sel_fn = fn;
+	cur->sel_arg = arg;
+	cur->sel = NULL;
+	cur->sel_gen = UINT64_MAX;
+}
+
+uint8
+dbe_cursor_row_selection(DbeRowCursor *cur)
+{
+	return cur->row_sel;
+}
+
+uint64
+dbe_cursor_take_skipped(DbeRowCursor *cur)
+{
+	uint64		n = cur->sel_skipped;
+
+	cur->sel_skipped = 0;
+	return n;
+}
+
 bool
 dbe_cursor_next_keys(DbeRowCursor *cur, TupleTableSlot *slot)
 {
@@ -1003,18 +1041,33 @@ static bool
 dbe_cursor_take_row(DbeRowCursor *cur, uint64 *row)
 {
 	uint64		r;
+	uint64		n;
 
 	if (cur->stripe == NULL)
 		return false;
+	n = cur->stripe->row_count;
+
+	if (cur->sel_fn != NULL && cur->sel_gen != cur->stripe_loads)
+	{
+		cur->sel = cur->sel_fn(cur->sel_arg, cur, n);
+		cur->sel_gen = cur->stripe_loads;
+	}
 
 	r = dbe_cursor_next_live_row(cur, cur->row_in_stripe);
-	if (r >= cur->stripe->row_count)
+	while (cur->sel != NULL && r < n && cur->sel[r] == 0)
 	{
-		cur->row_in_stripe = cur->stripe->row_count;
+		if (dbe_row_visible(cur, r))
+			cur->sel_skipped++;
+		r = dbe_cursor_next_live_row(cur, r + 1);
+	}
+	if (r >= n)
+	{
+		cur->row_in_stripe = n;
 		return false;
 	}
 
 	*row = r;
+	cur->row_sel = cur->sel != NULL ? cur->sel[r] : UINT8_MAX;
 	cur->row_in_stripe = r + 1;
 	return true;
 }

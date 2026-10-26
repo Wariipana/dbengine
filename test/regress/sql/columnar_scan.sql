@@ -413,6 +413,30 @@ SELECT igual('SELECT count(*) FROM svis');
 DROP TABLE svacia, snulos, svis;
 RESET ALL;
 
+-- ===========================================================================
+-- Selección por stripe en el scan: las cláusulas de diccionario y las de
+-- enteros contra constantes se deciden para el stripe entero, y el cursor
+-- saltea las filas que no pasan sin leer sus columnas.  Sin el agregado
+-- empujado, para que sea el scan el que filtra.  Con nulos en las dos
+-- clases de columna, una cláusula que queda fila por fila, y el conteo de
+-- filas descartadas, que tiene que ser el mismo.
+-- ===========================================================================
+SET dbengine.enable_agg_pushdown = off;
+SET max_parallel_workers_per_gather = 0;
+CREATE TABLE ssel (n int4, g int8, t text) USING dbengine_columnar;
+INSERT INTO ssel SELECT CASE WHEN i % 11 = 0 THEN NULL ELSE i % 1000 END, i / 7,
+	CASE WHEN i % 13 = 0 THEN NULL ELSE 'v' || (i % 40) END
+	FROM generate_series(1, 30000) i;
+SELECT igual('SELECT count(*) FROM ssel WHERE n > 900');
+SELECT igual('SELECT sum(g) FROM ssel WHERE n <> 5 AND t = ''v3''');
+SELECT igual('SELECT string_agg(t, '','' ORDER BY g, n) FROM ssel WHERE g = 100');
+SELECT igual('SELECT count(*) * 1000000 + sum(n) FROM ssel WHERE t LIKE ''v1%'' AND n % 3 = 0');
+SELECT igual('SELECT count(*) FROM ssel WHERE t IS NULL OR n IS NULL');
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT n FROM ssel WHERE n > 990 AND t <> 'v5';
+DROP TABLE ssel;
+RESET ALL;
+
 DROP FUNCTION igual(text);
 DROP FUNCTION igual_fila(text);
 DROP TABLE s;

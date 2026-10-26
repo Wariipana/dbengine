@@ -443,3 +443,20 @@ s, q16 0,71 → 0,58 s, q31 0,64 → 0,52 s, q15 0,75 → 0,61 s, q34/q35 2,6 �
 2,26 s.** Las 43 contra la línea base: media geométrica 0,344, suma 109,9 →
 39,0 s. Con empates en el límite el conjunto puede diferir del de
 Postgres, que tampoco lo fija (q33: todos los grupos tienen `c = 1`).
+
+## Resultado: la selección por stripe también en el scan
+
+`DbengineColumnarScan`, el scan que usa Postgres cuando elige su plan,
+evaluaba el WHERE fila por fila. Ahora el cursor acepta un selector: al
+tomar la primera fila de un stripe le pide un byte por fila
+(`dbe_dictqual_prefilter()`, el mismo de VectorAgg) y saltea las que no
+pasan sin decodificar ni las columnas del filtro; en las que pasan seguro
+no se evalúa el WHERE. Las cláusulas de diccionario se resuelven contra un
+slot propio, para no tocar el del scan. Las filas salteadas que son
+visibles se cuentan como filtradas, así que "Rows Removed by Filter" no
+cambia.
+
+En la comparación alternando los dos `.so`: **q25 306 → 207 ms, q26 261 →
+159 ms, q27 307 → 205 ms, q20 32 → 20 ms, q23 436 → 362 ms, q24 773 → 687
+ms**; las demás, igual. Las 43 contra la línea base: media geométrica
+0,328, suma 109,9 → 38,7 s.

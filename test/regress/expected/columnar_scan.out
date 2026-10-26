@@ -969,6 +969,64 @@ SELECT igual('SELECT count(*) FROM svis');
 
 DROP TABLE svacia, snulos, svis;
 RESET ALL;
+-- ===========================================================================
+-- Selección por stripe en el scan: las cláusulas de diccionario y las de
+-- enteros contra constantes se deciden para el stripe entero, y el cursor
+-- saltea las filas que no pasan sin leer sus columnas.  Sin el agregado
+-- empujado, para que sea el scan el que filtra.  Con nulos en las dos
+-- clases de columna, una cláusula que queda fila por fila, y el conteo de
+-- filas descartadas, que tiene que ser el mismo.
+-- ===========================================================================
+SET dbengine.enable_agg_pushdown = off;
+SET max_parallel_workers_per_gather = 0;
+CREATE TABLE ssel (n int4, g int8, t text) USING dbengine_columnar;
+INSERT INTO ssel SELECT CASE WHEN i % 11 = 0 THEN NULL ELSE i % 1000 END, i / 7,
+	CASE WHEN i % 13 = 0 THEN NULL ELSE 'v' || (i % 40) END
+	FROM generate_series(1, 30000) i;
+SELECT igual('SELECT count(*) FROM ssel WHERE n > 900');
+    igual    
+-------------
+ igual: 2700
+(1 row)
+
+SELECT igual('SELECT sum(g) FROM ssel WHERE n <> 5 AND t = ''v3''');
+     igual      
+----------------
+ igual: 1346813
+(1 row)
+
+SELECT igual('SELECT string_agg(t, '','' ORDER BY g, n) FROM ssel WHERE g = 100');
+             igual              
+--------------------------------
+ igual: v20,v21,v23,v25,v26,v24
+(1 row)
+
+SELECT igual('SELECT count(*) * 1000000 + sum(n) FROM ssel WHERE t LIKE ''v1%'' AND n % 3 = 0');
+       igual       
+-------------------
+ igual: 2294138554
+(1 row)
+
+SELECT igual('SELECT count(*) FROM ssel WHERE t IS NULL OR n IS NULL');
+    igual    
+-------------
+ igual: 4825
+(1 row)
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT n FROM ssel WHERE n > 990 AND t <> 'v5';
+                               QUERY PLAN                                
+-------------------------------------------------------------------------
+ Custom Scan (DbengineColumnarScan) on ssel (actual rows=226.00 loops=1)
+   Columnas leídas: n, t
+   Filter: ((ssel.n > 990) AND (ssel.t <> 'v5'::text))
+   Rows Removed by Filter: 29774
+   Predicados sobre zone maps: 1
+   Stripes descartados: 0
+(6 rows)
+
+DROP TABLE ssel;
+RESET ALL;
 DROP FUNCTION igual(text);
 DROP FUNCTION igual_fila(text);
 DROP TABLE s;

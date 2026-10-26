@@ -250,8 +250,9 @@ Tres hechos del código que ordenan la lista:
        `const − min` en FOR sin reconstruir el valor, y salir con un vector
        de selección; `ExecQual` queda para el residuo. Hecho el vector de
        selección: `col op const` sobre enteros y fechas se evalúa sobre el
-       arreglo del stripe (q2 4,2×). Falta compararlo sin descomprimir y
-       aplicarlo también en `DbengineColumnarScan`, que sigue fila por fila.
+       arreglo del stripe (q2 4,2×), y en `DbengineColumnarScan` el cursor
+       saltea las filas que no pasan (q25–q27 1,5×; las 43: media
+       geométrica 0,328). Falta compararlo sin descomprimir.
 
 ### C2.3 — Lo grueso
 
@@ -520,7 +521,8 @@ Lo que convierte el trabajo en portfolio.
 C0 ✅ → **C2 (rendimiento)** → C5.0 y C5.1 (BI) → C1 (DELETE/UPDATE) →
 C5.2 (estrella) → C4, con C3 intercalado cuando un cambio toque el archivo
 en cuestión. Lo que queda de C2 que más sirve a BI va primero: top-N (8),
-el prefiltro en `DbengineColumnarScan` (7) y `sum(bigint)` (1). El foco pasó a ser que el
+el prefiltro en `DbengineColumnarScan` (7, hecho) y `sum(bigint)`
+(1). El foco pasó a ser que el
 motor mejore el rendimiento de verdad, así que C2 va primero; C1 después,
 porque DELETE obliga a revisar todos los atajos por metadatos (SMA, zone
 maps, `count(*)`), y conviene hacerlo una vez con la lista completa de

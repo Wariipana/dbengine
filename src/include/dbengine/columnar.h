@@ -138,6 +138,25 @@ extern uint64 dbe_cursor_next_live_row(DbeRowCursor *cur, uint64 row);
 extern uint64 dbe_cursor_granules_pruned(DbeRowCursor *cur);
 
 /*
+ * Selección por stripe para los recorridos que toman filas del cursor
+ * (dbe_cursor_next_keys() y compañía): al tomar la primera fila de cada
+ * stripe se llama a `fn`, que devuelve un byte por fila —o NULL si no pudo
+ * decidir nada—, válido hasta el próximo stripe.  Las filas con 0 se
+ * saltean sin leer sus columnas; el byte de las demás se consulta con
+ * dbe_cursor_row_selection() (UINT8_MAX si no hubo selección).  Son los
+ * DBE_SEL_* de dictqual.h.  dbe_cursor_take_skipped() devuelve, y pone en
+ * cero, cuántas filas visibles se saltearon, para contarlas como
+ * filtradas.
+ */
+typedef const uint8 *(*DbeRowSelectFn) (void *arg, DbeRowCursor *cur,
+										 uint64 nrows);
+
+extern void dbe_cursor_set_selector(DbeRowCursor *cur, DbeRowSelectFn fn,
+									void *arg);
+extern uint8 dbe_cursor_row_selection(DbeRowCursor *cur);
+extern uint64 dbe_cursor_take_skipped(DbeRowCursor *cur);
+
+/*
  * Cantidad exacta de filas visibles, sin leer ni un byte de datos.
  *
  * El row_count de cada stripe ya está en el catálogo, y el storage es

@@ -92,6 +92,15 @@ typedef struct DbeScanState
 	DbeDictQual *qual;
 
 	/*
+	 * El WHERE de diccionario y de enteros contra constantes, decidido por
+	 * stripe (dbe_dictqual_prefilter()) y aplicado por el cursor: ver
+	 * dbe_scan_select().
+	 */
+	uint8	   *sel;
+	uint64		sel_cap;
+	TupleTableSlot *sel_slot;
+
+	/*
 	 * Proyección propia, solo si alguna expresión de la salida se puede
 	 * calcular por entrada del diccionario (ver dbe_scan_init_projection).
 	 * NULL = la proyección normal de ExecScan().
@@ -125,6 +134,7 @@ static TupleTableSlot *dbe_exec_scan(CustomScanState *node);
 static void dbe_end_scan(CustomScanState *node);
 static void dbe_rescan_scan(CustomScanState *node);
 static void dbe_shutdown_scan(CustomScanState *node);
+static const uint8 *dbe_scan_select(void *arg, DbeRowCursor *cur, uint64 nrows);
 static void dbe_explain_scan(CustomScanState *node, List *ancestors,
 							 ExplainState *es);
 static Size dbe_estimate_dsm(CustomScanState *node, ParallelContext *pcxt);
@@ -855,6 +865,9 @@ dbe_begin_scan(CustomScanState *node, EState *estate, int eflags)
 		dbe_cursor_set_filter_columns(state->cursor, filter_cols);
 		pfree(filter_cols);
 	}
+	if (state->qual != NULL && dbe_enable_dict_quals &&
+		estate->es_epq_active == NULL)
+		dbe_cursor_set_selector(state->cursor, dbe_scan_select, state);
 
 	if (lsecond(cscan->custom_private) != NIL)
 		state->dedup = dbe_dedup_create(RelationGetDescr(relation),
@@ -888,6 +901,44 @@ dbe_scan_repeated(DbeScanState *state, TupleTableSlot *slot)
 	return true;
 }
 
+/*
+ * La selección del stripe para el cursor: las filas que no pasan se
+ * saltean sin decodificar ni las columnas del filtro, y las que pasan
+ * seguro no evalúan el WHERE.  Las cláusulas de diccionario se resuelven
+ * contra un slot propio, para no tocar el del scan.
+ */
+static const uint8 *
+dbe_scan_select(void *arg, DbeRowCursor *cur, uint64 nrows)
+{
+	DbeScanState *state = (DbeScanState *) arg;
+	ExprContext *econtext = state->css.ss.ps.ps_ExprContext;
+	TupleTableSlot *saved = econtext->ecxt_scantuple;
+	bool		ok;
+
+	if (state->sel_cap < nrows)
+	{
+		if (state->sel != NULL)
+			pfree(state->sel);
+		state->sel = (uint8 *) MemoryContextAlloc(GetMemoryChunkContext(state),
+												  nrows);
+		state->sel_cap = nrows;
+	}
+	if (state->sel_slot == NULL)
+	{
+		TupleDesc	desc = RelationGetDescr(state->css.ss.ss_currentRelation);
+
+		state->sel_slot = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
+		ExecClearTuple(state->sel_slot);
+		memset(state->sel_slot->tts_isnull, true, sizeof(bool) * desc->natts);
+		ExecStoreVirtualTuple(state->sel_slot);
+	}
+	econtext->ecxt_scantuple = state->sel_slot;
+	ok = dbe_dictqual_prefilter(state->qual, cur, (uint32) nrows, state->sel,
+								econtext);
+	econtext->ecxt_scantuple = saved;
+	return ok ? state->sel : NULL;
+}
+
 static bool
 dbe_scan_row_passes(DbeScanState *state, TupleTableSlot *slot)
 {
@@ -904,8 +955,10 @@ dbe_scan_row_passes(DbeScanState *state, TupleTableSlot *slot)
 		return !dbe_scan_repeated(state, slot);
 	}
 
+	state->rows_filtered += dbe_cursor_take_skipped(state->cursor);
 	econtext->ecxt_scantuple = slot;
-	if (!dbe_dictqual_eval(state->qual, state->cursor,
+	if (dbe_cursor_row_selection(state->cursor) != DBE_SEL_PASS &&
+		!dbe_dictqual_eval(state->qual, state->cursor,
 						   dbe_cursor_current_row(state->cursor), econtext,
 						   dbe_scan_fill_column, state))
 	{
@@ -934,6 +987,7 @@ dbe_scan_next(CustomScanState *node)
 				if (dbe_scan_row_passes(state, slot))
 					return slot;
 
+			state->rows_filtered += dbe_cursor_take_skipped(state->cursor);
 			idx = pg_atomic_fetch_add_u64(&state->shared->next_stripe, 1);
 			if (idx >= (uint64) dbe_cursor_nstripes(state->cursor))
 				return ExecClearTuple(slot);
@@ -946,6 +1000,7 @@ dbe_scan_next(CustomScanState *node)
 		if (dbe_scan_row_passes(state, slot))
 			return slot;
 
+	state->rows_filtered += dbe_cursor_take_skipped(state->cursor);
 	return ExecClearTuple(slot);
 }
 
@@ -989,6 +1044,11 @@ dbe_end_scan(CustomScanState *node)
 	{
 		dbe_cursor_end(state->cursor);
 		state->cursor = NULL;
+	}
+	if (state->sel_slot != NULL)
+	{
+		ExecDropSingleTupleTableSlot(state->sel_slot);
+		state->sel_slot = NULL;
 	}
 }
 
