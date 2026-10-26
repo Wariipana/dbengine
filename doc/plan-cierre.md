@@ -311,6 +311,11 @@ Tres hechos del código que ordenan la lista:
   parcial debajo de un join cuando PG 19 sea el target.
 - **Ejecución por lotes del executor** (parche de Amit Langote, apunta a
   PG 20): el airlock ya está pensado para eso; seguirlo.
+- **Salida en Arrow (ADBC)** para llevar columnas a pandas o polars: es un
+  protocolo de cliente, no algo que una extensión del servidor resuelva
+  bien. Para eso está `COPY` binario.
+- **Función `dbengine.convert()`**: `SET ACCESS METHOD` ya convierte con
+  índices y permisos (ver C5.0, ítem 2).
 
 **Criterio de cierre**: ClickBench a 10M con la media geométrica en frío y
 en caliente contra heap, junto a Citus columnar y pg_duckdb **en la misma
@@ -349,102 +354,123 @@ conservadores.
 
 ### C5.0 — Medir antes de construir
 
-1. [ ] **Set de consultas de BI** (15 a 20) con un esquema estrella chico
-       sobre los datos de ClickBench —hechos más dimensiones de fecha,
-       región y buscador— y la forma que genera Power BI: subconsultas con
-       alias, `date_trunc`, `sum(numeric)`, `IN` de cientos de valores,
-       top N. Línea base propia, medida como ClickBench, y la lista de las
-       que caen al plan de Postgres. Si se puede, capturar el SQL real de
-       Power BI con `pg_stat_statements` o `auto_explain`.
-2. [ ] **Test de integración con psycopg 3** (3.3.4 instalado): conexión,
-       `CREATE TABLE ... USING`, `COPY` de texto y binario, agregados,
-       prepared statements y cursores del lado del servidor. En la CI.
-3. [ ] **Test de conversión**: `SET ACCESS METHOD` ida y vuelta, con
-       índices, permisos, defaults y vistas dependientes, en la suite.
-4. [ ] **Concurrencia**: 10 a 30 consultas a la vez con pgbench, como un
-       dashboard. Mirar cómo se reparten los workers, el `hash_mem` total
-       y si los costos calibrados para una consulta sola siguen valiendo.
+1. [ ] **Benchmarks de BI estándar en vez de inventar el set.** SSB (Star
+       Schema Benchmark: 13 consultas sobre un esquema estrella, con
+       `sum(lo_extendedprice * lo_discount)` y filtros de dimensión) y de
+       TPC-H las de una sola tabla que más se parecen a un tablero, Q1 y
+       Q6, con montos `decimal`. Son conocidos, reproducibles y comparables
+       con otros motores; un set armado a mano mide lo que uno ya espera.
+       Más 4 o 5 consultas con la forma de Power BI (subconsultas con
+       alias, `IN` de cientos de valores, top N) sobre las tablas de SSB.
+       Línea base propia, y la lista de las que caen al plan de Postgres.
+       Capturar el SQL real de Power BI queda para cuando haya una
+       instancia de Power BI con la que probar: acá no hay.
+2. [ ] **Test de conversión** en la suite: `SET ACCESS METHOD` ida y
+       vuelta, con índices, permisos, defaults y vistas dependientes. Es lo
+       que hace "plug and play" la adopción y hoy está probado solo a mano.
+3. [ ] **Test con psycopg 3**: conexión, `COPY` de texto y binario,
+       prepared statements y cursores del lado del servidor. Chico y a
+       nivel de servidor no prueba nada nuevo —el protocolo es el de
+       Postgres—, pero `COPY` binario sí pasa por el AM por otro camino, y
+       vale como evidencia para el README.
+4. [ ] **Concurrencia**: 10 a 30 consultas a la vez con pgbench. Lo que
+       importa es la memoria: la tabla propia en paralelo usa `hash_mem`
+       por participante y por nivel (dos con `count(DISTINCT)`), así que un
+       tablero puede pedir 30 × 3 × `hash_mem`. Medir antes de calibrar.
 
 ### C5.1 — Lo que saca a las consultas de BI del camino rápido
 
-5. [ ] **Medidas en `numeric` de escala fija**: `sum`/`avg` como enteros
-       escalados en int128 en la tabla propia. Sin esto casi cualquier
-       monto de dinero cae al HashAggregate de Postgres.
-6. [ ] **`sum`/`avg` de `bigint`** en la tabla propia y por SMA (q4).
-7. [ ] **Agregados sobre expresiones de varias columnas**:
-       `sum(precio * cantidad)`, `sum(CASE WHEN ... THEN monto END)`. Hoy
-       el argumento puede ser una expresión sobre una sola columna.
-8. [ ] **Agregados de `float8`/`real`** (métricas de series de tiempo),
-       con la suma en el mismo orden que Postgres o explicando la
-       diferencia de redondeo.
-9. [ ] **`IN (lista)`**: sobre texto ya se decide por código del
-       diccionario; falta sobre enteros en el arreglo del stripe
+Por orden de cuántas consultas de BI desbloquea; se reordena con lo que
+muestre C5.0.
+
+5. [ ] **Agregados sobre expresiones de varias columnas**:
+       `sum(precio * cantidad)`, `sum(CASE WHEN ... THEN monto END)`. Es la
+       medida central de SSB (`lo_extendedprice * lo_discount`). Hoy el
+       argumento puede mirar una sola columna; la evaluación ya pasa por el
+       slot, así que es cargar varias. Lo mismo para las claves (`CASE
+       WHEN` sobre varias columnas).
+6. [ ] **`sum`/`avg` de `bigint`** en la tabla propia y por SMA (q4). El
+       estado es int128, como en Postgres.
+7. [ ] **`sum`/`avg` de `numeric`** (TPC-H Q1, montos de dinero) como
+       enteros escalados en int128, mientras el valor entre: si no, se
+       pasa a la suma de Postgres para ese grupo. La escala del resultado
+       tiene que ser la de Postgres, la mayor de las de entrada, y no la del
+       typmod.
+8. [ ] **`IN (lista)` sobre enteros** en el arreglo del stripe
        (`ScalarArrayOpExpr`), y descartar stripes con el Bloom para cada
-       valor de la lista.
-10. [ ] **Claves `CASE WHEN` y `coalesce`** sobre varias columnas, y un
-        `extract` sobre `date`.
+       valor. Sobre texto ya se decide una vez por código del diccionario.
+9. [ ] **`extract` sobre `date`** como clave (hoy solo sobre timestamp), y
+       `date_trunc` sobre `date`, que da timestamp.
+10. [ ] **Agregados de `float8`/`real`**: menos frecuentes en BI que en
+        series de tiempo. El resultado depende del orden de suma; Postgres
+        en paralelo tampoco lo fija, pero hay que dejarlo escrito.
 
 ### C5.2 — Modelo estrella
 
-Revisa dos decisiones de "Descartado o para más adelante" de C2: los
-filtros de join en tiempo de ejecución y la agregación debajo del join.
-En BI son el caso normal, no la excepción. Es lo de más impacto y más
-riesgo, y depende de buenas estimaciones de ndistinct.
+Revisa dos decisiones de "Descartado o para más adelante" de C2. En BI son
+el caso normal, pero también lo más caro de construir: hay que medir C5.0
+primero y saber cuánto de SSB se pierde en el join y cuánto en el scan.
 
 11. [ ] **Tamaño del diccionario en el catálogo** para estimar ndistinct
-        sin muestrear (también pedido en C2).
-12. [ ] **Filtro de la dimensión empujado al scan de hechos**: el conjunto
-        de claves de la dimensión filtrada descarta stripes por zone map y
-        Bloom y filas por el vector de selección. Solo si es selectivo.
-13. [ ] **Agregación debajo del join**: agrupar los hechos por la clave
-        foránea con VectorAgg y unir el resultado, chico, con la
-        dimensión. Solo si la reducción estimada es clara. PG 19 trae
-        *eager aggregation*: ver si alcanza con ofrecer el nodo como
-        agregado parcial ahí.
+        sin muestrear (también pedido en C2). Base de lo que sigue.
+12. [ ] **Agregación debajo del join en PG 19.** PG 19 trae eager
+        aggregation (`enable_eager_aggregate`): arma un `grouped_rel` por
+        tabla base y le pone paths de Agg arriba del scan. Este nodo se
+        puede ofrecer ahí desde `set_rel_pathlist_hook`, que corre antes
+        de que se llene ese rel. En PG 18 no hay dónde engancharlo sin
+        reimplementar el planner de joins: queda solo para 19.
+13. [ ] **Filtro de la dimensión empujado al scan de hechos.** El executor
+        no le pasa el lado de construcción del HashJoin al scan, así que
+        hace falta otro mecanismo: un path parametrizado (el scan recibe la
+        clave como parámetro y usa el Bloom) sirve solo con pocas claves;
+        para muchas, un nodo propio de join. Empezar por un experimento
+        que diga cuánto de SSB se gana; si es poco, se descarta.
 
 ### C5.3 — Después
 
 14. [ ] **Regex rápido** para `regexp_replace`, `~` y `regexp_match` con
-        patrón constante (q29: 11,9 s, todo en el motor de regex de
-        Postgres). RE2, versión estable más reciente, del lado C++. Su
-        semántica no es la de Postgres (ARE), así que solo para un
-        subconjunto que un analizador propio garantice equivalente: sin
-        backreferences, sin clases que dependan del locale, sin
-        alternativas donde "la más larga" y "la primera" difieran. El resto,
-        con el motor de Postgres. Tests que comparen los dos motores, y
-        GUC. Suma una dependencia externa a la CI y al empaquetado.
-15. [ ] **Funciones de ventana**: que el scan entregue las filas ya
-        ordenadas a `OVER (...)` cuando hay clustering; no reimplementar la
-        ventana.
+        patrón constante. Hoy solo lo pide q29 (11,9 s, todo en el motor de
+        regex de Postgres), y en BI es raro; por eso va acá. RE2, versión
+        estable más reciente, del lado C++. Su semántica no es la de
+        Postgres (ARE): solo para un subconjunto que un analizador propio
+        garantice equivalente —sin backreferences, sin clases que dependan
+        del locale, sin alternativas donde "la más larga" y "la primera"
+        difieran—; el resto, con el motor de Postgres. Tests que comparen
+        los dos y GUC. Suma una dependencia externa a la CI y al
+        empaquetado.
+15. [ ] **Funciones de ventana: verificar**, no construir. El scan ya
+        declara el orden del clustering como pathkeys, así que un `OVER
+        (ORDER BY ...)` por esa columna no debería necesitar Sort.
+        Comprobarlo con EXPLAIN y dejarlo en un test.
 16. [ ] **Time travel**: verificar que las consultas sobre una versión
         pasada usen VectorAgg y el pruning.
 17. [ ] **Ingesta continua**: lotes chicos dejan stripes chicos;
-        compactación automática en el background worker, o documentada.
-18. [ ] **Compresión de floats y timestamps casi ordenados** (delta,
-        Gorilla): hoy solo hay crudo, RLE, FOR y diccionario (ver ítem 11
-        de C2).
-19. [ ] **Salida en Arrow** (ADBC) para llevar columnas a pandas o polars.
-        Grande; solo si sobra tiempo.
+        compactación automática en el background worker, o documentar
+        `merge_stripes`.
+
+La compresión de floats y timestamps casi ordenados ya está como ítem 11
+de C2.
 
 ### C5.4 — Adopción en una instancia existente
 
 Instalar ya es "plug and play" en una instancia propia con PG 18 o 19: se
 copia el `.so`, se agrega a `shared_preload_libraries` si se quiere el
-background worker, y `CREATE EXTENSION`. Las tablas heap no cambian. No
-sirve en servicios gestionados (RDS, Cloud SQL, Azure), que no dejan
-instalar extensiones propias. Lo que falta para convertir sin fricción:
+background worker, y `CREATE EXTENSION`. Las tablas heap no cambian, y
+`SET ACCESS METHOD` convierte una existente con sus índices: no hace
+falta una función de conversión propia. No sirve en servicios gestionados
+(RDS, Cloud SQL, Azure), que no dejan instalar extensiones propias.
 
-20. [ ] **C1** (DELETE, UPDATE, MERGE): sin eso solo convienen las tablas de
+18. [ ] **C1** (DELETE, UPDATE, MERGE): sin eso solo convienen las tablas de
         solo inserción o históricas.
-21. [ ] **Imagen Docker y paquetes** (deb, PGXN) además del release `1.0.0`
-        de C1.
-22. [ ] **`dbengine.convert(tabla)`**: conversión en línea con verificación
-        de conteos, y un asesor que, con `workload_stats`, diga qué tablas
-        conviene pasar a columnar y cuáles no.
-23. [ ] **Réplica por streaming y PITR**: test TAP con un standby que lea
+19. [ ] **Imagen Docker** con PG 18 y la extensión, además del release
+        `1.0.0` de C1. Es lo que permite probarlo en cinco minutos.
+20. [ ] **Asesor**: extender `cluster_advice` con `workload_stats` para
+        decir qué tablas conviene pasar a columnar (muchas lecturas de pocas
+        columnas, pocas modificaciones) y cuáles no.
+21. [ ] **Réplica por streaming y PITR**: test TAP con un standby que lea
         tablas columnares. Los datos van al WAL, pero no está probado.
-24. [ ] **Interruptor global** (`dbengine.enable_*` existe por camino):
-        documentar cómo apagar todo en producción si algo se porta mal.
+22. [ ] **Un GUC para apagar todo** (`dbengine.enable`), además de los de
+        cada camino, documentado como el interruptor de emergencia.
 
 ## C3 — Calidad de código (≈ 1–2 semanas, en paralelo)
 
