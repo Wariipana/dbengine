@@ -876,6 +876,96 @@ EXPLAIN (COSTS OFF) SELECT u, n, count(*) FROM ft GROUP BY u, n;
 (4 rows)
 
 DROP TABLE ft, fth;
+-- En paralelo: los participantes se reparten baldes de grupos por el hash de
+-- la clave, cada uno recorre la tabla entera y emite grupos completos.  El
+-- Gather solo concatena.  Con volcado, con WHERE, con texto, y con menos
+-- participantes de los planeados: sin workers el líder toma todos los
+-- baldes, y sin el líder los toman los workers.
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 2;
+-- Con la estimación buena (250K grupos en 252K filas) el agregado parcial
+-- no reduce y no se ofrece: queda la tabla propia, serial o repartida.
+ANALYZE fxs;
+CREATE TABLE fpt (k text, v int4) USING dbengine_columnar;
+INSERT INTO fpt SELECT 'k' || (i % 40000) || CASE WHEN i % 3 = 0 THEN 'ñ' ELSE '' END,
+	i % 100 FROM generate_series(1, 120000) i;
+ANALYZE fpt;
+CREATE TABLE fpth AS SELECT * FROM fpt;
+SET work_mem = '64kB';
+EXPLAIN (COSTS OFF) SELECT g, h, count(*), sum(v) FROM fxs GROUP BY g, h;
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Gather
+   Workers Planned: 2
+   ->  Parallel Custom Scan (DbengineVectorAgg) on fxs
+         Agregados empujados al scan: 4
+         Agrupación: tabla de hash propia
+         Reparto: grupos por hash entre participantes
+(6 rows)
+
+EXPLAIN (COSTS OFF) SELECT k, count(*), sum(v) FROM fpt GROUP BY k;
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Gather
+   Workers Planned: 2
+   ->  Parallel Custom Scan (DbengineVectorAgg) on fpt
+         Agregados empujados al scan: 3
+         Agrupación: tabla de hash propia
+         Reparto: grupos por hash entre participantes
+(6 rows)
+
+SELECT (SELECT sum(hashtext(g || ':' || coalesce(h, -1) || ':' || c || ':' || coalesce(s, -1) || ':' || coalesce(a::text, '-'))::bigint)
+		FROM (SELECT g, h, count(*) c, sum(v) s, avg(v) a FROM fxs GROUP BY g, h) x)
+	 = (SELECT sum(hashtext(g || ':' || coalesce(h, -1) || ':' || c || ':' || coalesce(s, -1) || ':' || coalesce(a::text, '-'))::bigint)
+		FROM (SELECT g, h, count(*) c, sum(v) s, avg(v) a FROM fxsh GROUP BY g, h) y)
+	AS paralelo_volcado_igual;
+ paralelo_volcado_igual 
+------------------------
+ t
+(1 row)
+
+SELECT fx_check('SELECT b, count(*), avg(w) FROM fx WHERE s = ''x1'' AND v > 0 GROUP BY b') AS paralelo_where;
+ paralelo_where 
+----------------
+ t
+(1 row)
+
+SELECT (SELECT sum(hashtext(k || ':' || c || ':' || s)::bigint)
+		FROM (SELECT k, count(*) c, sum(v) s FROM fpt GROUP BY k) x)
+	 = (SELECT sum(hashtext(k || ':' || c || ':' || s)::bigint)
+		FROM (SELECT k, count(*) c, sum(v) s FROM fpth GROUP BY k) y)
+	AS paralelo_texto;
+ paralelo_texto 
+----------------
+ t
+(1 row)
+
+SET max_parallel_workers = 0;
+SELECT count(*) AS grupos, sum(c) AS filas
+FROM (SELECT g, h, count(*) c FROM fxs GROUP BY g, h) x;
+ grupos | filas  
+--------+--------
+ 250021 | 252000
+(1 row)
+
+RESET max_parallel_workers;
+SET parallel_leader_participation = off;
+SELECT count(*) AS grupos, sum(c) AS filas
+FROM (SELECT g, h, count(*) c FROM fxs GROUP BY g, h) x;
+ grupos | filas  
+--------+--------
+ 250021 | 252000
+(1 row)
+
+RESET parallel_leader_participation;
+RESET work_mem;
+DROP TABLE fpt, fpth;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+SET max_parallel_workers_per_gather = 0;
 -- Lo que no entra: un float como clave (0 y -0 son iguales), sum(int8) y un
 -- HAVING, que la tabla no puede dejarle a un Finalize.
 EXPLAIN (COSTS OFF) SELECT v::float8, count(*) FROM fx GROUP BY 1;

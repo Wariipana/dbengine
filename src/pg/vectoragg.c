@@ -212,6 +212,18 @@ typedef struct DbeAggParallelShared
 {
 	pg_atomic_uint64 next_stripe;
 
+	/*
+	 * Tabla propia en paralelo: los participantes se reparten baldes de
+	 * grupos, no stripes.  Hay tantos como participantes planeados; si se
+	 * lanzan menos workers, los que sobran los toma quien termine antes.
+	 */
+	pg_atomic_uint32 next_bucket;
+	uint32		nbuckets;
+	pg_atomic_uint64 flat_groups;
+	pg_atomic_uint64 flat_spilled;
+	pg_atomic_uint64 flat_parts;
+	pg_atomic_uint64 flat_peak;	/* el máximo de un participante */
+
 	/* Contadores del EXPLAIN; ver la nota en customscan.c. */
 	pg_atomic_uint64 rows_seen;
 	pg_atomic_uint64 rows_filtered;
@@ -346,6 +358,18 @@ typedef struct DbeVectorAggState
 	bool	   *flat_valnulls;
 	Datum	   *flat_outs;
 	bool	   *flat_outnulls;
+
+	/*
+	 * En paralelo cada balde recorre la tabla entera y vuelve a descartar
+	 * los mismos stripes: se publica lo que descartó la vuelta del balde 0.
+	 * Y las cifras de la tabla, sumadas entre participantes.
+	 */
+	uint64		flat_stripes_pruned;
+	uint64		flat_granules_pruned;
+	uint64		flat_groups_total;
+	uint64		flat_spilled_total;
+	int			flat_parts_total;
+	Size		flat_peak_total;
 } DbeVectorAggState;
 
 /*
@@ -1583,13 +1607,76 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 			 * llamar por fmgr.  Si los grupos no entran, casi todas las
 			 * filas se escriben y se leen una vez más.
 			 */
-			path->path.startup_cost = input_path->total_cost +
+			/*
+			 * El recorrido se cobra como en los demás caminos de este nodo:
+			 * el 35% del scan, porque lee los mismos bytes sin armar tuplas.
+			 */
+			path->path.startup_cost = input_path->total_cost * 0.35 +
 				cpu_operator_cost * nagg * 0.3 * in_rows;
 			if (ngroups * (double) entry > hash_mem)
 				path->path.startup_cost += 2.0 * seq_page_cost *
 					(in_rows * (double) (entry / 2) / BLCKSZ);
 			path->path.total_cost = path->path.startup_cost +
 				cpu_tuple_cost * ngroups;
+
+			/*
+			 * La versión paralela no se reparte stripes sino grupos: cada
+			 * participante toma un balde del hash de la clave, recorre la
+			 * tabla entera y agrega solo las filas de su balde.  Los grupos
+			 * salen completos y el Gather solo concatena: no hay Finalize,
+			 * que con millones de grupos es justo lo que pesa (q34: 2,1 de
+			 * los 5,5 s).  Lo que se paga es leer la tabla una vez por
+			 * balde; leer es lo barato.
+			 */
+			if (input_rel->consider_parallel && output_rel->consider_parallel &&
+				path->path.parallel_safe)
+			{
+				int			workers = compute_parallel_worker(input_rel,
+															  input_rel->pages,
+															  -1,
+															  max_parallel_workers_per_gather);
+
+				if (workers > 0)
+				{
+					CustomPath *pp = makeNode(CustomPath);
+					GatherPath *gp;
+					double		parts = workers + 1;
+					double		scan = input_path->total_cost * 0.35;
+					double		work = path->path.startup_cost - scan;
+					double		rows = ngroups;
+					double		per_tuple;
+
+					memcpy(pp, path, sizeof(CustomPath));
+					pp->path.parallel_aware = true;
+					pp->path.parallel_workers = workers;
+					pp->path.rows = clamp_row_est(ngroups / parts);
+					pp->path.startup_cost = scan + work / parts;
+					pp->path.total_cost = pp->path.startup_cost +
+						cpu_tuple_cost * pp->path.rows;
+					gp = create_gather_path(root, output_rel, (Path *) pp,
+											output_rel->reltarget, NULL,
+											&rows);
+
+					/*
+					 * parallel_tuple_cost está pensado para tuplas cualquiera
+					 * cruzando la cola compartida, y acá suben filas angostas
+					 * de grupos ya cerrados.  Medido en q33: 10M filas cuestan
+					 * 0,75 s, y el camino serial, que cuesta 276K, tarda
+					 * 6,2 s; o sea unas 0,0033 unidades por fila, menos que
+					 * un cpu_tuple_cost.  Con el valor por omisión (0,1) el
+					 * Gather costaba más que todo el resto del plan y el
+					 * camino no se elegía, aunque era 1,6× más rápido.  Se
+					 * cobra un cpu_tuple_cost por fila, o menos si así está
+					 * configurado.
+					 */
+					per_tuple = Min(parallel_tuple_cost, cpu_tuple_cost);
+					gp->path.startup_cost = pp->path.startup_cost +
+						parallel_setup_cost;
+					gp->path.total_cost = pp->path.total_cost +
+						parallel_setup_cost + per_tuple * rows;
+					add_path(output_rel, (Path *) gp);
+				}
+			}
 			add_path(output_rel, (Path *) path);
 		}
 
@@ -3530,9 +3617,12 @@ dbe_agg_exec_hashed(CustomScanState *node)
 /*
  * Llena la tabla propia con todo el scan.  Es el mismo recorrido que
  * dbe_agg_fill_hash() sin el corte por memoria: la tabla vuelca sola.
+ *
+ * Con `bucket` >= 0 (en paralelo) se recorre la tabla entera y se agregan
+ * solo las filas cuya clave cae en ese balde de los `nbuckets`.
  */
 static void
-dbe_agg_fill_flat(DbeVectorAggState *state)
+dbe_agg_fill_flat(DbeVectorAggState *state, int bucket, uint32 nbuckets)
 {
 	int			i;
 	int64	   *dict_cache = NULL;
@@ -3551,7 +3641,13 @@ dbe_agg_fill_flat(DbeVectorAggState *state)
 		uint64		row;
 
 		CHECK_FOR_INTERRUPTS();
-		take = dbe_agg_take_stripe(state);
+
+		/* Con un balde se recorre la tabla entera: los grupos son los repartidos. */
+		if (bucket >= 0)
+			take = dbe_cursor_next_stripe(state->cursor) ? DBE_TAKE_STRIPE
+				: DBE_TAKE_DONE;
+		else
+			take = dbe_agg_take_stripe(state);
 		if (take == DBE_TAKE_DONE)
 			break;
 		if (take == DBE_TAKE_SKIP)
@@ -3588,8 +3684,8 @@ dbe_agg_fill_flat(DbeVectorAggState *state)
 		 * terminar el stripe en vez de uno por fila: en q34 una URL aparece
 		 * unas 5 veces por stripe, y el texto se escribía cada vez.
 		 *
-		 * dict_cache: >= 0 índice del grupo, -2 todavía no se vio, y
-		 * <= -3 el estado parcial número -3 - v.
+		 * dict_cache: >= 0 índice del grupo, -2 todavía no se vio, -1 es de
+		 * otro balde, y <= -3 el estado parcial número -3 - v.
 		 */
 		dict_size = 0;
 		if (state->ngroupcols == 1 && state->group_typlen[0] == -1 &&
@@ -3634,10 +3730,11 @@ dbe_agg_fill_flat(DbeVectorAggState *state)
 				continue;
 			if (state->qual != NULL && !dbe_agg_row_passes(state, row))
 			{
-				state->rows_filtered++;
+				/* Cada balde ve las mismas: las cuenta uno solo. */
+				if (bucket <= 0)
+					state->rows_filtered++;
 				continue;
 			}
-			state->rows_seen++;
 
 			if (dict_size > 0)
 			{
@@ -3649,6 +3746,8 @@ dbe_agg_fill_flat(DbeVectorAggState *state)
 
 				dbe_error_if_not_ok(&st, "leyendo el código del diccionario");
 				cached = &dict_cache[code_null ? dict_size : code];
+				if (*cached == -1)
+					continue;	/* de otro balde */
 			}
 
 			for (i = 0; i < state->ngroupcols && (cached == NULL || *cached == -2); i++)
@@ -3665,6 +3764,16 @@ dbe_agg_fill_flat(DbeVectorAggState *state)
 								  &state->flat_keys[i],
 								  &state->flat_keynulls[i]);
 			}
+			if (bucket >= 0 && (cached == NULL || *cached == -2) &&
+				dbe_flat_bucket(state->flatagg, state->flat_keys,
+								state->flat_keynulls, nbuckets) != (uint32) bucket)
+			{
+				if (cached != NULL)
+					*cached = -1;
+				continue;
+			}
+			state->rows_seen++;
+
 			for (i = 0; i < state->naggs; i++)
 			{
 				DbeAggState *agg = &state->aggs[i];
@@ -3757,14 +3866,53 @@ dbe_agg_exec_flat(CustomScanState *node)
 
 	if (state->done)
 		return NULL;
-	if (!state->flat_filled)
-		dbe_agg_fill_flat(state);
 
-	if (!dbe_flat_next(state->flatagg, state->flat_keys, state->flat_keynulls,
-					   state->flat_outs, state->flat_outnulls))
+	/*
+	 * En paralelo, cada balde es una vuelta entera: tomarlo, recorrer la
+	 * tabla, emitir sus grupos, y tomar el siguiente.  Los baldes se toman
+	 * del contador compartido, así que el resultado no depende de cuántos
+	 * workers se hayan lanzado.
+	 */
+	for (;;)
 	{
-		state->done = true;
-		return NULL;
+		if (!state->flat_filled)
+		{
+			if (state->shared != NULL)
+			{
+				uint32		b = pg_atomic_fetch_add_u32(&state->shared->next_bucket, 1);
+				uint64		sp0 = dbe_cursor_stripes_pruned(state->cursor);
+				uint64		gp0 = dbe_cursor_granules_pruned(state->cursor);
+
+				if (b >= state->shared->nbuckets)
+				{
+					state->done = true;
+					return NULL;
+				}
+				dbe_cursor_rescan(state->cursor);
+				dbe_flat_reset(state->flatagg);
+				dbe_agg_fill_flat(state, (int) b, state->shared->nbuckets);
+				if (b == 0)
+				{
+					state->flat_stripes_pruned =
+						dbe_cursor_stripes_pruned(state->cursor) - sp0;
+					state->flat_granules_pruned =
+						dbe_cursor_granules_pruned(state->cursor) - gp0;
+				}
+			}
+			else
+				dbe_agg_fill_flat(state, -1, 0);
+		}
+
+		if (dbe_flat_next(state->flatagg, state->flat_keys,
+						  state->flat_keynulls, state->flat_outs,
+						  state->flat_outnulls))
+			break;
+		if (state->shared == NULL)
+		{
+			state->done = true;
+			return NULL;
+		}
+		state->flat_filled = false;
 	}
 
 	ExecClearTuple(slot);
@@ -4230,6 +4378,14 @@ dbe_agg_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	pg_atomic_init_u64(&shared->stripes_pruned, 0);
 	pg_atomic_init_u64(&shared->granules_pruned, 0);
 	pg_atomic_init_u64(&shared->stripes_sma, 0);
+
+	/* Un balde por participante planeado: los workers y el líder. */
+	pg_atomic_init_u32(&shared->next_bucket, 0);
+	shared->nbuckets = (uint32) pcxt->nworkers + 1;
+	pg_atomic_init_u64(&shared->flat_groups, 0);
+	pg_atomic_init_u64(&shared->flat_spilled, 0);
+	pg_atomic_init_u64(&shared->flat_parts, 0);
+	pg_atomic_init_u64(&shared->flat_peak, 0);
 	state->shared = shared;
 }
 
@@ -4249,7 +4405,32 @@ dbe_agg_shutdown(CustomScanState *node)
 	pg_atomic_fetch_add_u64(&state->shared->rows_seen, state->rows_seen);
 	pg_atomic_fetch_add_u64(&state->shared->rows_filtered, state->rows_filtered);
 	pg_atomic_fetch_add_u64(&state->shared->stripes_sma, state->stripes_sma);
-	if (state->cursor != NULL)
+	if (state->flat)
+	{
+		pg_atomic_fetch_add_u64(&state->shared->stripes_pruned,
+								state->flat_stripes_pruned);
+		pg_atomic_fetch_add_u64(&state->shared->granules_pruned,
+								state->flat_granules_pruned);
+		if (state->flatagg != NULL)
+		{
+			uint64		groups;
+			int			parts;
+			uint64		spilled;
+			Size		peak;
+			uint64		cur;
+
+			dbe_flat_stats(state->flatagg, &groups, &parts, &spilled, &peak);
+			pg_atomic_fetch_add_u64(&state->shared->flat_groups, groups);
+			pg_atomic_fetch_add_u64(&state->shared->flat_spilled, spilled);
+			pg_atomic_fetch_add_u64(&state->shared->flat_parts, (uint64) parts);
+			cur = pg_atomic_read_u64(&state->shared->flat_peak);
+			while (cur < (uint64) peak &&
+				   !pg_atomic_compare_exchange_u64(&state->shared->flat_peak,
+												   &cur, (uint64) peak))
+				;
+		}
+	}
+	else if (state->cursor != NULL)
 	{
 		pg_atomic_fetch_add_u64(&state->shared->stripes_pruned,
 								dbe_cursor_stripes_pruned(state->cursor));
@@ -4265,6 +4446,10 @@ dbe_agg_shutdown(CustomScanState *node)
 		state->stripes_pruned = pg_atomic_read_u64(&state->shared->stripes_pruned);
 		state->granules_pruned = pg_atomic_read_u64(&state->shared->granules_pruned);
 		state->stripes_sma = pg_atomic_read_u64(&state->shared->stripes_sma);
+		state->flat_groups_total = pg_atomic_read_u64(&state->shared->flat_groups);
+		state->flat_spilled_total = pg_atomic_read_u64(&state->shared->flat_spilled);
+		state->flat_parts_total = (int) pg_atomic_read_u64(&state->shared->flat_parts);
+		state->flat_peak_total = (Size) pg_atomic_read_u64(&state->shared->flat_peak);
 		state->totals_ready = true;
 	}
 }
@@ -4281,6 +4466,11 @@ dbe_agg_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	pg_atomic_write_u64(&shared->stripes_pruned, 0);
 	pg_atomic_write_u64(&shared->granules_pruned, 0);
 	pg_atomic_write_u64(&shared->stripes_sma, 0);
+	pg_atomic_write_u32(&shared->next_bucket, 0);
+	pg_atomic_write_u64(&shared->flat_groups, 0);
+	pg_atomic_write_u64(&shared->flat_spilled, 0);
+	pg_atomic_write_u64(&shared->flat_parts, 0);
+	pg_atomic_write_u64(&shared->flat_peak, 0);
 }
 
 static void
@@ -4302,6 +4492,9 @@ dbe_agg_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 	if (state->flat)
 	{
 		ExplainPropertyText("Agrupación", "tabla de hash propia", es);
+		if (node->ss.ps.plan->parallel_aware)
+			ExplainPropertyText("Reparto", "grupos por hash entre participantes",
+								es);
 		if (es->analyze && state->flatagg != NULL)
 		{
 			uint64		groups;
@@ -4310,6 +4503,13 @@ dbe_agg_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 			Size		peak;
 
 			dbe_flat_stats(state->flatagg, &groups, &parts, &spilled, &peak);
+			if (state->shared != NULL && state->totals_ready)
+			{
+				groups = state->flat_groups_total;
+				parts = state->flat_parts_total;
+				spilled = state->flat_spilled_total;
+				peak = state->flat_peak_total;
+			}
 			ExplainPropertyInteger("Grupos", NULL, (int64) groups, es);
 			ExplainPropertyInteger("Memoria de la tabla", "kB",
 								   (int64) ((peak + 1023) / 1024), es);

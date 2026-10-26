@@ -269,9 +269,10 @@ Tres hechos del código que ordenan la lista:
        69,6 s. Después, claves de texto con estado parcial por código al
        volcar, y ANALYZE con la muestra repartida por toda la tabla: q35
        1,89×; las 43: media geométrica 0,511, suma 66,6 s. Falta:
-       `count(DISTINCT)`, claves que son expresiones, y un camino paralelo
-       que reparta los grupos por hash entre los workers (cada uno agrega
-       grupos completos y el Gather solo concatena, sin Finalize).
+       `count(DISTINCT)` y claves que son expresiones. Hecho también el
+       camino paralelo que reparte los grupos por hash entre participantes
+       (grupos completos, Gather sin Finalize): q33 2,1×, q34 2,1×, q16
+       1,8×; las 43: media geométrica 0,471, suma 57,3 s.
 10. [ ] **Decodificación por lotes** (`decode_range` de 1024 filas a través
        del airlock) con desempaquetado de bits por ancho estilo FastLanes,
        escrito para que el compilador lo vectorice en NEON.

@@ -92,6 +92,14 @@ extern void dbe_flat_accum(DbeFlatAgg *fa, uint64 *states, const Datum *vals,
 extern void dbe_flat_spill_states(DbeFlatAgg *fa, const Datum *keys,
 								  const bool *keynulls, const uint64 *states);
 
+/*
+ * En paralelo los participantes no se reparten stripes sino grupos: cada
+ * uno toma un balde y agrega solo las filas cuya clave cae en él, así que
+ * emite grupos completos.  El balde de una clave es el mismo en todos.
+ */
+extern uint32 dbe_flat_bucket(DbeFlatAgg *fa, const Datum *keys,
+							  const bool *keynulls, uint32 nbuckets);
+
 /* No hay más filas de entrada: lo que sigue es emitir. */
 extern void dbe_flat_input_done(DbeFlatAgg *fa);
 

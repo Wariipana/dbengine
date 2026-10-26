@@ -303,3 +303,29 @@ base: media geométrica 0,511, suma 109,9 → 66,6 s.
 q34 sigue eligiendo el camino paralelo con Finalize (5,5 s; la tabla propia
 tarda 3,7 s): el estimador de Postgres con 30.000 filas de muestra cree que
 hay 96K URLs y hay 2,6M, y con esa cuenta el Finalize parece barato.
+
+## Resultado: la tabla propia en paralelo, repartiendo grupos
+
+El agregado parcial paralelo reparte stripes: cada worker agrega lo suyo y
+un Finalize junta los estados. Con millones de grupos ese Finalize es la
+mitad de la query (q34: 2,1 de 5,5 s), porque recibe casi una fila por fila
+de entrada.
+
+La tabla propia en paralelo reparte **grupos**: cada participante toma un
+balde del hash de la clave con un contador compartido, recorre la tabla
+entera y agrega solo las filas de su balde. Los grupos salen completos y el
+Gather solo concatena. Lo que se paga es leer la tabla una vez por balde,
+y leer es lo barato. Hay un balde por participante planeado; si se lanzan
+menos workers, los que sobran los toma quien termine antes, así que el
+resultado no depende de cuántos arranquen (el test lo prueba sin workers y
+sin el líder). Con diccionario, el balde se calcula una vez por código.
+
+El costo tuvo dos ajustes. El recorrido se cobra como en los demás caminos
+del nodo, el 35% del scan, porque no arma tuplas. Y el Gather: con
+`parallel_tuple_cost` = 0,1 por fila, 10M grupos costaban más que todo el
+plan, cuando medido cuestan 0,75 s, menos que un `cpu_tuple_cost` por fila
+en estas unidades. Se cobra un `cpu_tuple_cost`.
+
+**q33 7,14 → 3,39 s, q34 5,21 → 2,50 s, q35 3,84 → 2,54 s, q16 1,55 → 0,85
+s, q31 1,19 → 0,80 s, q32 1,55 → 1,06 s.** Las 43 contra la línea base:
+media geométrica 0,471, suma 109,9 → 57,3 s.

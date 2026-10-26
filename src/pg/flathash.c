@@ -736,6 +736,23 @@ dbe_flat_keywords(DbeFlatAgg *fa, const Datum *keys, const bool *keynulls,
 	}
 }
 
+uint32
+dbe_flat_bucket(DbeFlatAgg *fa, const Datum *keys, const bool *keynulls,
+				uint32 nbuckets)
+{
+	uint64		keyw[DBE_FLAT_MAX_KEYS];
+	uint32		nullmask;
+
+	dbe_flat_keywords(fa, keys, keynulls, keyw, &nullmask);
+
+	/*
+	 * Otra mezcla que la del directorio y la de las particiones: si fuera la
+	 * misma, todos los grupos de un balde caerían en las mismas ranuras.
+	 */
+	return (uint32) (murmurhash64(dbe_flat_hash(fa, keyw, nullmask) ^
+								  UINT64CONST(0xC2B2AE3D27D4EB4F)) % nbuckets);
+}
+
 int64
 dbe_flat_find(DbeFlatAgg *fa, const Datum *keys, const bool *keynulls)
 {
@@ -1105,13 +1122,15 @@ dbe_flat_reset(DbeFlatAgg *fa)
 	list_free(fa->pending);
 	fa->pending = NIL;
 
+	/*
+	 * Las cifras del EXPLAIN no se tocan: en paralelo esto se llama entre un
+	 * balde y el siguiente, y son la suma de todos.  Con un rescan se
+	 * acumulan, como las demás cifras con loops > 1.
+	 */
 	dbe_flat_clear_table(fa);
 	fa->level = 0;
 	fa->phase = DBE_FLAT_FILL;
 	fa->emit_pos = 0;
-	fa->groups_out = 0;
-	fa->parts_total = 0;
-	fa->spilled_rows = 0;
 	MemoryContextReset(fa->outcxt);
 }
 
