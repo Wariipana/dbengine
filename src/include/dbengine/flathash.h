@@ -1,0 +1,86 @@
+/*-------------------------------------------------------------------------
+ *
+ * flathash.h
+ *	  GROUP BY por hash con tabla propia y volcado a disco.
+ *
+ * El HashAggregate de Postgres guarda cada grupo como una MinimalTuple con
+ * los estados de transición colgando, y avanza cada agregado con una
+ * llamada por fmgr.  Con muchos grupos eso es lo que pesa, no el disco: en
+ * ClickBench `GROUP BY WatchID, ClientIP` —10M grupos en 10M filas— tarda
+ * lo mismo con work_mem de 4 MB que con 2 GB, unos 175 bytes y más de un
+ * microsegundo por grupo.
+ *
+ * Esta tabla sirve para claves de ancho fijo cuya igualdad es la binaria
+ * (enteros, fechas, timestamps) y para los agregados cuyo estado es un par
+ * de enteros: count, sum y avg de smallint/integer, min y max de enteros.
+ * Una entrada es un arreglo de uint64 —hash, máscara de nulos, claves,
+ * estados— en un arreglo denso, con un directorio de direccionamiento
+ * abierto encima.
+ *
+ * La memoria la acota hash_mem.  Cuando la tabla se llena, los grupos que
+ * ya están se siguen agregando en memoria y las filas de grupos nuevos se
+ * vuelcan a particiones en archivos temporales, elegidas por el hash.  Al
+ * terminar la entrada se emite la tabla, y cada partición se procesa
+ * después igual, con otros bits del hash y volcando de nuevo si hace falta.
+ * Es el hash híbrido de nodeAgg desde PG 13.
+ *
+ *-------------------------------------------------------------------------
+ */
+#ifndef DBENGINE_FLATHASH_H
+#define DBENGINE_FLATHASH_H
+
+#include "postgres.h"
+
+#define DBE_FLAT_MAX_KEYS	8
+
+typedef enum DbeFlatKind
+{
+	DBE_FLAT_COUNT_STAR,		/* count(*) */
+	DBE_FLAT_COUNT,				/* count(col): los no nulos */
+	DBE_FLAT_SUM,				/* sum(int2/int4) → int8 */
+	DBE_FLAT_AVG,				/* avg(int2/int4) → numeric, con int8_avg() */
+	DBE_FLAT_MIN,				/* min de un entero, mismo tipo */
+	DBE_FLAT_MAX
+} DbeFlatKind;
+
+typedef struct DbeFlatAggDef
+{
+	DbeFlatKind kind;
+	int16		vallen;			/* ancho del argumento (por valor); 0 sin argumento */
+} DbeFlatAggDef;
+
+typedef struct DbeFlatAgg DbeFlatAgg;
+
+/*
+ * `keylen`: ancho de cada clave (por valor: 1, 2, 4 u 8).  `budget`: bytes
+ * de memoria para la tabla y los buffers de las particiones.
+ * `est_groups`: la estimación del planner, solo para el tamaño inicial de la
+ * tabla; si es mala, la tabla crece hasta el presupuesto.
+ */
+extern DbeFlatAgg *dbe_flat_create(int nkeys, const int16 *keylen,
+								   int naggs, const DbeFlatAggDef *defs,
+								   Size budget, double est_groups);
+
+/* Una fila.  `vals` y `valnulls` van en el orden de `defs`. */
+extern void dbe_flat_add(DbeFlatAgg *fa, const Datum *keys,
+						 const bool *keynulls, const Datum *vals,
+						 const bool *valnulls);
+
+/* No hay más filas de entrada: lo que sigue es emitir. */
+extern void dbe_flat_input_done(DbeFlatAgg *fa);
+
+/*
+ * El próximo grupo.  Los valores por referencia (el numeric de avg) valen
+ * hasta la llamada siguiente.  false cuando no quedan.
+ */
+extern bool dbe_flat_next(DbeFlatAgg *fa, Datum *keys, bool *keynulls,
+						  Datum *outs, bool *outnulls);
+
+/* Vacía todo para volver a empezar: rescan. */
+extern void dbe_flat_reset(DbeFlatAgg *fa);
+
+/* Para el EXPLAIN. */
+extern void dbe_flat_stats(DbeFlatAgg *fa, uint64 *groups, int *partitions,
+						   uint64 *spilled_rows, Size *peak_bytes);
+
+#endif							/* DBENGINE_FLATHASH_H */

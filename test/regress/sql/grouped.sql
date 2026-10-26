@@ -6,6 +6,10 @@
 -- agrupe por una columna que no está ordenada.
 CREATE EXTENSION dbengine;
 
+-- La tabla de hash propia (flathash.c) agrupa por hash cualquier columna
+-- entera, así que también tomaría los GROUP BY de abajo que prueban que,
+-- sin orden, no se agrupa de corrido.  Se prende en su propia sección.
+SET dbengine.enable_flat_hash = off;
 SET max_parallel_workers_per_gather = 0;
 SET enable_indexscan = off;
 SET enable_indexonlyscan = off;
@@ -376,6 +380,109 @@ RESET max_parallel_workers_per_gather;
 EXPLAIN (COSTS off) SELECT a, count(DISTINCT b) FROM hh GROUP BY a;
 
 DROP TABLE hh, hhh, nulos, nulosh;
+
+-- ===========================================================================
+-- Tabla de hash propia (flathash.c)
+-- ===========================================================================
+-- Claves de ancho fijo y count, sum, avg, min y max de enteros: un agregado
+-- completo y serial que vuelca a disco por su cuenta.  Todo contra heap, con
+-- nulos en claves y argumentos, y un checksum independiente del orden.
+SET dbengine.enable_flat_hash = on;
+SET max_parallel_workers_per_gather = 0;
+CREATE TABLE fx (a int2, b int4, c int8, d date, t timestamp, f bool,
+				 v int4, w int2, s text) USING dbengine_columnar;
+INSERT INTO fx SELECT
+	CASE WHEN i % 17 = 0 THEN NULL ELSE i % 5 END,
+	CASE WHEN i % 13 = 0 THEN NULL ELSE i % 300 END,
+	(i % 7) * 10000000000,
+	date '2020-01-01' + (i % 40),
+	timestamp '2020-01-01' + (i % 11) * interval '1 hour',
+	CASE WHEN i % 19 = 0 THEN NULL ELSE i % 2 = 0 END,
+	CASE WHEN i % 23 = 0 THEN NULL ELSE i * 37 % 1000 - 500 END,
+	(i % 100)::int2,
+	CASE WHEN i % 29 = 0 THEN NULL ELSE 'x' || i % 3 END
+	FROM generate_series(1, 30000) i;
+ANALYZE fx;
+CREATE TABLE fxh AS SELECT * FROM fx;
+
+EXPLAIN (COSTS OFF)
+SELECT a, b, count(*), sum(v), avg(w) FROM fx GROUP BY a, b;
+
+CREATE FUNCTION fx_check(q text) RETURNS bool LANGUAGE plpgsql AS $$
+DECLARE
+	x bigint;
+	y bigint;
+BEGIN
+	EXECUTE format('SELECT sum(hashtext(r::text)::bigint) FROM (%s) r', q) INTO x;
+	EXECUTE format('SELECT sum(hashtext(r::text)::bigint) FROM (%s) r',
+				   replace(q, 'FROM fx', 'FROM fxh')) INTO y;
+	RETURN x IS NOT DISTINCT FROM y;
+END $$;
+
+SELECT fx_check('SELECT a, b, count(*), count(v), count(s), sum(v), sum(w), avg(v), avg(w), min(v), max(w) FROM fx GROUP BY a, b') AS dos_claves;
+SELECT fx_check('SELECT c, d, min(c), max(d), min(t), max(t), count(*) FROM fx GROUP BY c, d') AS int8_fecha;
+SELECT fx_check('SELECT t, f, count(*), sum(v), avg(v) FROM fx GROUP BY t, f') AS timestamp_bool;
+SELECT fx_check('SELECT b, count(*), avg(w) FROM fx WHERE s = ''x1'' AND v > 0 GROUP BY b') AS con_where;
+-- Un grupo sin ningún valor no nulo: sum, avg, min y max dan NULL, count 0.
+SELECT fx_check('SELECT a, count(v), sum(v), avg(v), min(v), max(v) FROM fx WHERE v IS NULL GROUP BY a') AS todo_nulo;
+SELECT a, count(v), sum(v), avg(v), min(v), max(v) FROM fx WHERE v IS NULL GROUP BY a ORDER BY a;
+
+-- Una columna que los stripes viejos no tienen: vale el DEFAULT, como
+-- clave y como argumento.
+ALTER TABLE fx ADD COLUMN k int4 DEFAULT 7;
+ALTER TABLE fxh ADD COLUMN k int4 DEFAULT 7;
+INSERT INTO fx (a, b, k, v) SELECT 1, i % 3, i % 4, i FROM generate_series(1, 100) i;
+INSERT INTO fxh (a, b, k, v) SELECT 1, i % 3, i % 4, i FROM generate_series(1, 100) i;
+SELECT fx_check('SELECT k, count(*), sum(k), min(k) FROM fx GROUP BY k') AS columna_nueva;
+SELECT k, count(*) FROM fx GROUP BY k ORDER BY k;
+
+-- Volcado: con work_mem al mínimo y una estimación mala (se analiza con
+-- pocos grupos y se insertan muchos más), varios niveles de particiones.
+CREATE TABLE fxs (g int8, h int4, v int4) USING dbengine_columnar;
+INSERT INTO fxs SELECT i % 10, i % 3, i FROM generate_series(1, 2000) i;
+ANALYZE fxs;
+INSERT INTO fxs SELECT i, i % 3, i % 1000 FROM generate_series(1, 200000) i;
+INSERT INTO fxs SELECT i * 7, NULL, NULL FROM generate_series(1, 50000) i;
+CREATE TABLE fxsh AS SELECT * FROM fxs;
+SET work_mem = '64kB';
+EXPLAIN (COSTS OFF) SELECT g, h, count(*), sum(v) FROM fxs GROUP BY g, h;
+SELECT count(*) AS grupos, sum(c) AS filas
+FROM (SELECT g, h, count(*) c, sum(v) FROM fxs GROUP BY g, h) x;
+SELECT count(*) AS grupos, sum(c) AS filas
+FROM (SELECT g, h, count(*) c, sum(v) FROM fxsh GROUP BY g, h) x;
+SELECT (SELECT sum(hashtext(g || ':' || coalesce(h, -1) || ':' || c || ':' || coalesce(s, -1) || ':' || coalesce(a::text, '-'))::bigint)
+		FROM (SELECT g, h, count(*) c, sum(v) s, avg(v) a FROM fxs GROUP BY g, h) x)
+	 = (SELECT sum(hashtext(g || ':' || coalesce(h, -1) || ':' || c || ':' || coalesce(s, -1) || ':' || coalesce(a::text, '-'))::bigint)
+		FROM (SELECT g, h, count(*) c, sum(v) s, avg(v) a FROM fxsh GROUP BY g, h) y)
+	AS volcado_igual;
+RESET work_mem;
+
+-- Rescan: del lado de adentro de un nested loop, la tabla se vacía y se
+-- llena de nuevo por cada fila de afuera.
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_material = off;
+SELECT k, (SELECT count(*) FROM (SELECT b, count(*) FROM fx WHERE a = k GROUP BY b) s)
+FROM generate_series(0, 4) k ORDER BY k;
+SELECT k, (SELECT count(*) FROM (SELECT b, count(*) FROM fxh WHERE a = k GROUP BY b) s)
+FROM generate_series(0, 4) k ORDER BY k;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_material;
+
+-- Lo que no entra: un float como clave (0 y -0 son iguales), sum(int8) y un
+-- HAVING, que la tabla no puede dejarle a un Finalize.
+EXPLAIN (COSTS OFF) SELECT v::float8, count(*) FROM fx GROUP BY 1;
+EXPLAIN (COSTS OFF) SELECT a, sum(c) FROM fx GROUP BY a;
+EXPLAIN (COSTS OFF) SELECT a, count(*) FROM fx GROUP BY a HAVING count(*) > 1;
+
+-- Apagada, el plan de antes.
+SET dbengine.enable_flat_hash = off;
+EXPLAIN (COSTS OFF) SELECT a, b, count(*), sum(v), avg(w) FROM fx GROUP BY a, b;
+
+DROP FUNCTION fx_check(text);
+DROP TABLE fx, fxh, fxs, fxsh;
+RESET max_parallel_workers_per_gather;
 DROP TABLE f, fh;
 DROP TABLE g, gh;
 DROP EXTENSION dbengine;

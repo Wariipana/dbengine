@@ -257,12 +257,17 @@ Tres hechos del código que ordenan la lista:
        Ataca q24 (3,3 s, pierde 0,64×), q25–q27 y `SELECT * LIMIT`. Revisa
        el veredicto "estructural" sobre q24. Ref.: DuckDB 1.3 (3–10× con
        LIMIT), Doris y DataFusion (filtros dinámicos al scan).
-9. [ ] **Tabla de hash propia** para claves `int2/4/8` y códigos de
+9. [~] **Tabla de hash propia** para claves `int2/4/8` y códigos de
        diccionario: direccionamiento abierto, estados de agregado en un
        arreglo plano, sin `TupleHashTable` ni `MinimalTuple`; agregación
        parcial por worker. Ataca las queries de mayor tiempo absoluto (q9,
        q10, q16, q17, q19, q31–q36). Revisa "el hash domina": lo que domina
        es la tabla genérica. Ref.: DuckDB; Xue y Marcus 2025.
+       Primera parte hecha (`src/pg/flathash.c`): claves de ancho fijo,
+       count/sum/avg/min/max de enteros, serial y con volcado propio. q33
+       1,83×, q31 1,20×, q32 1,14×; las 43: media geométrica 0,529, suma
+       69,6 s. Falta: claves de texto, `count(DISTINCT)`, claves que son
+       expresiones y el camino paralelo.
 10. [ ] **Decodificación por lotes** (`decode_range` de 1024 filas a través
        del airlock) con desempaquetado de bits por ancho estilo FastLanes,
        escrito para que el compilador lo vectorice en NEON.

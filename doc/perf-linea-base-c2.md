@@ -232,3 +232,42 @@ nada de varlena.
 **q21 689 → 286 ms, q22 725 → 314 ms, q23 953 → 422 ms, q24 1.182 → 752
 ms.** Las 43 contra la línea base: media geométrica 0,544, suma 109,9 →
 75,7 s.
+
+## Resultado: tabla de hash propia (C2.3, ítem 9, primera parte)
+
+Las queries más lentas agrupan millones de grupos, y lo que pesa no es el
+disco: q33 tarda 12,3 s con `work_mem` de 4 MB y 13,5 s con 2 GB. Con 2 GB
+el HashAggregate de Postgres usa 1,75 GB para 10M grupos (175 bytes por
+grupo) y tarda más de un microsegundo por grupo, entre la MinimalTuple, el
+estado de cada agregado colgando y una llamada por fmgr por agregado.
+
+`src/pg/flathash.c` es una tabla plana para claves de ancho fijo con
+igualdad binaria (enteros, fechas, timestamps, bool) y agregados de estado
+entero: `count`, `sum` y `avg` de smallint/integer, `min` y `max` de enteros
+y fechas. Una entrada son unas pocas palabras de 64 bits en un arreglo
+denso con un directorio de direccionamiento abierto, y `avg` sale con el
+mismo `int8_avg()` del core. Es un agregado completo y serial: vuelca a
+disco por su cuenta con el hash híbrido de nodeAgg (los grupos que entran
+se siguen agregando, las filas de grupos nuevos van a particiones por hash,
+y cada partición se procesa después con otros bits). Por eso, a diferencia
+del camino serial con `TupleHashTable`, sí se puede ofrecer sin un Finalize
+arriba.
+
+Dos ajustes que se vieron en el EXPLAIN:
+
+- La capacidad redondeada a potencia de dos dejaba sin usar hasta la mitad
+  del presupuesto, y cada partición de q33 quedaba apenas más grande que la
+  tabla: un segundo nivel entero, 11,5M filas volcadas para 10M de entrada.
+  Solo el directorio tiene que ser potencia de dos.
+- Elegir cuántas particiones abrir según la estimación de grupos sale caro
+  justo cuando la estimación es mala: en q16 dice 39.309 y hay 1,53M, se
+  abrían 4 y se volcaban 14M filas. Ahora se abren siempre todas las que
+  entran en el presupuesto; una de más cuesta un buffer de 8 KB.
+
+**q33 12,27 → 6,71 s, q31 1,35 → 1,13 s, q32 1,69 → 1,49 s**, el resto sin
+cambios. Las 43 contra la línea base: media geométrica 0,529, suma 109,9 →
+69,6 s. GUC `dbengine.enable_flat_hash`.
+
+Lo que no cubre todavía: claves de texto (q34, q35), `count(DISTINCT)` (q10),
+claves que son expresiones (q19, q36) y el camino paralelo. En q33 queda
+además 1,5 s del Sort top-N de Postgres sobre los 10M grupos.

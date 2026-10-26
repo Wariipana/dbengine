@@ -37,6 +37,7 @@ bool		dbe_enable_zonemap_pruning = true;
 bool		dbe_enable_granule_pruning = true;
 bool		dbe_enable_dict_quals = true;
 bool		dbe_enable_scan_dedup = true;
+bool		dbe_enable_flat_hash = true;
 bool		dbe_kernel_readahead = false;
 bool		dbe_enable_learned_zonemaps = false;	/* F5, experimental */
 bool		dbe_enable_adaptive_clustering = false; /* F6 */
@@ -225,6 +226,17 @@ dbe_define_gucs(void)
 							 "(DISTINCT, min, max), el scan descarta las filas iguales "
 							 "dentro de cada stripe y el Sort de arriba ordena menos.",
 							 &dbe_enable_scan_dedup,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("dbengine.enable_flat_hash",
+							 "Agrupa por hash con la tabla propia del agregado vectorizado.",
+							 "Para claves de ancho fijo (enteros, fechas) y count, sum, avg, "
+							 "min y max de enteros: una tabla plana sin tuplas por grupo, "
+							 "que vuelca a disco por su cuenta.",
+							 &dbe_enable_flat_hash,
 							 true,
 							 PGC_USERSET,
 							 0,

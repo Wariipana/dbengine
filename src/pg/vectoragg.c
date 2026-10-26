@@ -76,6 +76,7 @@
 #include "dbengine/customscan.h"
 #include "dbengine/dbengine.h"
 #include "dbengine/dictqual.h"
+#include "dbengine/flathash.h"
 #include "dbengine/zonemap.h"
 
 #define DBE_AGG_NAME "DbengineVectorAgg"
@@ -322,6 +323,21 @@ typedef struct DbeVectorAggState
 	MemoryContext hash_tempcxt;
 	MemoryContext dictcxt;		/* cache de códigos, se resetea por stripe */
 	Oid		   *group_eqops;
+
+	/*
+	 * Agrupación por hash con la tabla propia (flathash.h): claves de
+	 * ancho fijo y agregados de estado entero.  Es un agregado completo, no
+	 * parcial, y vuelca a disco por su cuenta.
+	 */
+	bool		flat;
+	DbeFlatAgg *flatagg;
+	bool		flat_filled;
+	Datum	   *flat_keys;
+	bool	   *flat_keynulls;
+	Datum	   *flat_vals;		/* uno por agregado de verdad, en orden */
+	bool	   *flat_valnulls;
+	Datum	   *flat_outs;
+	bool	   *flat_outnulls;
 } DbeVectorAggState;
 
 /*
@@ -499,6 +515,152 @@ dbe_agg_supported(Aggref *ref, Index relid, AttrNumber *attnum,
 	}
 
 	return true;
+}
+
+/*
+ * ¿La columna puede ser clave de la tabla propia (flathash.h)?  Tiene que
+ * ser por valor y de ancho fijo, y su igualdad la binaria: dos Datum iguales
+ * si y solo si los valores son iguales para el operador del GROUP BY.  Por
+ * eso los float quedan afuera (0 y -0 son iguales, NaN también), y el
+ * operador tiene que ser el = del tipo y no otro.
+ */
+static bool
+dbe_flat_key_ok(Oid typid, Oid eqop)
+{
+	TypeCacheEntry *tc;
+
+	switch (typid)
+	{
+		case INT2OID:
+		case INT4OID:
+		case INT8OID:
+		case DATEOID:
+		case TIMESTAMPOID:
+		case TIMESTAMPTZOID:
+		case BOOLOID:
+		case OIDOID:
+			break;
+		default:
+			return false;
+	}
+	tc = lookup_type_cache(typid, TYPECACHE_EQ_OPR);
+	return OidIsValid(eqop) && eqop == tc->eq_opr;
+}
+
+/*
+ * ¿El agregado tiene un estado que la tabla propia sabe llevar?  Se
+ * reconoce por las funciones de pg_aggregate y no por el nombre: un
+ * agregado de usuario que se llame sum no las tiene.
+ *
+ *   count(*)                    int8inc
+ *   count(col)                  int8inc_any, cualquier tipo
+ *   sum(int2/int4)              int2_sum / int4_sum → int8
+ *   avg(int2/int4)              int2/int4_avg_accum + int8_avg → numeric
+ *   min/max de enteros y fechas aggsortop = el < o > del tipo
+ *
+ * El argumento tiene que ser la columna sola.  `relid` 0 no comprueba de
+ * qué relación es el Var: en ejecución los Var ya pasaron por setrefs.c.
+ */
+static bool
+dbe_flat_agg_def(Aggref *ref, Index relid, DbeFlatAggDef *def)
+{
+	HeapTuple	tup;
+	Form_pg_aggregate aggform;
+	Var		   *var;
+	Oid			transfn;
+	Oid			finalfn;
+	Oid			sortop;
+	bool		ok = false;
+
+	if (ref->aggorder != NIL || ref->aggdistinct != NIL ||
+		ref->aggfilter != NULL || ref->aggvariadic ||
+		ref->aggkind != AGGKIND_NORMAL)
+		return false;
+
+	tup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(ref->aggfnoid));
+	if (!HeapTupleIsValid(tup))
+		return false;
+	aggform = (Form_pg_aggregate) GETSTRUCT(tup);
+	transfn = aggform->aggtransfn;
+	finalfn = aggform->aggfinalfn;
+	sortop = aggform->aggsortop;
+	ReleaseSysCache(tup);
+
+	if (ref->aggstar)
+	{
+		def->kind = DBE_FLAT_COUNT_STAR;
+		def->vallen = 0;
+		return transfn == F_INT8INC && !OidIsValid(finalfn);
+	}
+
+	if (list_length(ref->args) != 1)
+		return false;
+	var = (Var *) ((TargetEntry *) linitial(ref->args))->expr;
+	if (!IsA(var, Var) || var->varattno <= 0 || var->varlevelsup != 0 ||
+		(relid != 0 && var->varno != (int) relid))
+		return false;
+
+	if (transfn == F_INT8INC_ANY && !OidIsValid(finalfn))
+	{
+		def->kind = DBE_FLAT_COUNT;
+		def->vallen = 0;		/* solo importa si es nulo */
+		return true;
+	}
+
+	switch (var->vartype)
+	{
+		case INT2OID:
+			def->vallen = 2;
+			ok = (transfn == F_INT2_SUM || transfn == F_INT2_AVG_ACCUM);
+			break;
+		case INT4OID:
+		case DATEOID:
+			def->vallen = 4;
+			ok = (var->vartype == INT4OID &&
+				  (transfn == F_INT4_SUM || transfn == F_INT4_AVG_ACCUM));
+			break;
+		case INT8OID:
+		case TIMESTAMPOID:
+		case TIMESTAMPTZOID:
+			def->vallen = 8;
+			break;
+		default:
+			return false;
+	}
+	if (ok)
+	{
+		if ((transfn == F_INT2_SUM || transfn == F_INT4_SUM) &&
+			!OidIsValid(finalfn))
+		{
+			def->kind = DBE_FLAT_SUM;
+			return true;
+		}
+		if ((transfn == F_INT2_AVG_ACCUM || transfn == F_INT4_AVG_ACCUM) &&
+			finalfn == F_INT8_AVG)
+		{
+			def->kind = DBE_FLAT_AVG;
+			return true;
+		}
+		return false;
+	}
+
+	if (OidIsValid(sortop) && ref->aggtype == var->vartype)
+	{
+		TypeCacheEntry *tc = lookup_type_cache(var->vartype,
+											   TYPECACHE_LT_OPR | TYPECACHE_GT_OPR);
+
+		if (sortop == tc->lt_opr)
+		{
+			def->kind = DBE_FLAT_MIN;
+			return true;
+		}
+		if (sortop == tc->gt_opr)
+		{
+			def->kind = DBE_FLAT_MAX;
+			return true;
+		}
+	}
+	return false;
 }
 
 /* ¿Todos los agregados del tlist son MIN o MAX? */
@@ -839,6 +1001,9 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	int			n_distinct = 0;
 	bool		all_metadata = false;
 	Node	   *having = NULL;
+	bool		flat_ok;
+	bool		partial_ok = true;
+	int			nflat_aggs = 0;
 
 	if (prev_create_upper_paths_hook)
 		prev_create_upper_paths_hook(root, stage, input_rel, output_rel, extra);
@@ -972,6 +1137,12 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	 * agrupa.  Cualquier otra cosa —una expresión sobre la columna de
 	 * agrupación, por ejemplo— cae al plan normal.
 	 */
+	/*
+	 * La tabla propia es un agregado completo y serial: no puede dejarle el
+	 * HAVING a un Finalize.
+	 */
+	flat_ok = grouped && hashed && having == NULL && dbe_enable_flat_hash;
+
 	tlist = make_tlist_from_pathtarget(output_rel->reltarget);
 	foreach(lc, tlist)
 	{
@@ -981,10 +1152,15 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		if (IsA(tle->expr, Aggref))
 		{
 			bool		is_distinct;
+			DbeFlatAggDef def;
 
 			if (!dbe_agg_supported((Aggref *) tle->expr, input_rel->relid,
 								   &attnum, grouped, &is_distinct))
 				return;
+			if (flat_ok &&
+				(!dbe_flat_agg_def((Aggref *) tle->expr, input_rel->relid, &def) ||
+				 ++nflat_aggs > 32))
+				flat_ok = false;
 			agg_attnums = lappend_int(agg_attnums, attnum);
 			if (is_distinct)
 				n_distinct++;
@@ -1011,6 +1187,8 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 												parse->groupClause);
 			if (sgc == NULL || !OidIsValid(sgc->eqop))
 				return;
+			if (flat_ok && !dbe_flat_key_ok(var->vartype, sgc->eqop))
+				flat_ok = false;
 
 			agg_attnums = lappend_int(agg_attnums, var->varattno);
 			group_attnums = lappend_int(group_attnums, var->varattno);
@@ -1037,6 +1215,8 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	 */
 	if (grouped && list_length(group_attnums) != list_length(parse->groupClause))
 		return;
+	if (list_length(group_attnums) > DBE_FLAT_MAX_KEYS)
+		flat_ok = false;
 
 	/*
 	 * Los agregados del HAVING tienen que salir del parcial aunque no estén
@@ -1114,9 +1294,11 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 				(double) work_mem * 1024.0;
 
 			if (!fits && ngroups > input_path->rows * 0.5)
-				return;
+				partial_ok = false;
 		}
 	}
+	if (!partial_ok && !flat_ok)
+		return;
 
 	relation = table_open(rte->relid, NoLock);
 	if (!dbe_is_columnar_relation(relation))
@@ -1319,6 +1501,42 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 			add_path(output_rel, (Path *) path);
 
 		/*
+		 * Con la tabla propia el camino serial con hash sí se ofrece: vuelca
+		 * a disco por su cuenta, así que una estimación mala cuesta un nivel
+		 * más de particiones y no la memoria.  Lleva su propia copia de
+		 * custom_private, con la marca 2 y la estimación de grupos, porque
+		 * `private` sigue siendo la del camino paralelo.
+		 */
+		if (grouped && hashed && flat_ok)
+		{
+			double		in_rows = input_path->rows;
+			double		nagg = (double) list_length(agg_attnums);
+			Size		entry = sizeof(uint64) * (2 + list_length(agg_attnums) * 2) + 8;
+			double		hash_mem = (double) get_hash_memory_limit();
+			List	   *fprivate = list_copy(private);
+
+			llast(fprivate) = makeInteger(2);
+			fprivate = lappend(fprivate,
+							   makeInteger((int) Min(ngroups, (double) PG_INT32_MAX)));
+			path->custom_private = fprivate;
+			path->path.pathkeys = NIL;	/* sale en el orden de la tabla */
+
+			/*
+			 * Una búsqueda por fila en una tabla plana, sin armar tuplas ni
+			 * llamar por fmgr.  Si los grupos no entran, casi todas las
+			 * filas se escriben y se leen una vez más.
+			 */
+			path->path.startup_cost = input_path->total_cost +
+				cpu_operator_cost * nagg * 0.3 * in_rows;
+			if (ngroups * (double) entry > hash_mem)
+				path->path.startup_cost += 2.0 * seq_page_cost *
+					(in_rows * (double) (entry / 2) / BLCKSZ);
+			path->path.total_cost = path->path.startup_cost +
+				cpu_tuple_cost * ngroups;
+			add_path(output_rel, (Path *) path);
+		}
+
+		/*
 		 * El camino paralelo no sabe agrupar: cada worker ve un subconjunto
 		 * de stripes, así que un grupo puede quedar partido entre varios y
 		 * habría que emitir estados de transición parciales para que un
@@ -1330,7 +1548,8 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		 * conteos parciales daría de más, y combinar los conjuntos es otra
 		 * cosa que este nodo no emite.
 		 */
-		if (n_distinct == 0 && !all_metadata && input_rel->consider_parallel &&
+		if (partial_ok && n_distinct == 0 && !all_metadata &&
+			input_rel->consider_parallel &&
 			output_rel->consider_parallel && extra != NULL &&
 			((GroupPathExtraData *) extra)->partial_costs_set)
 			dbe_add_parallel_agg_path(root, input_rel, output_rel,
@@ -2142,6 +2361,51 @@ dbe_agg_try_metadata(DbeVectorAggState *state, TupleTableSlot *slot)
 	return true;
 }
 
+/*
+ * Prepara la tabla propia.  El planner ya comprobó que cada agregado tiene
+ * un estado que ella sabe llevar; si acá no, es que el plan y el código
+ * dejaron de coincidir, y seguir daría resultados de otro agregado.
+ */
+static void
+dbe_agg_begin_flat(DbeVectorAggState *state, CustomScan *cscan, int eflags)
+{
+	DbeFlatAggDef *defs = (DbeFlatAggDef *)
+		palloc0(sizeof(DbeFlatAggDef) * Max(state->naggs, 1));
+	int			n = 0;
+	ListCell   *lc;
+	double		est = (double) intVal(list_nth(cscan->custom_private, 7));
+
+	foreach(lc, cscan->custom_scan_tlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+
+		if (!IsA(tle->expr, Aggref))
+			continue;
+		if (!dbe_flat_agg_def((Aggref *) tle->expr, 0, &defs[n]))
+			elog(ERROR, "dbengine: el agregado %d no sirve para la tabla propia",
+				 n + 1);
+		n++;
+	}
+
+	/* Un EXPLAIN sin ANALYZE no ejecuta: no hace falta la tabla. */
+	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+	{
+		pfree(defs);
+		return;
+	}
+
+	state->flatagg = dbe_flat_create(state->ngroupcols, state->group_typlen,
+									 n, defs, get_hash_memory_limit(), est);
+	state->flat_filled = false;
+	state->flat_keys = (Datum *) palloc0(sizeof(Datum) * state->ngroupcols);
+	state->flat_keynulls = (bool *) palloc0(sizeof(bool) * state->ngroupcols);
+	state->flat_vals = (Datum *) palloc0(sizeof(Datum) * Max(n, 1));
+	state->flat_valnulls = (bool *) palloc0(sizeof(bool) * Max(n, 1));
+	state->flat_outs = (Datum *) palloc0(sizeof(Datum) * Max(n, 1));
+	state->flat_outnulls = (bool *) palloc0(sizeof(bool) * Max(n, 1));
+	pfree(defs);
+}
+
 static void
 dbe_agg_begin(CustomScanState *node, EState *estate, int eflags)
 {
@@ -2285,7 +2549,10 @@ dbe_agg_begin(CustomScanState *node, EState *estate, int eflags)
 		state->in_stripe = false;
 
 		state->hashed = (intVal(list_nth(cscan->custom_private, 6)) != 0);
-		if (state->hashed)
+		state->flat = (intVal(list_nth(cscan->custom_private, 6)) == 2);
+		if (state->flat)
+			dbe_agg_begin_flat(state, cscan, eflags);
+		else if (state->hashed)
 		{
 			List	   *eqops = (List *) list_nth(cscan->custom_private, 5);
 			TupleDesc	gdesc = CreateTemplateTupleDesc(state->ngroupcols);
@@ -3194,6 +3461,144 @@ dbe_agg_exec_hashed(CustomScanState *node)
 	return slot;
 }
 
+/*
+ * Llena la tabla propia con todo el scan.  Es el mismo recorrido que
+ * dbe_agg_fill_hash() sin el corte por memoria: la tabla vuelca sola.
+ */
+static void
+dbe_agg_fill_flat(DbeVectorAggState *state)
+{
+	int			i;
+
+	for (;;)
+	{
+		DbeStripeTake take;
+		uint64		nrows;
+		bool		all_visible;
+		uint64		row;
+
+		CHECK_FOR_INTERRUPTS();
+		take = dbe_agg_take_stripe(state);
+		if (take == DBE_TAKE_DONE)
+			break;
+		if (take == DBE_TAKE_SKIP)
+			continue;
+
+		nrows = dbe_cursor_stripe_rows(state->cursor);
+		all_visible = dbe_cursor_stripe_fully_visible(state->cursor);
+
+		for (i = 0; i < state->naggs; i++)
+		{
+			DbeAggState *agg = &state->aggs[i];
+
+			if (agg->is_group)
+				continue;
+			agg->has_vector = !agg->is_count_star &&
+				dbe_cursor_column(state->cursor, agg->attnum, &agg->vec);
+		}
+		for (i = 0; i < state->ngroupcols; i++)
+			state->groupvec_ok[i] =
+				dbe_cursor_column(state->cursor, state->groupcols[i],
+								  &state->groupvecs[i]);
+		for (i = 0; i < state->nqualcols; i++)
+			state->qualvec_ok[i] =
+				dbe_cursor_column(state->cursor, state->qualcols[i],
+								  &state->qualvecs[i]);
+
+		for (row = dbe_cursor_next_live_row(state->cursor, 0); row < nrows;
+			 row = dbe_cursor_next_live_row(state->cursor, row + 1))
+		{
+			int			v = 0;
+
+			if (!all_visible &&
+				!dbe_cursor_row_is_visible(state->cursor, row))
+				continue;
+			if (state->qual != NULL && !dbe_agg_row_passes(state, row))
+			{
+				state->rows_filtered++;
+				continue;
+			}
+			state->rows_seen++;
+
+			for (i = 0; i < state->ngroupcols; i++)
+			{
+				/* Columna que el stripe no tiene: su valor por omisión. */
+				if (!state->groupvec_ok[i])
+					dbe_agg_missing_value(state, state->groupcols[i],
+										  &state->flat_keys[i],
+										  &state->flat_keynulls[i]);
+				else
+					dbe_vec_value(&state->groupvecs[i], row,
+								  state->group_typbyval[i],
+								  state->group_typlen[i],
+								  &state->flat_keys[i],
+								  &state->flat_keynulls[i]);
+			}
+			for (i = 0; i < state->naggs; i++)
+			{
+				DbeAggState *agg = &state->aggs[i];
+
+				if (agg->is_group)
+					continue;
+				if (agg->is_count_star)
+				{
+					state->flat_vals[v] = (Datum) 0;
+					state->flat_valnulls[v] = false;
+				}
+				else
+					dbe_agg_value(state, agg, row, &state->flat_vals[v],
+								  &state->flat_valnulls[v]);
+				v++;
+			}
+			dbe_flat_add(state->flatagg, state->flat_keys,
+						 state->flat_keynulls, state->flat_vals,
+						 state->flat_valnulls);
+		}
+	}
+	dbe_flat_input_done(state->flatagg);
+	state->flat_filled = true;
+}
+
+static TupleTableSlot *
+dbe_agg_exec_flat(CustomScanState *node)
+{
+	DbeVectorAggState *state = (DbeVectorAggState *) node;
+	TupleTableSlot *slot = node->ss.ps.ps_ResultTupleSlot;
+	int			i;
+	int			v = 0;
+
+	if (state->done)
+		return NULL;
+	if (!state->flat_filled)
+		dbe_agg_fill_flat(state);
+
+	if (!dbe_flat_next(state->flatagg, state->flat_keys, state->flat_keynulls,
+					   state->flat_outs, state->flat_outnulls))
+	{
+		state->done = true;
+		return NULL;
+	}
+
+	ExecClearTuple(slot);
+	for (i = 0; i < state->naggs; i++)
+	{
+		DbeAggState *agg = &state->aggs[i];
+
+		if (agg->is_group)
+		{
+			slot->tts_values[i] = state->flat_keys[agg->group_idx];
+			slot->tts_isnull[i] = state->flat_keynulls[agg->group_idx];
+			continue;
+		}
+		slot->tts_values[i] = state->flat_outs[v];
+		slot->tts_isnull[i] = state->flat_outnulls[v];
+		v++;
+	}
+	ExecStoreVirtualTuple(slot);
+	ExecMaterializeSlot(slot);
+	return slot;
+}
+
 static TupleTableSlot *
 dbe_agg_exec_grouped(CustomScanState *node)
 {
@@ -3315,8 +3720,12 @@ dbe_agg_exec(CustomScanState *node)
 	int			i;
 
 	if (state->ngroupcols > 0)
+	{
+		if (state->flat)
+			return dbe_agg_exec_flat(node);
 		return state->hashed ? dbe_agg_exec_hashed(node)
 			: dbe_agg_exec_grouped(node);
+	}
 
 	if (state->done)
 		return NULL;
@@ -3569,6 +3978,12 @@ dbe_agg_rescan(CustomScanState *node)
 		agg->init_nothing_yet = agg->nothing_yet;
 	}
 
+	if (state->flat && state->flatagg != NULL)
+	{
+		dbe_flat_reset(state->flatagg);
+		state->flat_filled = false;
+	}
+
 	/* El recorrido por grupos arranca de cero. */
 	state->have_group = false;
 	state->in_stripe = false;
@@ -3681,6 +4096,28 @@ dbe_agg_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 
 	ExplainPropertyInteger("Agregados empujados al scan", NULL,
 						   state->naggs, es);
+	if (state->flat)
+	{
+		ExplainPropertyText("Agrupación", "tabla de hash propia", es);
+		if (es->analyze && state->flatagg != NULL)
+		{
+			uint64		groups;
+			int			parts;
+			uint64		spilled;
+			Size		peak;
+
+			dbe_flat_stats(state->flatagg, &groups, &parts, &spilled, &peak);
+			ExplainPropertyInteger("Grupos", NULL, (int64) groups, es);
+			ExplainPropertyInteger("Memoria de la tabla", "kB",
+								   (int64) ((peak + 1023) / 1024), es);
+			if (parts > 0 || es->format != EXPLAIN_FORMAT_TEXT)
+			{
+				ExplainPropertyInteger("Particiones volcadas", NULL, parts, es);
+				ExplainPropertyInteger("Filas volcadas", NULL,
+									   (int64) spilled, es);
+			}
+		}
+	}
 
 	if (quals != NIL)
 	{
