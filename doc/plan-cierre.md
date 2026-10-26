@@ -188,11 +188,13 @@ Tres hechos del código que ordenan la lista:
        worker y **0,735 con io_uring**; q21 3,0×, q22 2,8×, q25 4,6×, q4
        3,5×. En caliente, sin cambios. La `BufferAccessStrategy` queda
        pendiente: con 128 MB de `shared_buffers` la tabla no entra igual.
-3. [ ] **`count(DISTINCT)` por unión de diccionarios**: en un segmento con
+3. [~] **`count(DISTINCT)` por unión de diccionarios**: en un segmento con
        diccionario, las entradas *son* los valores distintos del stripe; sin
        filtro y con todo visible, alcanza con unir diccionarios (q6). Y
        combinar los conjuntos parciales para correr en paralelo (q5, que
-       hoy pierde 0,79×).
+       hoy pierde 0,79×). Hecho a medias: dentro de un stripe cada código
+       se busca una vez y sin diccionario se saltea la fila que repite la
+       anterior (q5 1,16 → 0,61 s, q6 1,62 → 0,53 s). Falta el paralelo.
 4. [ ] **Experimento: clustering multicolumna (Z-order / Hilbert)** en
        `relation_copy_for_cluster`, con las columnas normalizadas por
        cuantiles. Revisa "una tabla se ordena por una sola cosa":
@@ -244,9 +246,12 @@ Tres hechos del código que ordenan la lista:
        patrones de literales y `%` comparados por bytes con `memmem`. q21
        2,4×, q22 2,2×, q23 2,3×, q24 1,6× sobre lo que había; las 43: media
        geométrica 0,544, suma 75,7 s. Ver perf-linea-base-c2.md.
-7. [ ] **Predicados sobre enteros comprimidos**: comparar contra
+7. [~] **Predicados sobre enteros comprimidos**: comparar contra
        `const − min` en FOR sin reconstruir el valor, y salir con un vector
-       de selección; `ExecQual` queda para el residuo.
+       de selección; `ExecQual` queda para el residuo. Hecho el vector de
+       selección: `col op const` sobre enteros y fechas se evalúa sobre el
+       arreglo del stripe (q2 4,2×). Falta compararlo sin descomprimir y
+       aplicarlo también en `DbengineColumnarScan`, que sigue fila por fila.
 
 ### C2.3 — Lo grueso
 
@@ -312,6 +317,135 @@ en caliente contra heap, junto a Citus columnar y pg_duckdb **en la misma
 máquina**, con las 43 queries verificadas contra heap. Las que sigan
 perdiendo, explicadas.
 
+## C5 — BI y data warehouse
+
+El objetivo del motor es acelerar consultas analíticas de un data
+warehouse, y las herramientas de BI (Power BI en DirectQuery, Tableau,
+Metabase, Superset) no mandan SQL con la forma de ClickBench: modelo
+estrella, expresiones de fecha, montos `numeric`, `IN` largos y top N. El
+bloque sale de una revisión externa del proyecto, contrastada con el código
+el 2026-10-26.
+
+**Lo que ya está y no hace falta tocar.** Los clientes externos (psycopg,
+Npgsql, JDBC) hablan el protocolo de siempre: el motor corre dentro del
+servidor y el planner elige sus caminos solo. `shared_preload_libraries`
+hace falta solo para el background worker de mantenimiento; los scans y
+la agregación andan sin él. Los datos van al WAL (`log_newpage_buffer`),
+y hay tests de recuperación tras un crash (`test/crash`) y de
+`pg_dump`/restore entre clusters (`make check-dump`). Las tablas columnares
+funcionan como particiones (`columnar_compat`, `columnar_scan`) y guardan
+`jsonb`. `ALTER TABLE ... SET ACCESS METHOD dbengine_columnar` convierte una
+tabla heap existente conservando la clave primaria (probado a mano; falta
+el test). Ya hechos en C2: claves que son expresiones sobre una columna
+(`date_trunc`, `extract`, aritmética) y `count(DISTINCT)` por grupo y
+global.
+
+**Cómo se trabaja este bloque.** Lo mismo que en C2: cada cambio se mide
+contra las 43 de ClickBench y contra el set de BI-0, no solo contra lo que
+toca; cada camino nuevo lleva su GUC; la generalidad nueva va en caminos
+aparte para no cargar el lazo caliente (q18 tardaba 11% más con una rama
+de más); y los caminos que dependen de estimaciones arrancan con umbrales
+conservadores.
+
+### C5.0 — Medir antes de construir
+
+1. [ ] **Set de consultas de BI** (15 a 20) con un esquema estrella chico
+       sobre los datos de ClickBench —hechos más dimensiones de fecha,
+       región y buscador— y la forma que genera Power BI: subconsultas con
+       alias, `date_trunc`, `sum(numeric)`, `IN` de cientos de valores,
+       top N. Línea base propia, medida como ClickBench, y la lista de las
+       que caen al plan de Postgres. Si se puede, capturar el SQL real de
+       Power BI con `pg_stat_statements` o `auto_explain`.
+2. [ ] **Test de integración con psycopg 3** (3.3.4 instalado): conexión,
+       `CREATE TABLE ... USING`, `COPY` de texto y binario, agregados,
+       prepared statements y cursores del lado del servidor. En la CI.
+3. [ ] **Test de conversión**: `SET ACCESS METHOD` ida y vuelta, con
+       índices, permisos, defaults y vistas dependientes, en la suite.
+4. [ ] **Concurrencia**: 10 a 30 consultas a la vez con pgbench, como un
+       dashboard. Mirar cómo se reparten los workers, el `hash_mem` total
+       y si los costos calibrados para una consulta sola siguen valiendo.
+
+### C5.1 — Lo que saca a las consultas de BI del camino rápido
+
+5. [ ] **Medidas en `numeric` de escala fija**: `sum`/`avg` como enteros
+       escalados en int128 en la tabla propia. Sin esto casi cualquier
+       monto de dinero cae al HashAggregate de Postgres.
+6. [ ] **`sum`/`avg` de `bigint`** en la tabla propia y por SMA (q4).
+7. [ ] **Agregados sobre expresiones de varias columnas**:
+       `sum(precio * cantidad)`, `sum(CASE WHEN ... THEN monto END)`. Hoy
+       el argumento puede ser una expresión sobre una sola columna.
+8. [ ] **Agregados de `float8`/`real`** (métricas de series de tiempo),
+       con la suma en el mismo orden que Postgres o explicando la
+       diferencia de redondeo.
+9. [ ] **`IN (lista)`**: sobre texto ya se decide por código del
+       diccionario; falta sobre enteros en el arreglo del stripe
+       (`ScalarArrayOpExpr`), y descartar stripes con el Bloom para cada
+       valor de la lista.
+10. [ ] **Claves `CASE WHEN` y `coalesce`** sobre varias columnas, y un
+        `extract` sobre `date`.
+
+### C5.2 — Modelo estrella
+
+Revisa dos decisiones de "Descartado o para más adelante" de C2: los
+filtros de join en tiempo de ejecución y la agregación debajo del join.
+En BI son el caso normal, no la excepción. Es lo de más impacto y más
+riesgo, y depende de buenas estimaciones de ndistinct.
+
+11. [ ] **Tamaño del diccionario en el catálogo** para estimar ndistinct
+        sin muestrear (también pedido en C2).
+12. [ ] **Filtro de la dimensión empujado al scan de hechos**: el conjunto
+        de claves de la dimensión filtrada descarta stripes por zone map y
+        Bloom y filas por el vector de selección. Solo si es selectivo.
+13. [ ] **Agregación debajo del join**: agrupar los hechos por la clave
+        foránea con VectorAgg y unir el resultado, chico, con la
+        dimensión. Solo si la reducción estimada es clara. PG 19 trae
+        *eager aggregation*: ver si alcanza con ofrecer el nodo como
+        agregado parcial ahí.
+
+### C5.3 — Después
+
+14. [ ] **Regex rápido** para `regexp_replace`, `~` y `regexp_match` con
+        patrón constante (q29: 11,9 s, todo en el motor de regex de
+        Postgres). RE2, versión estable más reciente, del lado C++. Su
+        semántica no es la de Postgres (ARE), así que solo para un
+        subconjunto que un analizador propio garantice equivalente: sin
+        backreferences, sin clases que dependan del locale, sin
+        alternativas donde "la más larga" y "la primera" difieran. El resto,
+        con el motor de Postgres. Tests que comparen los dos motores, y
+        GUC. Suma una dependencia externa a la CI y al empaquetado.
+15. [ ] **Funciones de ventana**: que el scan entregue las filas ya
+        ordenadas a `OVER (...)` cuando hay clustering; no reimplementar la
+        ventana.
+16. [ ] **Time travel**: verificar que las consultas sobre una versión
+        pasada usen VectorAgg y el pruning.
+17. [ ] **Ingesta continua**: lotes chicos dejan stripes chicos;
+        compactación automática en el background worker, o documentada.
+18. [ ] **Compresión de floats y timestamps casi ordenados** (delta,
+        Gorilla): hoy solo hay crudo, RLE, FOR y diccionario (ver ítem 11
+        de C2).
+19. [ ] **Salida en Arrow** (ADBC) para llevar columnas a pandas o polars.
+        Grande; solo si sobra tiempo.
+
+### C5.4 — Adopción en una instancia existente
+
+Instalar ya es "plug and play" en una instancia propia con PG 18 o 19: se
+copia el `.so`, se agrega a `shared_preload_libraries` si se quiere el
+background worker, y `CREATE EXTENSION`. Las tablas heap no cambian. No
+sirve en servicios gestionados (RDS, Cloud SQL, Azure), que no dejan
+instalar extensiones propias. Lo que falta para convertir sin fricción:
+
+20. [ ] **C1** (DELETE, UPDATE, MERGE): sin eso solo convienen las tablas de
+        solo inserción o históricas.
+21. [ ] **Imagen Docker y paquetes** (deb, PGXN) además del release `1.0.0`
+        de C1.
+22. [ ] **`dbengine.convert(tabla)`**: conversión en línea con verificación
+        de conteos, y un asesor que, con `workload_stats`, diga qué tablas
+        conviene pasar a columnar y cuáles no.
+23. [ ] **Réplica por streaming y PITR**: test TAP con un standby que lea
+        tablas columnares. Los datos van al WAL, pero no está probado.
+24. [ ] **Interruptor global** (`dbengine.enable_*` existe por camino):
+        documentar cómo apagar todo en producción si algo se porta mal.
+
 ## C3 — Calidad de código (≈ 1–2 semanas, en paralelo)
 
 - [ ] **Rediseñar `scancols.c`**: las columnas del plan viajan con el scan
@@ -354,8 +488,10 @@ Lo que convierte el trabajo en portfolio.
 
 ## Orden sugerido
 
-C0 ✅ → **C2 (rendimiento)** → C1 (DELETE/UPDATE) → C4, con C3 intercalado
-cuando un cambio toque el archivo en cuestión. El foco pasó a ser que el
+C0 ✅ → **C2 (rendimiento)** → C5.0 y C5.1 (BI) → C1 (DELETE/UPDATE) →
+C5.2 (estrella) → C4, con C3 intercalado cuando un cambio toque el archivo
+en cuestión. Lo que queda de C2 que más sirve a BI va primero: top-N (8),
+el prefiltro en `DbengineColumnarScan` (7) y `sum(bigint)` (1). El foco pasó a ser que el
 motor mejore el rendimiento de verdad, así que C2 va primero; C1 después,
 porque DELETE obliga a revisar todos los atajos por metadatos (SMA, zone
 maps, `count(*)`), y conviene hacerlo una vez con la lista completa de
