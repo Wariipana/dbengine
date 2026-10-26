@@ -20,11 +20,14 @@
  */
 #include "postgres.h"
 
+#include "catalog/pg_type.h"
 #include "executor/executor.h"
+#include "mb/pg_wchar.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
 #include "optimizer/optimizer.h"
 #include "utils/datum.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 
@@ -35,11 +38,27 @@
 #define DQ_PASS		1
 #define DQ_FAIL		2
 
+/*
+ * `col LIKE 'patrón'` con un patrón hecho solo de literales y `%`: las
+ * piezas literales en orden, y si el patrón está anclado al principio o al
+ * final (no empieza o no termina con `%`).
+ */
+typedef struct DbeLikeMatch
+{
+	bool		negate;			/* NOT LIKE */
+	bool		anchor_start;
+	bool		anchor_end;
+	int			npieces;
+	const char **pieces;
+	int		   *lens;
+} DbeLikeMatch;
+
 typedef struct DbeDictClause
 {
 	AttrNumber	attnum;
 	ExprState  *qual;
 	bool		lazy;			/* el slot no la trae: pedirla con fill */
+	DbeLikeMatch *like;			/* se evalúa sobre los bytes, o NULL */
 
 	uint64		generation;		/* de dbe_cursor_reader(); 0 = nunca */
 	bool		is_dict;
@@ -98,6 +117,187 @@ dbe_dictqual_column(Node *clause, Index varno, TupleDesc desc)
 	return attnum;
 }
 
+/*
+ * ¿Es `col LIKE 'patrón'` o `col NOT LIKE 'patrón'` sobre la columna, con
+ * un patrón que se puede comparar byte a byte?  Es la forma de q21 a q24
+ * de ClickBench: `URL LIKE '%google%'`.
+ *
+ * textlike() hace lo mismo, pero por cada valor paga la llamada por fmgr,
+ * la consulta de la collation y, en el Custom Scan, cargar el valor en el
+ * slot.  Acá se busca cada pieza literal con memmem() sobre los bytes que
+ * ya devolvió el lector del segmento.
+ *
+ * Coincide con textlike() solo bajo estas condiciones, y fuera de ellas se
+ * evalúa la expresión:
+ *
+ *   - Sin `_` ni `\`: `_` es un carácter, no un byte, y el escape cambia
+ *     qué es literal.  Un ESCAPE explícito llega ya plegado a un patrón con
+ *     `\`, así que también queda afuera.
+ *   - Collation determinista: con una no determinista LIKE compara según
+ *     la collation (PG 18) y no por bytes.
+ *   - UTF-8 o una codificación de un byte.  En UTF-8 una secuencia válida
+ *     no puede aparecer empezando a mitad de otro carácter, así que buscar
+ *     bytes es buscar caracteres; en SJIS, por ejemplo, no vale.
+ */
+static DbeLikeMatch *
+dbe_like_compile(Node *clause, AttrNumber attnum)
+{
+	OpExpr	   *op = (OpExpr *) clause;
+	Node	   *l;
+	Const	   *k;
+	text	   *pat;
+	const char *p;
+	int			plen;
+	DbeLikeMatch *m;
+	int			start;
+
+	if (!IsA(clause, OpExpr) || list_length(op->args) != 2)
+		return NULL;
+	if (op->opfuncid != F_TEXTLIKE && op->opfuncid != F_TEXTNLIKE)
+		return NULL;
+	l = (Node *) linitial(op->args);
+	while (IsA(l, RelabelType))
+		l = (Node *) ((RelabelType *) l)->arg;
+	if (!IsA(l, Var) || ((Var *) l)->varattno != attnum)
+		return NULL;
+	if (!IsA(lsecond(op->args), Const))
+		return NULL;
+	k = (Const *) lsecond(op->args);
+	if (k->constisnull || k->consttype != TEXTOID)
+		return NULL;
+	if (!OidIsValid(op->inputcollid) ||
+		!get_collation_isdeterministic(op->inputcollid))
+		return NULL;
+	if (GetDatabaseEncoding() != PG_UTF8 &&
+		pg_database_encoding_max_length() != 1)
+		return NULL;
+
+	pat = DatumGetTextPP(k->constvalue);
+	p = VARDATA_ANY(pat);
+	plen = VARSIZE_ANY_EXHDR(pat);
+	for (int i = 0; i < plen; i++)
+		if (p[i] == '_' || p[i] == '\\')
+			return NULL;
+
+	m = (DbeLikeMatch *) palloc0(sizeof(DbeLikeMatch));
+	m->negate = (op->opfuncid == F_TEXTNLIKE);
+	m->anchor_start = (plen == 0 || p[0] != '%');
+	m->anchor_end = (plen == 0 || p[plen - 1] != '%');
+	m->pieces = (const char **) palloc(sizeof(char *) * (plen / 2 + 1));
+	m->lens = (int *) palloc(sizeof(int) * (plen / 2 + 1));
+	start = 0;
+	for (int i = 0; i <= plen; i++)
+	{
+		if (i < plen && p[i] != '%')
+			continue;
+		if (i > start)
+		{
+			m->pieces[m->npieces] = pnstrdup(p + start, i - start);
+			m->lens[m->npieces] = i - start;
+			m->npieces++;
+		}
+		start = i + 1;
+	}
+	return m;
+}
+
+/* ¿Calza `s` con el patrón?  Sin contar el NOT. */
+static bool
+dbe_like_matches(const DbeLikeMatch *m, const char *s, Size len)
+{
+	Size		pos = 0;
+	Size		end = len;
+	int			first = 0;
+	int			last = m->npieces;
+
+	/* Sin `%`: es una igualdad. */
+	if (m->anchor_start && m->anchor_end && m->npieces <= 1)
+		return m->npieces == 0 ? len == 0
+			: (len == (Size) m->lens[0] && memcmp(s, m->pieces[0], len) == 0);
+
+	if (m->anchor_start && m->npieces > 0)
+	{
+		if (len < (Size) m->lens[0] || memcmp(s, m->pieces[0], m->lens[0]) != 0)
+			return false;
+		pos = m->lens[0];
+		first = 1;
+	}
+	if (m->anchor_end && last > first)
+	{
+		Size		l = m->lens[last - 1];
+
+		if (end - pos < l || memcmp(s + end - l, m->pieces[last - 1], l) != 0)
+			return false;
+		end -= l;
+		last--;
+	}
+
+	/* Las del medio, la primera aparición de cada una: es la que deja más. */
+	for (int i = first; i < last; i++)
+	{
+		const char *hit = memmem(s + pos, end - pos, m->pieces[i], m->lens[i]);
+
+		if (hit == NULL)
+			return false;
+		pos = (hit - s) + m->lens[i];
+	}
+	return true;
+}
+
+/*
+ * Para dbe_segreader_dict_contains(): cuántos bytes de cabecera tiene un
+ * varlena guardado según su primer byte.  Se arma con las macros de
+ * varlena y no a mano, así vale en cualquier endianness.  255 para las
+ * formas que no se guardan (TOAST externo, comprimido inline): ahí el
+ * motor contesta "no sé" y se lee el valor.
+ */
+static const uint8 *
+dbe_varlena_hdr_table(void)
+{
+	static uint8 table[256];
+	static bool done = false;
+
+	if (!done)
+	{
+		for (int b = 0; b < 256; b++)
+		{
+			union
+			{
+				uint32		align;
+				uint8		bytes[4];
+			}			fake;
+
+			memset(&fake, 0, sizeof(fake));
+			fake.bytes[0] = (uint8) b;
+			if (VARATT_IS_1B_E(&fake))
+				table[b] = 255;
+			else if (VARATT_IS_1B(&fake))
+				table[b] = 1;
+			else if (VARATT_IS_4B_U(&fake))
+				table[b] = 4;
+			else
+				table[b] = 255;
+		}
+		done = true;
+	}
+	return table;
+}
+
+/*
+ * El resultado de la cláusula para un valor guardado, o -1 si no se puede
+ * decidir sobre los bytes y hay que evaluar la expresión.
+ */
+static int
+dbe_like_eval_stored(const DbeLikeMatch *m, const void *data)
+{
+	const struct varlena *v = (const struct varlena *) data;
+
+	/* Se guarda sin comprimir (columnar_write.c), pero por las dudas. */
+	if (VARATT_IS_EXTERNAL(v) || VARATT_IS_COMPRESSED(v))
+		return -1;
+	return dbe_like_matches(m, VARDATA_ANY(v), VARSIZE_ANY_EXHDR(v)) != m->negate;
+}
+
 static ExprState *
 dbe_dictqual_compile(List *quals, PlanState *parent, EState *estate)
 {
@@ -137,6 +337,7 @@ dbe_dictqual_build(List *quals, Index varno, TupleDesc desc,
 		}
 
 		dq->clauses[dq->nclauses].attnum = attnum;
+		dq->clauses[dq->nclauses].like = dbe_like_compile(clause, attnum);
 		dq->clauses[dq->nclauses].qual =
 			dbe_dictqual_compile(list_make1(clause), parent, estate);
 		dq->nclauses++;
@@ -216,6 +417,22 @@ dbe_dictqual_eval_clause(DbeDictQual *dq, DbeDictClause *c, DbeRowCursor *cur,
 
 	if (!c->is_dict)
 	{
+		if (c->like != NULL && reader != NULL)
+		{
+			const void *data;
+			uint32		len;
+			int32		vnull;
+			int			r;
+			DbeStatus	st = dbe_segreader_get(reader, (uint32) row, &data,
+											   &len, &vnull);
+
+			dbe_error_if_not_ok(&st, "leyendo un valor de la columna");
+			if (vnull)
+				return false;	/* LIKE es estricto: NULL no pasa */
+			r = dbe_like_eval_stored(c->like, data);
+			if (r >= 0)
+				return r;
+		}
 		if (c->lazy && fill != NULL)
 			fill(fill_arg, c->attnum);
 		pass = ExecQual(c->qual, econtext);
@@ -232,6 +449,50 @@ dbe_dictqual_eval_clause(DbeDictQual *dq, DbeDictClause *c, DbeRowCursor *cur,
 	slot_result = isnull ? &c->null_result : &c->result[code];
 	if (*slot_result != DQ_UNKNOWN)
 		return *slot_result == DQ_PASS;
+
+	if (c->like != NULL)
+	{
+		int			r = 0;
+
+		if (isnull)
+			r = 0;				/* LIKE es estricto: NULL no pasa */
+		else
+		{
+			const DbeLikeMatch *m = c->like;
+			int32		found = -1;
+
+			/*
+			 * `%aguja%`: sobre FSST se busca en los códigos comprimidos, sin
+			 * descomprimir la entrada (q21 a q24).
+			 */
+			if (m->npieces == 1 && !m->anchor_start && !m->anchor_end)
+			{
+				DbeStatus	st = dbe_segreader_dict_contains(reader, code,
+															 m->pieces[0],
+															 m->lens[0],
+															 dbe_varlena_hdr_table(),
+															 &found);
+
+				dbe_error_if_not_ok(&st, "buscando en el diccionario");
+			}
+			if (found >= 0)
+				r = (found != 0) != m->negate;
+			else
+			{
+				const void *data;
+				uint32		len;
+				DbeStatus	st = dbe_segreader_dict_value(reader, code, &data, &len);
+
+				dbe_error_if_not_ok(&st, "leyendo una entrada del diccionario");
+				r = dbe_like_eval_stored(c->like, data);
+			}
+		}
+		if (r >= 0)
+		{
+			*slot_result = r ? DQ_PASS : DQ_FAIL;
+			return r;
+		}
+	}
 
 	if (c->lazy && fill != NULL)
 		fill(fill_arg, c->attnum);

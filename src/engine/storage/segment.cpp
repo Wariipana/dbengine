@@ -583,6 +583,180 @@ fill_run(uint8_t *dst, const uint8_t *value, uint32_t run)
 
 }	// namespace
 
+/*
+ * Búsqueda de una subcadena sobre FSST sin descomprimir.
+ *
+ * Un autómata KMP sobre la aguja tiene m + 1 estados: el estado es cuánto
+ * del principio de la aguja calza con lo último que se leyó, y m es
+ * "encontrada".  Como la tabla de símbolos del segmento es fija, se puede
+ * precalcular a qué estado lleva cada símbolo desde cada estado —aplicar
+ * sus hasta 8 bytes de una—, y una entrada se recorre con una lectura de
+ * tabla por código en vez de escribir los bytes y después buscarlos.  El
+ * código de escape (255) trae un byte literal y usa la tabla por byte.
+ *
+ * Ref.: Pop, Riedl y Neumann, "Efficient pattern matching on FSST-compressed
+ * strings" (TUM); es lo que hace Vortex para `%aguja%`.
+ */
+struct FsstSearch
+{
+	std::vector<uint8_t> needle;
+	uint32_t	m = 0;
+	std::vector<uint8_t> by_byte;	///< (m + 1) × 256
+	std::vector<uint8_t> by_code;	///< (m + 1) × 255
+	bool		hot[256];		///< el código saca del estado 0 (255: escape)
+};
+
+namespace {
+
+/* Con uint8_t por estado y m como "encontrada", m tiene que entrar en 254. */
+constexpr uint32_t kMaxNeedle = 254;
+
+void
+build_search(FsstSearch *s, const fsst_decoder_t &dec)
+{
+	const uint32_t m = s->m;
+	const uint8_t *p = s->needle.data();
+
+	s->by_byte.assign((size_t) (m + 1) * 256, 0);
+	s->by_byte[p[0]] = 1;
+	for (uint32_t j = 1, x = 0; j < m; j++)
+	{
+		for (uint32_t c = 0; c < 256; c++)
+			s->by_byte[j * 256 + c] = s->by_byte[x * 256 + c];
+		s->by_byte[j * 256 + p[j]] = static_cast<uint8_t>(j + 1);
+		x = s->by_byte[x * 256 + p[j]];
+	}
+	for (uint32_t c = 0; c < 256; c++)
+		s->by_byte[m * 256 + c] = static_cast<uint8_t>(m);
+
+	s->by_code.assign((size_t) (m + 1) * 255, 0);
+	for (uint32_t st = 0; st <= m; st++)
+		for (uint32_t code = 0; code < 255; code++)
+		{
+			uint32_t	cur = st;
+			const uint64_t sym = dec.symbol[code];
+
+			const uint32_t len = dec.len[code] < 8 ? dec.len[code] : 8;
+
+			for (uint32_t k = 0; k < len && cur != m; k++)
+				cur = s->by_byte[cur * 256 + ((sym >> (8 * k)) & 0xff)];
+			s->by_code[st * 255 + code] = static_cast<uint8_t>(cur);
+		}
+	for (uint32_t code = 0; code < 255; code++)
+		s->hot[code] = s->by_code[code] != 0;
+	s->hot[255] = true;
+}
+
+}	// namespace
+
+int
+SegmentReader::dict_contains(uint32_t idx, const uint8_t *needle,
+							 uint32_t nlen, const uint8_t *hdr_len) const
+{
+	if (header_.encoding != kEncDictFsst || idx >= header_.aux_count)
+		return -1;
+	if (nlen == 0 || nlen > kMaxNeedle)
+		return -1;
+
+	FsstSearch *s = nullptr;
+
+	for (const auto &cand : searches_)
+		if (cand->m == nlen && std::memcmp(cand->needle.data(), needle, nlen) == 0)
+			s = cand.get();
+	if (s == nullptr)
+	{
+		auto	   *fresh = new FsstSearch;
+
+		searches_.emplace_back(fresh);
+		fresh->needle.assign(needle, needle + nlen);
+		fresh->m = nlen;
+		build_search(fresh, fsst_->dec);
+		s = fresh;
+	}
+
+	const fsst_decoder_t &dec = fsst_->dec;
+	const uint8_t *in = fsst_comp_ + offsets_[idx];
+	const uint8_t *end = fsst_comp_ + offsets_[idx + 1];
+	const uint8_t *by_byte = s->by_byte.data();
+	const uint8_t *by_code = s->by_code.data();
+	const uint32_t m = s->m;
+	uint32_t	st = 0;
+	uint32_t	pos = 0;		/* bytes decodificados hasta acá */
+	uint32_t	hdr = 0;
+
+	/*
+	 * La cabecera se saltea byte por byte: un símbolo puede tener una parte
+	 * en la cabecera y otra en los datos.  Después, un paso por código.
+	 */
+	while (in < end && (pos == 0 || pos < hdr))
+	{
+		uint8_t		bytes[8];
+		uint32_t	k;
+		const uint8_t code = *in++;
+
+		if (code == 255)
+		{
+			if (in >= end)
+				return -1;
+			bytes[0] = *in++;
+			k = 1;
+		}
+		else
+		{
+			std::memcpy(bytes, &dec.symbol[code], 8);
+			k = dec.len[code] < 8 ? dec.len[code] : 8;
+		}
+		for (uint32_t i = 0; i < k; i++, pos++)
+		{
+			if (pos == 0)
+			{
+				hdr = hdr_len[bytes[0]];
+				if (hdr == 255 || hdr == 0)
+					return -1;
+			}
+			if (pos >= hdr)
+			{
+				st = by_byte[st * 256 + bytes[i]];
+				if (st == m)
+					return 1;
+			}
+		}
+	}
+
+	/*
+	 * En el estado 0 —no hay nada de la aguja a medio calzar, que es casi
+	 * siempre— un código que deja en 0 no cambia nada.  Saltearlos mira una
+	 * tabla por código sin depender del estado, que es lo caro del recorrido:
+	 * cada paso del autómata espera al anterior.
+	 */
+	const bool *hot = s->hot;
+
+	while (in < end)
+	{
+		if (st == 0)
+		{
+			while (in < end && !hot[*in])
+				in++;
+			if (in >= end)
+				break;
+		}
+
+		const uint8_t code = *in++;
+
+		if (code == 255)
+		{
+			if (in >= end)
+				return -1;
+			st = by_byte[st * 256 + *in++];
+		}
+		else
+			st = by_code[st * 255 + code];
+		if (st == m)
+			return 1;
+	}
+	return 0;
+}
+
 SegmentReader::~SegmentReader() = default;
 
 /*

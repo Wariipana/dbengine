@@ -195,3 +195,40 @@ el Finalize recibe todo y su hash vuelca a disco (q32, 1,37M grupos en
 q16 2,66 → 1,54 s, q18 2,46 → 1,59 s, q34 7,15 → 5,14 s, q15 1,61 → 1,25 s,
 q37 524 → 366 ms, q39 128 → 45 ms, q41 93 → 58 ms. Las 43 contra la línea
 base: media geométrica 0,604, suma 109,9 → 80,4 s.
+
+## Resultado: HAVING y `length()` en el agregado vectorizado
+
+q28 caía al HashAggregate de Postgres por `HAVING COUNT(*) > 100000`. En el
+camino paralelo el HAVING lo evalúa el Finalize, así que alcanza con que el
+parcial calcule también los agregados que aparecen solo ahí; el camino
+serial sigue sin HAVING. Con eso el 40% de q28 pasó a ser `length(URL)`:
+`textlen()` cuenta caracteres con `pg_mbstrlen_with_len()`, una llamada a
+`pg_mblen()` por carácter. En UTF-8 válido —y lo guardado lo es, Postgres
+lo valida al entrar— los caracteres son los bytes que no son de
+continuación (`10xxxxxx`), y eso se cuenta de a 8 bytes con un popcount.
+**q28 1.975 → 1.050 ms.**
+
+## Resultado: `LIKE` sobre FSST sin descomprimir (C2.2, ítem 6)
+
+Los predicados ya se evaluaban una vez por entrada del diccionario, pero
+cada evaluación cargaba el valor en el slot y llamaba a `textlike()` por
+fmgr. Primer paso: un patrón hecho solo de literales y `%` se compara sobre
+los bytes que devuelve el lector, con `memmem()`; vale con collation
+determinista y en UTF-8 o codificaciones de un byte, y con `_` o escape se
+evalúa como antes. q21 689 → 395 ms.
+
+Ahí la descompresión FSST pasó a ser el 27% y `memmem` el 13%. Segundo
+paso, para `%aguja%`: un autómata KMP sobre la aguja con la transición de
+cada símbolo de la tabla FSST precalculada desde cada estado, así que una
+entrada se recorre código por código sin escribir nada (Pop, Riedl y
+Neumann; es lo que hace Vortex). Recorrido así no ganó nada: cada paso del
+autómata espera la lectura de tabla del anterior. Lo que lo hizo rendir es
+que en el estado 0 —casi siempre— un código que deja en 0 no cambia nada, y
+saltearlos mira una tabla por código que no depende del estado. La cabecera
+varlena, que FSST comprime junto con el texto, se saltea con una tabla de
+256 largos que arma el lado de Postgres con sus macros: el motor no aprende
+nada de varlena.
+
+**q21 689 → 286 ms, q22 725 → 314 ms, q23 953 → 422 ms, q24 1.182 → 752
+ms.** Las 43 contra la línea base: media geométrica 0,544, suma 109,9 →
+75,7 s.

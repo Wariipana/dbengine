@@ -316,6 +316,21 @@ dbe_segreader_dict_value(DbeSegReader *r, uint32_t idx, const void **data_out,
 	});
 }
 
+DbeStatus
+dbe_segreader_dict_contains(DbeSegReader *r, uint32_t idx, const void *needle,
+							uint32_t nlen, const uint8_t *hdr_len,
+							int32_t *result_out)
+{
+	if (r == nullptr || needle == nullptr || hdr_len == nullptr ||
+		result_out == nullptr)
+		return dbe_status_make(DBE_ERR_INVALID_ARGUMENT, "argumento nulo");
+
+	return dbe_guard([r, idx, needle, nlen, hdr_len, result_out] {
+		*result_out = reinterpret_cast<dbe::SegmentReader *>(r)->dict_contains(
+			idx, static_cast<const uint8_t *>(needle), nlen, hdr_len);
+	});
+}
+
 void
 dbe_segreader_close(DbeSegReader *r)
 {

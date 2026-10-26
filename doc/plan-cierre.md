@@ -220,8 +220,10 @@ Tres hechos del código que ordenan la lista:
          copia a un contexto que dura el stripe. **q29 21,0 → 11,85 s
          (1,77×)**, el resto sin cambios. Las 43: media geométrica 0,879
          contra la línea base, suma 109,9 → 96,8 s.
-       - [ ] `length(URL)` de q28 es argumento de un agregado empujado: el
-         mismo arreglo en `dbe_vec_value` de VectorAgg.
+       - [x] `length(URL)` de q28: no hacía falta cachear por entrada. Lo
+         que pesaba era el HAVING, que dejaba q28 afuera del agregado
+         vectorizado, y `pg_mbstrlen`; ahora el HAVING lo evalúa el
+         Finalize y `length()` cuenta UTF-8 de a 8 bytes. q28 1,97 → 1,05 s.
        - De paso: el EXPLAIN de `DbengineVectorAgg` dentro de una subconsulta
          fallaba ("invalid attnum 2 for relation v"): setrefs.c no corrige
          los Var de `custom_private`.
@@ -234,10 +236,14 @@ Tres hechos del código que ordenan la lista:
          vuelca solo, así que se ofrece si entra en memoria o si reduce al
          menos a la mitad. q16 1,73×, q18 1,54×, q34 1,39×, q39 2,8×. Las
          43: media geométrica 0,604, suma 80,4 s.
-6. [ ] **`LIKE` sobre FSST sin descomprimir** (autómata sobre los códigos
+6. [x] **`LIKE` sobre FSST sin descomprimir** (autómata sobre los códigos
        de símbolo): 2,5×–17× sobre descomprimir y comparar según Pop, Riedl
        y Neumann (TUM). Vortex lo implementa para `prefix%` y `%needle%`,
        que son los de ClickBench. Revisa "FSST es solo tamaño".
+       Hecho para `%aguja%` (`SegmentReader::dict_contains`), con los demás
+       patrones de literales y `%` comparados por bytes con `memmem`. q21
+       2,4×, q22 2,2×, q23 2,3×, q24 1,6× sobre lo que había; las 43: media
+       geométrica 0,544, suma 75,7 s. Ver perf-linea-base-c2.md.
 7. [ ] **Predicados sobre enteros comprimidos**: comparar contra
        `const − min` en FOR sin reconstruir el valor, y salir con un vector
        de selección; `ExecQual` queda para el residuo.

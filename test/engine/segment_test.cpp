@@ -141,6 +141,75 @@ verificar_dict(const char *caso, const SegmentReader &r,
 	}
 }
 
+// dict_contains() contra buscar a mano en la entrada descomprimida.  La
+// cabecera que se saltea depende del primer byte (1 a 3 bytes acá, que no
+// es el varlena de verdad: lo que se prueba es que se respete la tabla).
+// Agujas sacadas de las entradas, que cruzan la cabecera, al azar, y una
+// más larga que lo que acepta el autómata.
+static void
+verificar_contains(const char *caso, const SegmentReader &r)
+{
+	uint32_t	n = 0;
+	uint8_t		hdr[256];
+	std::mt19937 rng(7);
+	std::vector<std::string> agujas = {"a", "zz", std::string(300, 'x')};
+
+	if (r.encoding() != kEncDictFsst || !r.dict(&n) || n == 0)
+		return;
+	for (int b = 0; b < 256; b++)
+		hdr[b] = (uint8_t) (1 + b % 3);
+
+	for (int k = 0; k < 100; k++)
+	{
+		const uint8_t *d;
+		uint32_t	len;
+
+		r.dict_value(rng() % n, &d, &len);
+		if (len == 0)
+			continue;
+		const uint32_t desde = rng() % len;
+		const uint32_t largo = 1 + rng() % std::min<uint32_t>(24, len - desde);
+
+		agujas.emplace_back(reinterpret_cast<const char *>(d) + desde, largo);
+	}
+	for (int k = 0; k < 20; k++)
+	{
+		std::string a;
+
+		for (uint32_t i = 0, l = 1 + rng() % 6; i < l; i++)
+			a.push_back("aeo/.?=0123ptw"[rng() % 14]);
+		agujas.push_back(a);
+	}
+
+	for (const std::string &aguja : agujas)
+		for (uint32_t idx = 0; idx < std::min<uint32_t>(n, 1500); idx++)
+		{
+			const uint8_t *d;
+			uint32_t	len;
+
+			r.dict_value(idx, &d, &len);
+
+			const int	got = r.dict_contains(idx,
+											  reinterpret_cast<const uint8_t *>(aguja.data()),
+											  (uint32_t) aguja.size(), hdr);
+
+			if (aguja.size() > 254)
+			{
+				if (got != -1)
+					fallar(caso, "dict_contains aceptó una aguja larga", idx);
+				continue;
+			}
+
+			const uint32_t h = len > 0 ? hdr[d[0]] : 0;
+			const bool	esperado = len > h &&
+				std::string(reinterpret_cast<const char *>(d) + h, len - h)
+					.find(aguja) != std::string::npos;
+
+			if (got != (esperado ? 1 : 0))
+				fallar(caso, ("dict_contains con \"" + aguja + "\"").c_str(), idx);
+		}
+}
+
 static void
 probar(const char *caso, uint32_t ancho, const std::vector<Valor> &ref,
 	   int enc_esperada)
@@ -178,6 +247,7 @@ probar(const char *caso, uint32_t ancho, const std::vector<Valor> &ref,
 		verificar_get(caso, r, ref, salteado);
 		verificar_get(caso, r, ref, azar);
 		verificar_dict(caso, r, ref);
+		verificar_contains(caso, r);
 		verificar_vector(caso, r, ref, ancho);
 		verificar_get(caso, r, ref, adelante);
 	}

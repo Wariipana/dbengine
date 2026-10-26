@@ -275,6 +275,152 @@ SELECT s, count(*) FROM dq WHERE s <> 'zoe' GROUP BY s ORDER BY s;
  yago   |   750
 (6 rows)
 
+-- LIKE comparado sobre los bytes (dbe_like_compile): cada patrón como
+-- constante, contra heap.  Los que llevan `_` o escape no califican y se
+-- evalúan con textlike(); tienen que dar lo mismo igual.  El primer stripe
+-- tiene diccionario y el segundo no (todos los valores distintos), que es
+-- el otro camino de la evaluación.
+CREATE TABLE lk (s text, v varchar(40)) USING dbengine_columnar;
+INSERT INTO lk SELECT x, x FROM (SELECT (ARRAY['', 'a', 'ab', 'aba', 'abba',
+	'ababa', 'b', 'bab', 'xaby', 'año', 'ñaño', 'a%b', 'a_b', 'a\b', '日本語',
+	'𝄞ab𝄞', NULL])[1 + g % 17] AS x FROM generate_series(1, 3400) g) z;
+INSERT INTO lk SELECT 'ab' || g || CASE WHEN g % 2 = 0 THEN 'ba' ELSE 'ñ' END,
+	'q' || g FROM generate_series(1, 2000) g;
+CREATE TABLE lk_heap AS SELECT * FROM lk;
+SELECT DISTINCT sc.encoding IN (3, 4) AS con_diccionario
+FROM dbengine.stripe_column sc
+WHERE sc.relfilenode = pg_relation_filenode('lk') AND sc.attnum = 1
+ORDER BY 1;
+ con_diccionario 
+-----------------
+ f
+ t
+(2 rows)
+
+CREATE FUNCTION lk_check(OUT pat text, OUT op text, OUT igual bool)
+RETURNS SETOF record LANGUAGE plpgsql AS $$
+DECLARE
+	c bigint;
+	h bigint;
+BEGIN
+	FOREACH pat IN ARRAY ARRAY['', '%', '%%', 'a', 'a%', '%a', '%a%', 'ab%',
+		'%ba', 'a%a', 'ab%ba', 'aba%aba', '%b%b%', '%ab%ba%', 'a%%b', '%ñ%',
+		'%𝄞', '日%語', '%1%9%', 'ab1%', '_b%', '%a_b%', 'a\%b', 'a\_b', 'a\\b',
+		'%\\%']
+	LOOP
+		FOREACH op IN ARRAY ARRAY['s LIKE', 's NOT LIKE', 'v LIKE',
+			's COLLATE "C" LIKE']
+		LOOP
+			EXECUTE format('SELECT count(*) FROM lk WHERE %s %L', op, pat) INTO c;
+			EXECUTE format('SELECT count(*) FROM lk_heap WHERE %s %L', op, pat) INTO h;
+			igual := (c = h);
+			RETURN NEXT;
+		END LOOP;
+	END LOOP;
+END $$;
+SELECT count(*) AS casos, bool_and(igual) AS todos_iguales FROM lk_check();
+ casos | todos_iguales 
+-------+---------------
+   104 | t
+(1 row)
+
+SELECT * FROM lk_check() WHERE NOT igual;
+ pat | op | igual 
+-----+----+-------
+(0 rows)
+
+-- ESCAPE explícito: el planner lo pliega a un patrón con `\`.
+SELECT (SELECT count(*) FROM lk WHERE s LIKE 'a#%b' ESCAPE '#')
+	 = (SELECT count(*) FROM lk_heap WHERE s LIKE 'a#%b' ESCAPE '#') AS escape_igual;
+ escape_igual 
+--------------
+ t
+(1 row)
+
+-- Con el pushdown de agregados y con el Custom Scan proyectando filas.
+SELECT (SELECT count(*) FROM lk WHERE s LIKE '%ab%' AND s NOT LIKE '%ba')
+	 = (SELECT count(*) FROM lk_heap WHERE s LIKE '%ab%' AND s NOT LIKE '%ba')
+	AS dos_like_igual;
+ dos_like_igual 
+----------------
+ t
+(1 row)
+
+SELECT (SELECT string_agg(s, ',' ORDER BY s) FROM lk WHERE s LIKE 'ab1%9%')
+	 = (SELECT string_agg(s, ',' ORDER BY s) FROM lk_heap WHERE s LIKE 'ab1%9%')
+	AS filas_igual;
+ filas_igual 
+-------------
+ t
+(1 row)
+
+DROP FUNCTION lk_check();
+DROP TABLE lk, lk_heap;
+-- `%aguja%` sobre un diccionario FSST se busca en los códigos comprimidos
+-- (SegmentReader::dict_contains).  Agujas que cruzan símbolos, que se
+-- solapan consigo mismas (`gogoogle` tiene que encontrar `google` después
+-- de un falso comienzo), multibyte, de un byte y más largas que lo que
+-- acepta el autómata.  La última empieza con el byte de cabecera varlena de
+-- las filas de ese largo: la cabecera no es parte del texto y no puede
+-- calzar.
+CREATE TABLE fz (s text) USING dbengine_columnar;
+INSERT INTO fz SELECT 'http://www.example' || (g % 400) || '.com/path/' ||
+	CASE g % 7 WHEN 0 THEN 'google' WHEN 1 THEN 'goog' WHEN 2 THEN 'gogoogle'
+			   WHEN 3 THEN 'añoñgoogle日本' WHEN 4 THEN NULL ELSE 'xgooglx' END
+	|| '/index.html?q=' || (g % 400)
+	FROM generate_series(1, 4000) g;
+CREATE TABLE fz_heap AS SELECT * FROM fz;
+SELECT DISTINCT sc.encoding = 4 AS fsst
+FROM dbengine.stripe_column sc
+WHERE sc.relfilenode = pg_relation_filenode('fz');
+ fsst 
+------
+ t
+(1 row)
+
+CREATE FUNCTION fz_check(OUT pat text, OUT igual bool)
+RETURNS SETOF record LANGUAGE plpgsql AS $$
+DECLARE
+	c bigint;
+	h bigint;
+	hdr text;
+BEGIN
+	SELECT chr((octet_length(s) + 1) * 2 + 1) INTO hdr
+	FROM fz_heap WHERE octet_length(s) < 62 LIMIT 1;
+	FOREACH pat IN ARRAY ARRAY['%google%', '%goog%', '%gogoogle%', '%oogl%',
+		'%ñgoogle日%', '%日本/%', '%h%', '%q=1%', '%example12.com/path/g%',
+		'%.com/path/xgooglx/index.html?q=3%', '%zz%', '%' || repeat('x', 300) || '%',
+		'%' || hdr || 'http%', '%' || hdr || '%']
+	LOOP
+		EXECUTE format('SELECT count(*) FROM fz WHERE s LIKE %L', pat) INTO c;
+		EXECUTE format('SELECT count(*) FROM fz_heap WHERE s LIKE %L', pat) INTO h;
+		igual := (c = h);
+		RETURN NEXT;
+		EXECUTE format('SELECT count(*) FROM fz WHERE s NOT LIKE %L', pat) INTO c;
+		EXECUTE format('SELECT count(*) FROM fz_heap WHERE s NOT LIKE %L', pat) INTO h;
+		igual := (c = h);
+		RETURN NEXT;
+	END LOOP;
+END $$;
+SELECT count(*) AS casos, bool_and(igual) AS todos_iguales FROM fz_check();
+ casos | todos_iguales 
+-------+---------------
+    28 | t
+(1 row)
+
+SELECT * FROM fz_check() WHERE NOT igual;
+ pat | igual 
+-----+-------
+(0 rows)
+
+SELECT count(*) AS con_google FROM fz WHERE s LIKE '%google%';
+ con_google 
+------------
+       1715
+(1 row)
+
+DROP FUNCTION fz_check();
+DROP TABLE fz, fz_heap;
 DROP TABLE dq, dq_heap;
 DROP FUNCTION dq_check(text);
 DROP EXTENSION dbengine CASCADE;

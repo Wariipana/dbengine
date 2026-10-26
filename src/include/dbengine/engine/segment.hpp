@@ -155,6 +155,7 @@ private:
 /// mitad del tiempo: se decodificaban 65.536 valores de cada columna para
 /// devolver diez filas.
 struct FsstDecoder;				///< envuelve fsst_decoder_t; definido en segment.cpp
+struct FsstSearch;				///< autómata de dict_contains(); en segment.cpp
 
 class SegmentReader
 {
@@ -190,6 +191,18 @@ public:
 	/// Valor de una entrada del diccionario.
 	void		dict_value(uint32_t idx, const uint8_t **data,
 						   uint32_t *len) const;
+
+	/// ¿La entrada `idx` contiene `needle`?  Sobre el diccionario FSST se
+	/// busca recorriendo los códigos comprimidos, sin descomprimir la
+	/// entrada: ver FsstSearch en segment.cpp.  Los primeros bytes de cada
+	/// entrada son una cabecera que no cuenta, y su largo lo da
+	/// `hdr_len[primer byte]`; 255 ahí quiere decir que no se sabe.
+	///
+	/// Devuelve 1 o 0, o -1 si no se pudo decidir: el segmento no es FSST,
+	/// la aguja es muy larga o la cabecera no se reconoce.  Con -1 hay que
+	/// leer el valor y buscar a mano.
+	int			dict_contains(uint32_t idx, const uint8_t *needle,
+							  uint32_t nlen, const uint8_t *hdr_len) const;
 
 private:
 	/// Slot de la fila en el buffer de valores decodificados.  Se reserva
@@ -229,6 +242,11 @@ private:
 		uint32_t	off;
 		uint32_t	len;		///< UINT32_MAX = todavía sin descomprimir
 	};
+
+	/// Autómatas compilados para dict_contains(), uno por aguja: una query
+	/// con dos LIKE sobre la misma columna busca dos cosas distintas en el
+	/// mismo segmento.
+	mutable std::vector<std::unique_ptr<FsstSearch>> searches_;
 
 	std::unique_ptr<FsstDecoder> fsst_;
 	const uint8_t *fsst_comp_ = nullptr;

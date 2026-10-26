@@ -140,6 +140,18 @@ DbeStatus	dbe_segreader_code(DbeSegReader *r, uint32_t row,
 DbeStatus	dbe_segreader_dict_value(DbeSegReader *r, uint32_t idx,
 									 const void **data_out, uint32_t *len_out);
 
+/*
+ * ¿La entrada `idx` del diccionario contiene `needle`?  Sobre FSST se busca
+ * en los códigos comprimidos, sin descomprimir.  `hdr_len` tiene 256
+ * entradas: cuántos bytes de cabecera saltear según el primer byte de la
+ * entrada (255 = no se sabe).  *result_out queda en 1 o 0, o en -1 si no
+ * se pudo decidir así y hay que leer el valor.
+ */
+DbeStatus	dbe_segreader_dict_contains(DbeSegReader *r, uint32_t idx,
+										const void *needle, uint32_t nlen,
+										const uint8_t *hdr_len,
+										int32_t *result_out);
+
 void		dbe_segreader_close(DbeSegReader *r);
 
 
