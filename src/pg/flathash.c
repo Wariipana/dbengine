@@ -47,7 +47,7 @@
 
 /*
  * Marca en la máscara de nulos de un registro: en vez de los argumentos de
- * una fila trae los estados ya agregados de varias (dbe_flat_spill_states).
+ * una fila trae los estados ya agregados de varias (dbe_flat_add_states).
  * Las claves son a lo sumo 8, así que el bit 31 está libre.
  */
 #define DBE_FLAT_REC_STATES	((uint32) 1 << 31)
@@ -108,6 +108,7 @@ struct DbeFlatAgg
 	Size		rec_cap;
 	Size		fixed_rowlen;	/* sin claves de texto: largo de un registro */
 	Size		fixed_statelen;	/* ... y de uno con estados */
+	bool		state_recs;		/* se volcó algún registro de estados */
 	char	   *keybuf[DBE_FLAT_MAX_KEYS];	/* textos leídos de un registro */
 	Size		keybuf_cap[DBE_FLAT_MAX_KEYS];
 
@@ -122,7 +123,7 @@ struct DbeFlatAgg
 	Size		peak;
 };
 
-static int
+int
 dbe_flat_state_words(DbeFlatKind kind)
 {
 	return (kind == DBE_FLAT_COUNT_STAR || kind == DBE_FLAT_COUNT) ? 1 : 2;
@@ -260,11 +261,10 @@ dbe_flat_create(int nkeys, const int16 *keylen, int naggs,
 	 * Redondear para abajo dejaba sin usar hasta la mitad del presupuesto,
 	 * y con eso cada partición de q33 quedaba apenas más grande que la
 	 * tabla y volcaba un nivel más entero.  Con claves de texto el arena
-	 * comparte el presupuesto, y se reserva lugar para un texto de 64 bytes
-	 * por entrada: si son más largos, la tabla deja de crecer antes.
+	 * comparte el presupuesto, y lo que pesa se ve al crecer: ver
+	 * dbe_flat_can_grow().
 	 */
-	per_entry = sizeof(uint64) * fa->words + 4 * sizeof(uint32) +
-		(fa->anyvar ? 64 : 0);
+	per_entry = sizeof(uint64) * fa->words + 4 * sizeof(uint32);
 	fa->max_cap = (uint32) Min((Size) PG_INT32_MAX / 8,
 							   Max((Size) 64, fa->table_budget / per_entry));
 
@@ -305,6 +305,16 @@ dbe_flat_create(int nkeys, const int16 *keylen, int naggs,
 	return fa;
 }
 
+uint64
+dbe_flat_text_hash(Datum d)
+{
+	const char *p;
+	Size		len;
+
+	dbe_flat_text(d, &p, &len);
+	return hash_bytes_extended((const unsigned char *) p, (int) len, 0);
+}
+
 static pg_attribute_always_inline uint64
 dbe_flat_hash(DbeFlatAgg *fa, const uint64 *keyw, uint32 nullmask)
 {
@@ -319,14 +329,27 @@ dbe_flat_hash(DbeFlatAgg *fa, const uint64 *keyw, uint32 nullmask)
 	for (int i = 0; i < fa->nkeys; i++)
 	{
 		if (fa->keylen[i] < 0 && (nullmask & ((uint32) 1 << i)) == 0)
-		{
-			const char *p;
-			Size		len;
+			h = hash_combine64(h, dbe_flat_text_hash((Datum) keyw[i]));
+		else
+			h = hash_combine64(h, murmurhash64(keyw[i]));
+	}
+	return hash_combine64(h, nullmask);
+}
 
-			dbe_flat_text((Datum) keyw[i], &p, &len);
-			h = hash_combine64(h, hash_bytes_extended((const unsigned char *) p,
-													  (int) len, 0));
-		}
+/* dbe_flat_hash() con los hashes de algunos textos ya calculados. */
+static uint64
+dbe_flat_hash_given(DbeFlatAgg *fa, const uint64 *keyw, uint32 nullmask,
+					const uint64 *texthash, uint32 have)
+{
+	uint64		h = 0;
+
+	for (int i = 0; i < fa->nkeys; i++)
+	{
+		uint32		bit = (uint32) 1 << i;
+
+		if (fa->keylen[i] < 0 && (nullmask & bit) == 0)
+			h = hash_combine64(h, (have & bit) ? texthash[i]
+							   : dbe_flat_text_hash((Datum) keyw[i]));
 		else
 			h = hash_combine64(h, murmurhash64(keyw[i]));
 	}
@@ -493,6 +516,8 @@ dbe_flat_spill(DbeFlatAgg *fa, uint64 h, uint32 nullmask, const uint64 *keyw,
 
 	if (fa->parts == NULL)
 		dbe_flat_open_parts(fa);
+	if (states != NULL)
+		fa->state_recs = true;
 
 	/* Otros bits que los que repartieron el nivel anterior. */
 	part = (int) (murmurhash64(h ^ (UINT64CONST(0x9E3779B97F4A7C15) *
@@ -600,9 +625,29 @@ dbe_flat_spill(DbeFlatAgg *fa, uint64 h, uint32 nullmask, const uint64 *keyw,
 }
 
 /*
+ * Achica la tabla para que el arena tenga `block` bytes más, si está a
+ * menos de la mitad.  Pasa al procesar una partición: la tabla conserva el
+ * tamaño que alcanzó con la entrada entera, y en q17 dejaba lugar para los
+ * textos de 8 mil de los 150 mil grupos que cabían, así que cada partición
+ * volvía a volcar casi todo.  Los índices de las entradas no cambian.
+ */
+static bool
+dbe_flat_shrink_for(DbeFlatAgg *fa, Size block)
+{
+	uint32		c = Max((uint32) 256, fa->nentries * 2);
+
+	if (c > fa->cap / 2 ||
+		dbe_flat_table_bytes(fa, c) + fa->arena_bytes + block > fa->table_budget)
+		return false;
+	dbe_flat_alloc(fa, c);
+	return true;
+}
+
+/*
  * Copia un texto al arena, con cabecera de 4 bytes.  false si no entra en
  * el presupuesto; con la tabla vacía entra igual, porque si no un texto más
- * grande que el presupuesto se volcaría para siempre.
+ * grande que el presupuesto se volcaría para siempre.  Puede achicar la
+ * tabla: ver dbe_flat_shrink_for().
  */
 static bool
 dbe_flat_arena_copy(DbeFlatAgg *fa, Datum src, Datum *dst)
@@ -620,7 +665,8 @@ dbe_flat_arena_copy(DbeFlatAgg *fa, Datum src, Datum *dst)
 
 		if (fa->nentries > 0 &&
 			dbe_flat_table_bytes(fa, fa->cap) + fa->arena_bytes + block >
-			fa->table_budget)
+			fa->table_budget &&
+			!dbe_flat_shrink_for(fa, block))
 			return false;
 		fa->arena_ptr = MemoryContextAlloc(fa->arenacxt, block);
 		fa->arena_left = block;
@@ -637,7 +683,26 @@ dbe_flat_arena_copy(DbeFlatAgg *fa, Datum src, Datum *dst)
 	return true;
 }
 
-/* ¿Puede la tabla duplicarse sin pasarse del presupuesto? */
+/*
+ * ¿Cuánto puede crecer la tabla sin pasarse del presupuesto?  Con claves de
+ * texto, el arena se proyecta al tamaño nuevo con lo que ocupan en promedio
+ * los textos que ya están, más un bloque.  Si el doble no entra, la tabla
+ * crece hasta donde entre, siempre que sea al menos un cuarto más: en q17
+ * los textos son casi todos vacíos, y duplicar o nada dejaba la mitad del
+ * presupuesto sin usar.
+ */
+static bool
+dbe_flat_fits(DbeFlatAgg *fa, uint32 c)
+{
+	Size		arena = fa->arena_bytes;
+
+	if (fa->anyvar && fa->nentries > 0)
+		arena = (Size) ((double) (fa->arena_bytes - fa->arena_left) * c /
+						fa->nentries) + DBE_FLAT_ARENA_BLOCK;
+	return dbe_flat_table_bytes(fa, c) + Max(arena, fa->arena_bytes) <=
+		fa->table_budget;
+}
+
 static bool
 dbe_flat_can_grow(DbeFlatAgg *fa, uint32 *newcap)
 {
@@ -646,8 +711,12 @@ dbe_flat_can_grow(DbeFlatAgg *fa, uint32 *newcap)
 	if (fa->cap >= fa->max_cap)
 		return false;
 	c = (uint32) Min((uint64) fa->max_cap, (uint64) fa->cap * 2);
-	if (dbe_flat_table_bytes(fa, c) + fa->arena_bytes > fa->table_budget)
-		return false;
+	while (!dbe_flat_fits(fa, c))
+	{
+		c -= c / 8;
+		if (c < fa->cap + fa->cap / 4)
+			return false;
+	}
 	*newcap = c;
 	return true;
 }
@@ -690,20 +759,33 @@ dbe_flat_lookup_hashed(DbeFlatAgg *fa, const uint64 *keyw, uint32 nullmask,
 	}
 
 	e = fa->entries + (Size) fa->nentries * fa->words;
-	e[0] = head;
-	for (int i = 0; i < fa->nkeys; i++)
+	if (fa->anyvar)
 	{
-		if (fa->keylen[i] < 0 && (nullmask & ((uint32) 1 << i)) == 0)
-		{
-			Datum		copy;
+		uint64		kw[DBE_FLAT_MAX_KEYS];
+		uint32		cap = fa->cap;
 
-			if (!dbe_flat_arena_copy(fa, (Datum) keyw[i], &copy))
+		for (int i = 0; i < fa->nkeys; i++)
+		{
+			Datum		copy = (Datum) keyw[i];
+
+			if (fa->keylen[i] < 0 && (nullmask & ((uint32) 1 << i)) == 0 &&
+				!dbe_flat_arena_copy(fa, (Datum) keyw[i], &copy))
 				return -1;
-			e[1 + i] = (uint64) copy;
+			kw[i] = (uint64) copy;
 		}
-		else
-			e[1 + i] = keyw[i];
+		/* El arena achicó la tabla: entradas y directorio son otros. */
+		if (fa->cap != cap)
+		{
+			for (pos = (uint32) h & fa->dirmask; fa->dir[pos] != 0;
+				 pos = (pos + 1) & fa->dirmask)
+				;
+			e = fa->entries + (Size) fa->nentries * fa->words;
+		}
+		memcpy(e + 1, kw, sizeof(uint64) * fa->nkeys);
 	}
+	else
+		memcpy(e + 1, keyw, sizeof(uint64) * fa->nkeys);
+	e[0] = head;
 	memset(e + 1 + fa->nkeys, 0,
 		   sizeof(uint64) * (fa->words - 1 - fa->nkeys));
 	fa->nentries++;
@@ -749,8 +831,25 @@ dbe_flat_bucket(DbeFlatAgg *fa, const Datum *keys, const bool *keynulls,
 	 * Otra mezcla que la del directorio y la de las particiones: si fuera la
 	 * misma, todos los grupos de un balde caerían en las mismas ranuras.
 	 */
-	return (uint32) (murmurhash64(dbe_flat_hash(fa, keyw, nullmask) ^
-								  UINT64CONST(0xC2B2AE3D27D4EB4F)) % nbuckets);
+	return dbe_flat_bucket_of(dbe_flat_hash(fa, keyw, nullmask), nbuckets);
+}
+
+uint32
+dbe_flat_bucket_of(uint64 hash, uint32 nbuckets)
+{
+	return (uint32) (murmurhash64(hash ^ UINT64CONST(0xC2B2AE3D27D4EB4F)) %
+					 nbuckets);
+}
+
+uint64
+dbe_flat_hash_keys(DbeFlatAgg *fa, const Datum *keys, const bool *keynulls,
+				   const uint64 *texthash, uint32 have)
+{
+	uint64		keyw[DBE_FLAT_MAX_KEYS];
+	uint32		nullmask;
+
+	dbe_flat_keywords(fa, keys, keynulls, keyw, &nullmask);
+	return dbe_flat_hash_given(fa, keyw, nullmask, texthash, have);
 }
 
 int64
@@ -779,8 +878,8 @@ dbe_flat_accum(DbeFlatAgg *fa, uint64 *states, const Datum *vals,
 }
 
 void
-dbe_flat_spill_states(DbeFlatAgg *fa, const Datum *keys, const bool *keynulls,
-					  const uint64 *states)
+dbe_flat_add_states(DbeFlatAgg *fa, const Datum *keys, const bool *keynulls,
+					const uint64 *states)
 {
 	uint64		keyw[DBE_FLAT_MAX_KEYS];
 	uint32		nullmask;
@@ -821,6 +920,25 @@ dbe_flat_add(DbeFlatAgg *fa, const Datum *keys, const bool *keynulls,
 						vals, valnulls);
 	else
 		dbe_flat_spill(fa, h, nullmask, keyw, vals, valnulls, NULL);
+}
+
+void
+dbe_flat_add_hashed(DbeFlatAgg *fa, uint64 hash, const Datum *keys,
+					const bool *keynulls, const Datum *vals,
+					const bool *valnulls)
+{
+	uint64		keyw[DBE_FLAT_MAX_KEYS];
+	uint32		nullmask;
+	int64		idx;
+
+	Assert(fa->phase == DBE_FLAT_FILL);
+	dbe_flat_keywords(fa, keys, keynulls, keyw, &nullmask);
+	idx = dbe_flat_lookup_hashed(fa, keyw, nullmask, hash);
+	if (idx >= 0)
+		dbe_flat_update(fa, fa->entries + (Size) idx * fa->words + 1 + fa->nkeys,
+						vals, valnulls);
+	else
+		dbe_flat_spill(fa, hash, nullmask, keyw, vals, valnulls, NULL);
 }
 
 /* Las particiones del nivel que terminó pasan a la pila de pendientes. */
@@ -927,11 +1045,13 @@ dbe_flat_load_part(DbeFlatAgg *fa, DbeFlatPart *part)
 		CHECK_FOR_INTERRUPTS();
 
 		/*
-		 * Sin claves de texto todos los registros son de filas y del mismo
-		 * largo: los de estados salen de la caché por código de diccionario,
-		 * que exige una clave de texto.  Se leen de una vez.
+		 * Sin claves de texto y sin registros de estados, todos los
+		 * registros son de filas y del mismo largo: se leen de una vez.  Los
+		 * de estados salen de la caché por código de diccionario, que exige
+		 * una clave de texto, o de dbe_flat_add_states() en el segundo nivel
+		 * de un count(DISTINCT), que puede tener solo claves enteras.
 		 */
-		if (!fa->anyvar)
+		if (!fa->anyvar && !fa->state_recs)
 			BufFileReadExact(part->file, fa->rec, fa->fixed_rowlen);
 		else
 		{
@@ -1018,25 +1138,27 @@ dbe_flat_load_part(DbeFlatAgg *fa, DbeFlatPart *part)
 	dbe_flat_input_done(fa);
 }
 
-bool
-dbe_flat_next(DbeFlatAgg *fa, Datum *keys, bool *keynulls, Datum *outs,
-			  bool *outnulls)
+/*
+ * La entrada del próximo grupo, cargando la partición pendiente que toque.
+ * NULL cuando no quedan.
+ */
+static const uint64 *
+dbe_flat_next_entry(DbeFlatAgg *fa, Datum *keys, bool *keynulls)
 {
 	const uint64 *e;
 	uint32		nullmask;
 
-	MemoryContextReset(fa->outcxt);
 	for (;;)
 	{
 		if (fa->phase == DBE_FLAT_DONE)
-			return false;
+			return NULL;
 		Assert(fa->phase == DBE_FLAT_EMIT);
 		if (fa->emit_pos < fa->nentries)
 			break;
 		if (fa->pending == NIL)
 		{
 			fa->phase = DBE_FLAT_DONE;
-			return false;
+			return NULL;
 		}
 		{
 			DbeFlatPart *part = (DbeFlatPart *) llast(fa->pending);
@@ -1053,6 +1175,32 @@ dbe_flat_next(DbeFlatAgg *fa, Datum *keys, bool *keynulls, Datum *outs,
 		keynulls[i] = (nullmask & ((uint32) 1 << i)) != 0;
 		keys[i] = keynulls[i] ? (Datum) 0 : (Datum) e[1 + i];
 	}
+	fa->groups_out++;
+	return e;
+}
+
+bool
+dbe_flat_next_states(DbeFlatAgg *fa, Datum *keys, bool *keynulls,
+					 const uint64 **states)
+{
+	const uint64 *e = dbe_flat_next_entry(fa, keys, keynulls);
+
+	if (e == NULL)
+		return false;
+	*states = e + 1 + fa->nkeys;
+	return true;
+}
+
+bool
+dbe_flat_next(DbeFlatAgg *fa, Datum *keys, bool *keynulls, Datum *outs,
+			  bool *outnulls)
+{
+	const uint64 *e;
+
+	MemoryContextReset(fa->outcxt);
+	e = dbe_flat_next_entry(fa, keys, keynulls);
+	if (e == NULL)
+		return false;
 
 	for (int i = 0; i < fa->naggs; i++)
 	{
@@ -1097,7 +1245,6 @@ dbe_flat_next(DbeFlatAgg *fa, Datum *keys, bool *keynulls, Datum *outs,
 				break;
 		}
 	}
-	fa->groups_out++;
 	return true;
 }
 
@@ -1128,6 +1275,7 @@ dbe_flat_reset(DbeFlatAgg *fa)
 	 * acumulan, como las demás cifras con loops > 1.
 	 */
 	dbe_flat_clear_table(fa);
+	fa->state_recs = false;
 	fa->level = 0;
 	fa->phase = DBE_FLAT_FILL;
 	fa->emit_pos = 0;

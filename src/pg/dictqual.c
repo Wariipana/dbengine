@@ -6,8 +6,8 @@
  *
  * Por cada cláusula que califica se guarda, para el stripe cargado, un byte
  * por entrada del diccionario: sin evaluar, pasa o no pasa.  La primera
- * fila con un código evalúa la cláusula de verdad, contra el valor que ya
- * está en el slot, y las siguientes leen el byte.  Al cambiar de stripe el
+ * fila con un código evalúa la cláusula de verdad, contra el valor de esa
+ * entrada, y las siguientes leen el byte.  Al cambiar de stripe el
  * diccionario es otro y la tabla se vacía.
  *
  * Es correcto porque una cláusula sin funciones volátiles que mira una sola
@@ -75,6 +75,8 @@ struct DbeDictQual
 	ExprState  *rest;			/* las que no califican; NULL si ninguna */
 	Bitmapset  *rest_cols;		/* columnas que miran las de `rest` */
 	MemoryContext cxt;			/* el del nodo: dura lo que dura el scan */
+	uint32	   *codes;			/* los de un stripe, para el prefiltro */
+	uint32		codes_cap;
 };
 
 /*
@@ -400,53 +402,23 @@ dbe_dictqual_sync(DbeDictQual *dq, DbeDictClause *c, DbeSegReader *reader,
 	c->is_dict = true;
 }
 
+/*
+ * El resultado de la cláusula para un código (o para NULL), calculado y
+ * guardado.  El valor sale del diccionario y se pone en el slot solo
+ * mientras se evalúa: no hace falta saber de qué fila vino, y el slot
+ * queda como estaba.
+ */
 static bool
-dbe_dictqual_eval_clause(DbeDictQual *dq, DbeDictClause *c, DbeRowCursor *cur,
-						 uint64 row, ExprContext *econtext,
-						 DbeDictFillFn fill, void *fill_arg)
+dbe_dictqual_resolve(DbeDictClause *c, DbeSegReader *reader, uint32 code,
+					 bool isnull, ExprContext *econtext)
 {
-	uint64		generation;
-	DbeSegReader *reader = dbe_cursor_reader(cur, c->attnum, &generation);
-	uint8	   *slot_result;
-	uint32		code = 0;
-	int32		isnull = 0;
+	uint8	   *slot_result = isnull ? &c->null_result : &c->result[code];
+	TupleTableSlot *slot = econtext->ecxt_scantuple;
+	int			a = c->attnum - 1;
+	Datum		saved_value;
+	bool		saved_null;
 	bool		pass;
 
-	if (generation != c->generation)
-		dbe_dictqual_sync(dq, c, reader, generation);
-
-	if (!c->is_dict)
-	{
-		if (c->like != NULL && reader != NULL)
-		{
-			const void *data;
-			uint32		len;
-			int32		vnull;
-			int			r;
-			DbeStatus	st = dbe_segreader_get(reader, (uint32) row, &data,
-											   &len, &vnull);
-
-			dbe_error_if_not_ok(&st, "leyendo un valor de la columna");
-			if (vnull)
-				return false;	/* LIKE es estricto: NULL no pasa */
-			r = dbe_like_eval_stored(c->like, data);
-			if (r >= 0)
-				return r;
-		}
-		if (c->lazy && fill != NULL)
-			fill(fill_arg, c->attnum);
-		pass = ExecQual(c->qual, econtext);
-		ResetExprContext(econtext);
-		return pass;
-	}
-
-	{
-		DbeStatus	st = dbe_segreader_code(reader, (uint32) row, &code, &isnull);
-
-		dbe_error_if_not_ok(&st, "leyendo un código de diccionario");
-	}
-
-	slot_result = isnull ? &c->null_result : &c->result[code];
 	if (*slot_result != DQ_UNKNOWN)
 		return *slot_result == DQ_PASS;
 
@@ -494,12 +466,79 @@ dbe_dictqual_eval_clause(DbeDictQual *dq, DbeDictClause *c, DbeRowCursor *cur,
 		}
 	}
 
-	if (c->lazy && fill != NULL)
-		fill(fill_arg, c->attnum);
+	saved_value = slot->tts_values[a];
+	saved_null = slot->tts_isnull[a];
+	if (isnull)
+	{
+		slot->tts_values[a] = (Datum) 0;
+		slot->tts_isnull[a] = true;
+	}
+	else
+	{
+		const void *data;
+		uint32		len;
+		DbeStatus	st = dbe_segreader_dict_value(reader, code, &data, &len);
+
+		dbe_error_if_not_ok(&st, "leyendo una entrada del diccionario");
+		slot->tts_values[a] =
+			dbe_varlena_datum(data,
+							  TupleDescAttr(slot->tts_tupleDescriptor, a)->attalign,
+							  econtext->ecxt_per_tuple_memory);
+		slot->tts_isnull[a] = false;
+	}
 	pass = ExecQual(c->qual, econtext);
 	ResetExprContext(econtext);
+	slot->tts_values[a] = saved_value;
+	slot->tts_isnull[a] = saved_null;
 	*slot_result = pass ? DQ_PASS : DQ_FAIL;
 	return pass;
+}
+
+static bool
+dbe_dictqual_eval_clause(DbeDictQual *dq, DbeDictClause *c, DbeRowCursor *cur,
+						 uint64 row, ExprContext *econtext,
+						 DbeDictFillFn fill, void *fill_arg)
+{
+	uint64		generation;
+	DbeSegReader *reader = dbe_cursor_reader(cur, c->attnum, &generation);
+	uint32		code = 0;
+	int32		isnull = 0;
+	bool		pass;
+
+	if (generation != c->generation)
+		dbe_dictqual_sync(dq, c, reader, generation);
+
+	if (!c->is_dict)
+	{
+		if (c->like != NULL && reader != NULL)
+		{
+			const void *data;
+			uint32		len;
+			int32		vnull;
+			int			r;
+			DbeStatus	st = dbe_segreader_get(reader, (uint32) row, &data,
+											   &len, &vnull);
+
+			dbe_error_if_not_ok(&st, "leyendo un valor de la columna");
+			if (vnull)
+				return false;	/* LIKE es estricto: NULL no pasa */
+			r = dbe_like_eval_stored(c->like, data);
+			if (r >= 0)
+				return r;
+		}
+		if (c->lazy && fill != NULL)
+			fill(fill_arg, c->attnum);
+		pass = ExecQual(c->qual, econtext);
+		ResetExprContext(econtext);
+		return pass;
+	}
+
+	{
+		DbeStatus	st = dbe_segreader_code(reader, (uint32) row, &code, &isnull);
+
+		dbe_error_if_not_ok(&st, "leyendo un código de diccionario");
+	}
+	return dbe_dictqual_resolve(c, reader, code, isnull != 0, econtext);
 }
 
 bool
@@ -521,6 +560,73 @@ dbe_dictqual_eval(DbeDictQual *dq, DbeRowCursor *cur, uint64 row,
 	pass = ExecQual(dq->rest, econtext);
 	ResetExprContext(econtext);
 	return pass;
+}
+
+bool
+dbe_dictqual_prefilter(DbeDictQual *dq, DbeRowCursor *cur, uint32 nrows,
+					   uint8 *sel, ExprContext *econtext)
+{
+	bool		any = false;
+
+	/* Sin cláusulas de diccionario no hay nada que decidir por código. */
+	if (dq->nclauses == 0)
+		return false;
+	memset(sel, dq->rest != NULL ? DBE_SEL_CHECK : DBE_SEL_PASS, nrows);
+	for (int i = 0; i < dq->nclauses; i++)
+	{
+		DbeDictClause *c = &dq->clauses[i];
+		uint64		generation;
+		DbeSegReader *reader = dbe_cursor_reader(cur, c->attnum, &generation);
+
+		if (generation != c->generation)
+			dbe_dictqual_sync(dq, c, reader, generation);
+		if (!c->is_dict)
+		{
+			/* Sin diccionario en este stripe: fila por fila. */
+			for (uint32 r = 0; r < nrows; r++)
+				if (sel[r] == DBE_SEL_PASS)
+					sel[r] = DBE_SEL_CHECK;
+			continue;
+		}
+
+		if (dq->codes_cap < nrows)
+		{
+			if (dq->codes != NULL)
+				pfree(dq->codes);
+			dq->codes = (uint32 *) MemoryContextAlloc(dq->cxt,
+													  sizeof(uint32) * nrows);
+			dq->codes_cap = nrows;
+		}
+		{
+			DbeStatus	st = dbe_segreader_codes(reader, 0, nrows, dq->codes);
+
+			dbe_error_if_not_ok(&st, "leyendo los códigos de diccionario");
+		}
+		any = true;
+
+		/*
+		 * Solo las filas que el cursor va a visitar: las de un gránulo que
+		 * el zone map descarta no se piden, y resolver sus códigos podía
+		 * costar un LIKE por entrada que nadie iba a mirar.
+		 */
+		for (uint64 r = dbe_cursor_next_live_row(cur, 0); r < nrows;
+			 r = dbe_cursor_next_live_row(cur, r + 1))
+		{
+			uint32		code = dq->codes[r];
+			bool		isnull = (code == DBE_NULL_CODE);
+			uint8		res;
+
+			if (sel[r] == DBE_SEL_FAIL)
+				continue;
+			res = isnull ? c->null_result : c->result[code];
+			if (res == DQ_UNKNOWN)
+				res = dbe_dictqual_resolve(c, reader, code, isnull, econtext)
+					? DQ_PASS : DQ_FAIL;
+			if (res == DQ_FAIL)
+				sel[r] = DBE_SEL_FAIL;
+		}
+	}
+	return any;
 }
 
 void

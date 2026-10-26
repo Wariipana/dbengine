@@ -141,6 +141,37 @@ verificar_dict(const char *caso, const SegmentReader &r,
 	}
 }
 
+// codes() contra code() fila por fila: desde el principio, desde el medio
+// con un largo que no es múltiplo de nada, y vacío.
+static void
+verificar_codes(const char *caso, const SegmentReader &r, uint32_t filas)
+{
+	uint32_t	n;
+
+	if (!r.dict(&n))
+		return;
+	const uint32_t tramos[][2] = {{0, filas}, {filas / 3, filas - filas / 3 - 1},
+								  {filas / 2, 0}};
+
+	for (const auto &t : tramos)
+	{
+		std::vector<uint32_t> got(t[1] + 1, 12345);
+
+		r.codes(t[0], t[1], got.data());
+		for (uint32_t i = 0; i < t[1]; i++)
+		{
+			uint32_t	code;
+			bool		is_null;
+
+			r.code(t[0] + i, &code, &is_null);
+			if (got[i] != (is_null ? SegmentReader::kNullCode : code))
+				fallar(caso, "codes() distinto de code()", t[0] + i);
+		}
+		if (got[t[1]] != 12345)
+			fallar(caso, "codes() escribió de más", t[0] + t[1]);
+	}
+}
+
 // dict_contains() contra buscar a mano en la entrada descomprimida.  La
 // cabecera que se saltea depende del primer byte (1 a 3 bytes acá, que no
 // es el varlena de verdad: lo que se prueba es que se respete la tabla).
@@ -247,6 +278,7 @@ probar(const char *caso, uint32_t ancho, const std::vector<Valor> &ref,
 		verificar_get(caso, r, ref, salteado);
 		verificar_get(caso, r, ref, azar);
 		verificar_dict(caso, r, ref);
+		verificar_codes(caso, r, n);
 		verificar_contains(caso, r);
 		verificar_vector(caso, r, ref, ancho);
 		verificar_get(caso, r, ref, adelante);

@@ -1077,6 +1077,29 @@ SegmentReader::code(uint32_t row, uint32_t *code_out, bool *is_null) const
 }
 
 void
+SegmentReader::codes(uint32_t start, uint32_t count, uint32_t *out) const
+{
+	if (start > header_.row_count || count > header_.row_count - start)
+		throw Error(DBE_ERR_INVALID_ARGUMENT, "filas fuera de rango en el segmento");
+	if (header_.encoding != kEncDict && header_.encoding != kEncDictFsst)
+		throw Error(DBE_ERR_INTERNAL, "codes() sobre un segmento sin diccionario");
+
+	for (uint32_t i = 0; i < count; i++)
+		out[i] = (uint32_t) bitpack_get(codes_, start + i, header_.bit_width);
+	for (uint32_t i = 0; i < count; i++)
+		if (out[i] >= header_.aux_count)
+			throw Error(DBE_ERR_INTERNAL, "código de diccionario fuera de rango");
+	if (nulls_ != nullptr)
+		for (uint32_t i = 0; i < count; i++)
+		{
+			uint32_t	row = start + i;
+
+			if ((nulls_[row / 8] & (1u << (row % 8))) == 0)
+				out[i] = kNullCode;
+		}
+}
+
+void
 SegmentReader::dict_value(uint32_t idx, const uint8_t **data,
 						  uint32_t *len) const
 {

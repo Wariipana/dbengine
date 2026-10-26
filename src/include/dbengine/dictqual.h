@@ -55,6 +55,29 @@ extern bool dbe_dictqual_eval(DbeDictQual *dq, DbeRowCursor *cur, uint64 row,
 							  ExprContext *econtext,
 							  DbeDictFillFn fill, void *fill_arg);
 
+/*
+ * Para quien recorre un stripe entero: lee los códigos de todas sus filas de
+ * una vez y deja en sel[r], para cada una de las `nrows`:
+ *
+ *   DBE_SEL_FAIL   no pasa alguna cláusula de diccionario
+ *   DBE_SEL_PASS   pasa el WHERE entero
+ *   DBE_SEL_CHECK  hay que evaluarla con dbe_dictqual_eval(): quedan
+ *                  cláusulas que no son de diccionario, o el segmento de
+ *                  alguna no tiene diccionario en este stripe
+ *
+ * econtext->ecxt_scantuple tiene que ser un slot virtual de la relación;
+ * se usa para evaluar las cláusulas sobre los valores del diccionario y
+ * queda como estaba.  Devuelve false si ninguna cláusula se pudo decidir
+ * por código: todas las filas quedan para evaluar.
+ */
+#define DBE_SEL_FAIL	0
+#define DBE_SEL_PASS	1
+#define DBE_SEL_CHECK	2
+
+extern bool dbe_dictqual_prefilter(DbeDictQual *dq, DbeRowCursor *cur,
+								   uint32 nrows, uint8 *sel,
+								   ExprContext *econtext);
+
 /* Olvida los resultados: en un rescan pueden haber cambiado los Params. */
 extern void dbe_dictqual_reset(DbeDictQual *dq);
 

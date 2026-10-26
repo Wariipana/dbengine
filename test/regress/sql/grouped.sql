@@ -408,14 +408,16 @@ CREATE TABLE fxh AS SELECT * FROM fx;
 EXPLAIN (COSTS OFF)
 SELECT a, b, count(*), sum(v), avg(w) FROM fx GROUP BY a, b;
 
-CREATE FUNCTION fx_check(q text) RETURNS bool LANGUAGE plpgsql AS $$
+-- La misma query contra la tabla y contra su copia en heap (`t` y `t`h).
+CREATE FUNCTION fx_check(q text, t text DEFAULT 'fx') RETURNS bool
+LANGUAGE plpgsql AS $$
 DECLARE
 	x bigint;
 	y bigint;
 BEGIN
 	EXECUTE format('SELECT sum(hashtext(r::text)::bigint) FROM (%s) r', q) INTO x;
 	EXECUTE format('SELECT sum(hashtext(r::text)::bigint) FROM (%s) r',
-				   replace(q, 'FROM fx', 'FROM fxh')) INTO y;
+				   replace(q, 'FROM ' || t || ' ', 'FROM ' || t || 'h ')) INTO y;
 	RETURN x IS NOT DISTINCT FROM y;
 END $$;
 
@@ -457,6 +459,22 @@ SELECT (SELECT sum(hashtext(g || ':' || coalesce(h, -1) || ':' || c || ':' || co
 	AS volcado_igual;
 RESET work_mem;
 
+-- Corridas: filas seguidas con las mismas claves van a la tabla una vez,
+-- como estados.  Corridas de largo variable, con nulos en las claves y en
+-- los argumentos, que cruzan de un stripe a otro, y volcado.
+CREATE TABLE fr (g int8, h int4, v int4, s text) USING dbengine_columnar;
+INSERT INTO fr SELECT i / 7, CASE WHEN (i / 7) % 11 = 0 THEN NULL ELSE (i / 7) % 3 END,
+	CASE WHEN i % 5 = 0 THEN NULL ELSE i % 100 END, 's' || (i / 3) % 50
+	FROM generate_series(1, 150000) i;
+INSERT INTO fr SELECT 5, 1, i, NULL FROM generate_series(1, 70000) i;
+CREATE TABLE frh AS SELECT * FROM fr;
+SET work_mem = '64kB';
+SELECT fx_check('SELECT g, h, count(*), count(v), sum(v), avg(v), min(v), max(v) FROM fr GROUP BY g, h', 'fr') AS corridas;
+SELECT fx_check('SELECT h, count(DISTINCT g), count(*), sum(v) FROM fr GROUP BY h', 'fr') AS corridas_distinct;
+SELECT fx_check('SELECT g, count(DISTINCT h) FROM fr GROUP BY g', 'fr') AS corridas_distinct_volcado;
+RESET work_mem;
+DROP TABLE fr, frh;
+
 -- Rescan: del lado de adentro de un nested loop, la tabla se vacía y se
 -- llena de nuevo por cada fila de afuera.
 SET enable_hashjoin = off;
@@ -492,7 +510,7 @@ SELECT (SELECT sum(hashtext(coalesce(u, '-') || ':' || c || ':' || s || ':' || a
 	AS texto_volcado_igual;
 SELECT (SELECT count(*) FROM (SELECT u FROM ft GROUP BY u) x)
 	 = (SELECT count(*) FROM (SELECT u FROM fth GROUP BY u) y) AS texto_grupos;
-SELECT fx_check('SELECT v, count(*), min(n), max(n) FROM ft GROUP BY v') AS varchar_igual;
+SELECT fx_check('SELECT v, count(*), min(n), max(n) FROM ft GROUP BY v', 'ft') AS varchar_igual;
 -- Una constante en el SELECT sale tal cual (q35: SELECT 1, URL, count(*)).
 EXPLAIN (COSTS OFF) SELECT 1, u, count(*) FROM ft GROUP BY 1, u;
 SELECT (SELECT sum(hashtext(k || ':' || coalesce(u, '-') || ':' || c)::bigint)
@@ -503,9 +521,31 @@ SELECT (SELECT sum(hashtext(k || ':' || coalesce(u, '-') || ':' || c)::bigint)
 -- Un LIMIT corta con particiones sin procesar: se tienen que cerrar al
 -- terminar el nodo, sin WARNING de archivos abiertos.
 SELECT count(*) FROM (SELECT u, count(*) FROM ft GROUP BY u LIMIT 5) x;
-RESET work_mem;
--- Texto junto a otra clave: sin caché por código, al plan de siempre.
+-- Texto junto a otras claves: el hash del texto se calcula una vez por
+-- código del diccionario y se combina con el de las demás.
 EXPLAIN (COSTS OFF) SELECT u, n, count(*) FROM ft GROUP BY u, n;
+SELECT fx_check('SELECT u, n, count(*), sum(n) FROM ft GROUP BY u, n', 'ft') AS texto_y_entero;
+SELECT fx_check('SELECT u, v, count(*), min(n) FROM ft GROUP BY u, v', 'ft') AS dos_textos;
+-- count(DISTINCT) por grupo: un nivel por (claves, columna) con los demás
+-- agregados, y otro por las claves que cuenta los valores no nulos.  Con
+-- la columna de texto o entera, muchos grupos y volcado en los dos niveles.
+EXPLAIN (COSTS OFF) SELECT v, count(DISTINCT u), count(*) FROM ft GROUP BY v;
+SELECT fx_check('SELECT v, count(DISTINCT u), count(*), sum(n), avg(n), min(n) FROM ft GROUP BY v', 'ft') AS distinct_texto;
+SELECT fx_check('SELECT v, count(DISTINCT n), count(n) FROM ft GROUP BY v', 'ft') AS distinct_entero;
+SELECT fx_check('SELECT u, count(DISTINCT v), max(n) FROM ft GROUP BY u', 'ft') AS distinct_muchos_grupos;
+SELECT fx_check('SELECT n, count(DISTINCT u) FROM ft WHERE u LIKE ''url/1%'' AND n > 10 GROUP BY n', 'ft') AS distinct_where;
+-- El segundo nivel vuelca estados con claves enteras: sus particiones no
+-- tienen registros de un solo largo.
+SELECT fx_check('SELECT n, count(DISTINCT u) FROM ft GROUP BY n', 'ft') AS distinct_volcado_entero;
+-- Dos columnas distintas bajo DISTINCT: no entra, el plan de siempre.
+EXPLAIN (COSTS OFF) SELECT v, count(DISTINCT u), count(DISTINCT n) FROM ft GROUP BY v;
+SELECT fx_check('SELECT v, count(DISTINCT u), count(DISTINCT n) FROM ft GROUP BY v', 'ft') AS dos_distinct;
+-- El WHERE de diccionario se decide por stripe, con los códigos de todas
+-- las filas de una vez; con una cláusula más, esa fila por fila.
+SELECT fx_check('SELECT v, count(*) FROM ft WHERE u <> ''u3'' GROUP BY v', 'ft') AS prefiltro;
+SELECT fx_check('SELECT v, count(*) FROM ft WHERE u IS NULL OR u LIKE ''%ñ%'' GROUP BY v', 'ft') AS prefiltro_nulos;
+SELECT fx_check('SELECT v, count(*), sum(n) FROM ft WHERE u > ''url/2'' AND v <> ''v3'' AND n % 2 = 0 GROUP BY v', 'ft') AS prefiltro_y_resto;
+RESET work_mem;
 DROP TABLE ft, fth;
 
 -- En paralelo: los participantes se reparten baldes de grupos por el hash de
@@ -539,13 +579,20 @@ SELECT (SELECT sum(hashtext(k || ':' || c || ':' || s)::bigint)
 	 = (SELECT sum(hashtext(k || ':' || c || ':' || s)::bigint)
 		FROM (SELECT k, count(*) c, sum(v) s FROM fpth GROUP BY k) y)
 	AS paralelo_texto;
+-- Con count(DISTINCT) el balde sale de las claves solas: cada participante
+-- emite grupos completos.
+EXPLAIN (COSTS OFF) SELECT v, count(DISTINCT k), count(*) FROM fpt GROUP BY v;
+SELECT fx_check('SELECT v, count(DISTINCT k), count(*) FROM fpt GROUP BY v', 'fpt') AS paralelo_distinct;
+SELECT fx_check('SELECT k, v, count(*) FROM fpt GROUP BY k, v', 'fpt') AS paralelo_texto_y_entero;
 SET max_parallel_workers = 0;
 SELECT count(*) AS grupos, sum(c) AS filas
 FROM (SELECT g, h, count(*) c FROM fxs GROUP BY g, h) x;
+SELECT fx_check('SELECT v, count(DISTINCT k), count(*) FROM fpt GROUP BY v', 'fpt') AS distinct_sin_workers;
 RESET max_parallel_workers;
 SET parallel_leader_participation = off;
 SELECT count(*) AS grupos, sum(c) AS filas
 FROM (SELECT g, h, count(*) c FROM fxs GROUP BY g, h) x;
+SELECT fx_check('SELECT v, count(DISTINCT k), count(*) FROM fpt GROUP BY v', 'fpt') AS distinct_sin_lider;
 RESET parallel_leader_participation;
 RESET work_mem;
 DROP TABLE fpt, fpth;
@@ -564,7 +611,7 @@ EXPLAIN (COSTS OFF) SELECT a, count(*) FROM fx GROUP BY a HAVING count(*) > 1;
 SET dbengine.enable_flat_hash = off;
 EXPLAIN (COSTS OFF) SELECT a, b, count(*), sum(v), avg(w) FROM fx GROUP BY a, b;
 
-DROP FUNCTION fx_check(text);
+DROP FUNCTION fx_check(text, text);
 DROP TABLE fx, fxh, fxs, fxsh;
 RESET max_parallel_workers_per_gather;
 DROP TABLE f, fh;

@@ -188,6 +188,12 @@ public:
 	/// devolvió true.
 	void		code(uint32_t row, uint32_t *code_out, bool *is_null) const;
 
+	/// Los códigos de `count` filas desde `start`, de una vez: para filtrar
+	/// un stripe entero sin una llamada por fila.  Una fila nula queda con
+	/// kNullCode.
+	static constexpr uint32_t kNullCode = UINT32_MAX;
+	void		codes(uint32_t start, uint32_t count, uint32_t *out) const;
+
 	/// Valor de una entrada del diccionario.
 	void		dict_value(uint32_t idx, const uint8_t **data,
 						   uint32_t *len) const;

@@ -286,6 +286,9 @@ typedef struct DbeVectorAggState
 	uint64		qual_row;		/* fila que se está evaluando, para el fill */
 	int16	   *qual_typlen;
 	bool	   *qual_typbyval;
+	uint8	   *sel;			/* dbe_agg_prefilter(): un byte por fila */
+	uint64		sel_cap;
+	uint8	   *stripe_sel;		/* el del stripe que se recorre, o NULL */
 	uint64		rows_filtered;
 	uint64		stripes_pruned;	/* total del plan, solo si totals_ready */
 	uint64		granules_pruned;
@@ -358,6 +361,21 @@ typedef struct DbeVectorAggState
 	bool	   *flat_valnulls;
 	Datum	   *flat_outs;
 	bool	   *flat_outnulls;
+
+	/*
+	 * count(DISTINCT col) por grupo: `flatagg` agrupa por las claves más la
+	 * columna, con los demás agregados, y `flatdist` por las claves solas,
+	 * con los agregados en el orden del tlist.  flat_dist es el índice en
+	 * `aggs` del primer count(DISTINCT), -1 sin ninguno.  flat_map[j] es
+	 * dónde empieza en los estados de `flatagg` el agregado j de `flatdist`,
+	 * o -1 si es un count(DISTINCT), que suma 1 por valor no nulo.
+	 */
+	DbeFlatAgg *flatdist;
+	int			flat_dist;
+	int		   *flat_map;
+	DbeFlatAggDef *flat_defs2;
+	int			flat_ndefs2;
+	uint64	   *flat_states2;
 
 	/*
 	 * En paralelo cada balde recorre la tabla entera y vuelve a descartar
@@ -485,12 +503,12 @@ dbe_agg_supported(Aggref *ref, Index relid, AttrNumber *attnum,
 	 * fila para llegar hasta él.  Solo count(): los demás agregados sobre
 	 * DISTINCT necesitarían además el valor, no solo saber si ya se vio.
 	 *
-	 * Y solo sin GROUP BY: por grupo haría falta un conjunto por grupo, que
-	 * es otra estructura y otra decisión de memoria.
+	 * Por grupo lo resuelve solo la tabla propia (ver
+	 * dbe_flat_distinct_ok()); quien llama se encarga de exigirlo.
 	 */
 	if (ref->aggdistinct != NIL)
 	{
-		if (grouped || list_length(ref->args) != 1 ||
+		if (list_length(ref->args) != 1 ||
 			list_length(ref->aggdistinct) != 1)
 			return false;
 		if (get_func_name(ref->aggfnoid) == NULL ||
@@ -587,6 +605,45 @@ dbe_flat_key_ok(Oid typid, Oid eqop, Oid collid)
 	}
 	tc = lookup_type_cache(typid, TYPECACHE_EQ_OPR);
 	return OidIsValid(eqop) && eqop == tc->eq_opr;
+}
+
+/*
+ * ¿count(DISTINCT col) por grupo, con la tabla propia?  La columna tiene
+ * que servir de clave (dbe_flat_key_ok()) con el operador del DISTINCT: la
+ * tabla agrupa primero por las claves más la columna, y después por las
+ * claves solas contando los valores no nulos (ver dbe_agg_fill_flat()).
+ */
+static bool
+dbe_flat_distinct_ok(Aggref *ref, Index relid, AttrNumber *attnum)
+{
+	HeapTuple	tup;
+	Form_pg_aggregate aggform;
+	Var		   *var;
+	SortGroupClause *sgc;
+	bool		ok;
+
+	if (ref->aggdistinct == NIL || list_length(ref->aggdistinct) != 1 ||
+		list_length(ref->args) != 1 || ref->aggorder != NIL ||
+		ref->aggfilter != NULL || ref->aggvariadic ||
+		ref->aggkind != AGGKIND_NORMAL)
+		return false;
+	var = (Var *) ((TargetEntry *) linitial(ref->args))->expr;
+	if (!IsA(var, Var) || var->varattno <= 0 || var->varlevelsup != 0 ||
+		(relid != 0 && var->varno != (int) relid))
+		return false;
+
+	tup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(ref->aggfnoid));
+	if (!HeapTupleIsValid(tup))
+		return false;
+	aggform = (Form_pg_aggregate) GETSTRUCT(tup);
+	ok = aggform->aggtransfn == F_INT8INC_ANY && !OidIsValid(aggform->aggfinalfn);
+	ReleaseSysCache(tup);
+
+	sgc = linitial_node(SortGroupClause, ref->aggdistinct);
+	if (!ok || !dbe_flat_key_ok(var->vartype, sgc->eqop, ref->inputcollid))
+		return false;
+	*attnum = var->varattno;
+	return true;
 }
 
 /*
@@ -1047,6 +1104,9 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	bool		partial_ok = true;
 	bool		has_const = false;
 	int			nflat_aggs = 0;
+	AttrNumber	dist_attnum = InvalidAttrNumber;
+	Node	   *dist_expr = NULL;
+	double		flat_groups = 1;	/* las entradas de la tabla propia */
 
 	if (prev_create_upper_paths_hook)
 		prev_create_upper_paths_hook(root, stage, input_rel, output_rel, extra);
@@ -1200,9 +1260,28 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 			if (!dbe_agg_supported((Aggref *) tle->expr, input_rel->relid,
 								   &attnum, grouped, &is_distinct))
 				return;
-			if (flat_ok &&
-				(!dbe_flat_agg_def((Aggref *) tle->expr, input_rel->relid, &def) ||
-				 ++nflat_aggs > 32))
+
+			/*
+			 * count(DISTINCT) por grupo: todos sobre la misma columna, que
+			 * es la que la tabla agrega como clave del primer nivel.
+			 */
+			if (is_distinct && grouped)
+			{
+				AttrNumber	da;
+
+				if (!flat_ok ||
+					!dbe_flat_distinct_ok((Aggref *) tle->expr,
+										  input_rel->relid, &da) ||
+					(dist_attnum != InvalidAttrNumber && da != dist_attnum) ||
+					++nflat_aggs > 32)
+					return;
+				dist_attnum = da;
+				dist_expr = (Node *) ((TargetEntry *)
+									  linitial(((Aggref *) tle->expr)->args))->expr;
+			}
+			else if (flat_ok &&
+					 (!dbe_flat_agg_def((Aggref *) tle->expr, input_rel->relid, &def) ||
+					  ++nflat_aggs > 32))
 				flat_ok = false;
 			agg_attnums = lappend_int(agg_attnums, attnum);
 			if (is_distinct)
@@ -1275,23 +1354,16 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	if (grouped &&
 		list_length(group_attnums) != list_length(root->processed_groupClause))
 		return;
-	if (list_length(group_attnums) > DBE_FLAT_MAX_KEYS)
+	if (list_length(group_attnums) + (dist_attnum != InvalidAttrNumber) >
+		DBE_FLAT_MAX_KEYS)
 		flat_ok = false;
-
-	/*
-	 * Una clave de texto rinde sola, con la caché por código del
-	 * diccionario.  Junto a otras se hashea el texto en cada fila, y ahí el
-	 * camino paralelo gana: q17 y q18 (UserID, SearchPhrase) tardaban 3,37
-	 * y 2,05 s contra 3,1 y 1,59.
-	 */
-	if (flat_ok && list_length(group_attnums) > 1)
+	if (grouped && n_distinct > 0)
 	{
-		ListCell   *lg;
-
-		foreach(lg, group_attnums)
-			if (get_typlen(get_atttype(rte->relid, lfirst_int(lg))) == -1)
-				flat_ok = false;
+		if (!flat_ok)
+			return;
+		partial_ok = false;
 	}
+
 	if (has_const)
 	{
 		if (!flat_ok)
@@ -1355,6 +1427,11 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		 */
 		ngroups = estimate_num_groups(root, gexprs, input_path->rows,
 									  NULL, NULL);
+		flat_groups = ngroups;
+		if (dist_expr != NULL)
+			flat_groups = estimate_num_groups(root, lappend(list_copy(gexprs),
+															dist_expr),
+											  input_path->rows, NULL, NULL);
 
 		/*
 		 * Con casi un grupo por fila el parcial no reduce nada: el Finalize
@@ -1613,7 +1690,9 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 			 */
 			path->path.startup_cost = input_path->total_cost * 0.35 +
 				cpu_operator_cost * nagg * 0.3 * in_rows;
-			if (ngroups * (double) entry > hash_mem)
+			if (dist_expr != NULL)	/* el segundo nivel */
+				path->path.startup_cost += cpu_operator_cost * nagg * flat_groups;
+			if (flat_groups * (double) entry > hash_mem)
 				path->path.startup_cost += 2.0 * seq_page_cost *
 					(in_rows * (double) (entry / 2) / BLCKSZ);
 			path->path.total_cost = path->path.startup_cost +
@@ -2515,39 +2594,132 @@ dbe_agg_begin_flat(DbeVectorAggState *state, CustomScan *cscan, int eflags)
 {
 	DbeFlatAggDef *defs = (DbeFlatAggDef *)
 		palloc0(sizeof(DbeFlatAggDef) * Max(state->naggs, 1));
+	DbeFlatAggDef *defs2 = (DbeFlatAggDef *)
+		palloc0(sizeof(DbeFlatAggDef) * Max(state->naggs, 1));
+	int		   *map = (int *) palloc0(sizeof(int) * Max(state->naggs, 1));
+	int16		keylen[DBE_FLAT_MAX_KEYS];
+	int			nkeys = state->ngroupcols;
 	int			n = 0;
+	int			n2 = 0;
+	int			off = 0;
+	int			words2 = 0;
+	int			i = 0;
 	ListCell   *lc;
 	double		est = (double) intVal(list_nth(cscan->custom_private, 7));
+	Size		budget = get_hash_memory_limit();
 
+	state->flat_dist = -1;
 	foreach(lc, cscan->custom_scan_tlist)
 	{
 		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+		Aggref	   *ref = (Aggref *) tle->expr;
+		AttrNumber	da;
 
-		if (!IsA(tle->expr, Aggref))
+		/* `aggs` va paralelo a custom_scan_tlist. */
+		i++;
+		if (!IsA(ref, Aggref))
 			continue;
-		if (!dbe_flat_agg_def((Aggref *) tle->expr, 0, &defs[n]))
-			elog(ERROR, "dbengine: el agregado %d no sirve para la tabla propia",
-				 n + 1);
-		n++;
+		if (ref->aggdistinct != NIL)
+		{
+			if (!dbe_flat_distinct_ok(ref, 0, &da))
+				elog(ERROR, "dbengine: el count(DISTINCT) no sirve para la tabla propia");
+			if (state->flat_dist < 0)
+				state->flat_dist = i - 1;
+			defs2[n2].kind = DBE_FLAT_COUNT_STAR;
+			defs2[n2].vallen = 0;
+			map[n2] = -1;
+		}
+		else
+		{
+			if (!dbe_flat_agg_def(ref, 0, &defs[n]))
+				elog(ERROR, "dbengine: el agregado %d no sirve para la tabla propia",
+					 n + 1);
+			defs2[n2] = defs[n];
+			map[n2] = off;
+			off += dbe_flat_state_words(defs[n].kind);
+			n++;
+		}
+		words2 += dbe_flat_state_words(defs2[n2].kind);
+		n2++;
 	}
 
 	/* Un EXPLAIN sin ANALYZE no ejecuta: no hace falta la tabla. */
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 	{
 		pfree(defs);
+		pfree(defs2);
+		pfree(map);
 		return;
 	}
 
-	state->flatagg = dbe_flat_create(state->ngroupcols, state->group_typlen,
-									 n, defs, get_hash_memory_limit(), est);
+	memcpy(keylen, state->group_typlen, sizeof(int16) * nkeys);
+	if (state->flat_dist >= 0)
+	{
+		/*
+		 * El segundo nivel suele ser chico —q10: 3.586 regiones contra
+		 * millones de pares región, usuario—: se lleva un cuarto de la
+		 * memoria.
+		 */
+		keylen[nkeys++] = state->aggs[state->flat_dist].inputtyplen;
+		state->flatdist = dbe_flat_create(state->ngroupcols, state->group_typlen,
+										  n2, defs2, budget / 4, est);
+		state->flat_map = map;
+		state->flat_defs2 = defs2;
+		state->flat_ndefs2 = n2;
+		state->flat_states2 = (uint64 *) palloc0(sizeof(uint64) * Max(words2, 1));
+		budget -= budget / 4;
+	}
+	else
+	{
+		pfree(defs2);
+		pfree(map);
+	}
+	state->flatagg = dbe_flat_create(nkeys, keylen, n, defs, budget, est);
 	state->flat_filled = false;
-	state->flat_keys = (Datum *) palloc0(sizeof(Datum) * state->ngroupcols);
-	state->flat_keynulls = (bool *) palloc0(sizeof(bool) * state->ngroupcols);
+	state->flat_keys = (Datum *) palloc0(sizeof(Datum) * nkeys);
+	state->flat_keynulls = (bool *) palloc0(sizeof(bool) * nkeys);
 	state->flat_vals = (Datum *) palloc0(sizeof(Datum) * Max(n, 1));
 	state->flat_valnulls = (bool *) palloc0(sizeof(bool) * Max(n, 1));
-	state->flat_outs = (Datum *) palloc0(sizeof(Datum) * Max(n, 1));
-	state->flat_outnulls = (bool *) palloc0(sizeof(bool) * Max(n, 1));
+	state->flat_outs = (Datum *) palloc0(sizeof(Datum) * Max(n2, 1));
+	state->flat_outnulls = (bool *) palloc0(sizeof(bool) * Max(n2, 1));
 	pfree(defs);
+}
+
+/*
+ * Con count(DISTINCT): pasa los grupos del primer nivel al segundo, que es
+ * el que se emite.  Cada uno aporta sus estados a los agregados comunes, y
+ * 1 a cada count(DISTINCT) si el valor no es nulo.
+ */
+static void
+dbe_agg_flat_distinct(DbeVectorAggState *state)
+{
+	int			nk = state->ngroupcols;
+	const uint64 *st;
+
+	dbe_flat_input_done(state->flatagg);
+	while (dbe_flat_next_states(state->flatagg, state->flat_keys,
+								state->flat_keynulls, &st))
+	{
+		int			w = 0;
+
+		for (int j = 0; j < state->flat_ndefs2; j++)
+		{
+			const DbeFlatAggDef *d = &state->flat_defs2[j];
+			int			nw;
+
+			if (state->flat_map[j] < 0)
+			{
+				state->flat_states2[w++] = state->flat_keynulls[nk] ? 0 : 1;
+				continue;
+			}
+			nw = dbe_flat_state_words(d->kind);
+			memcpy(&state->flat_states2[w], &st[state->flat_map[j]],
+				   sizeof(uint64) * nw);
+			w += nw;
+		}
+		dbe_flat_add_states(state->flatdist, state->flat_keys,
+							state->flat_keynulls, state->flat_states2);
+	}
 }
 
 static void
@@ -2930,6 +3102,58 @@ dbe_vec_value(DbeColumnVector *vec, uint64 row, bool typbyval, int16 typlen,
  *
  * Los stripes que el zone map descarta no llegan hasta acá.
  */
+/*
+ * El slot contra el que se evalúa el WHERE, listo y puesto en el
+ * ExprContext.
+ *
+ * Se prepara una sola vez.  Es virtual y nadie lo materializa, así que
+ * después alcanza con pisar las columnas del predicado: las demás quedan
+ * en NULL para siempre, que es correcto porque el predicado no las mira.
+ * Limpiar y rearmar el slot por fila costaba un memset de natts más dos
+ * llamadas, por cada fila candidata.
+ */
+static pg_attribute_always_inline TupleTableSlot *
+dbe_agg_qual_slot(DbeVectorAggState *state)
+{
+	TupleTableSlot *slot = state->rel_slot;
+
+	if (TTS_EMPTY(slot))
+	{
+		ExecClearTuple(slot);
+		memset(slot->tts_isnull, true,
+			   sizeof(bool) * slot->tts_tupleDescriptor->natts);
+		ExecStoreVirtualTuple(slot);
+	}
+	state->css.ss.ps.ps_ExprContext->ecxt_scantuple = slot;
+	return slot;
+}
+
+/*
+ * El WHERE de un stripe entero, con los códigos del diccionario: ver
+ * dbe_dictqual_prefilter().  NULL si no hay WHERE o no se pudo decidir
+ * nada por código; si no, un byte por fila, que vale hasta el próximo
+ * stripe.
+ */
+static uint8 *
+dbe_agg_prefilter(DbeVectorAggState *state, uint64 nrows)
+{
+	if (state->qual == NULL)
+		return NULL;
+	if (state->sel_cap < nrows)
+	{
+		if (state->sel != NULL)
+			pfree(state->sel);
+		state->sel = (uint8 *) MemoryContextAlloc(GetMemoryChunkContext(state),
+												  nrows);
+		state->sel_cap = nrows;
+	}
+	dbe_agg_qual_slot(state);
+	if (!dbe_dictqual_prefilter(state->qual, state->cursor, (uint32) nrows,
+								state->sel, state->css.ss.ps.ps_ExprContext))
+		return NULL;
+	return state->sel;
+}
+
 /* Carga en el slot una columna perezosa: ver dbe_dictqual_lazy_column(). */
 static void
 dbe_agg_fill_qualcol(void *arg, AttrNumber attnum)
@@ -2953,24 +3177,9 @@ dbe_agg_fill_qualcol(void *arg, AttrNumber attnum)
 static bool
 dbe_agg_row_passes(DbeVectorAggState *state, uint64 row)
 {
-	TupleTableSlot *slot = state->rel_slot;
+	TupleTableSlot *slot = dbe_agg_qual_slot(state);
 	ExprContext *econtext = state->css.ss.ps.ps_ExprContext;
 	int			i;
-
-	/*
-	 * El slot se prepara una sola vez.  Es virtual y nadie lo materializa,
-	 * así que después alcanza con pisar las columnas del predicado: las
-	 * demás quedan en NULL para siempre, que es correcto porque el
-	 * predicado no las mira.  Limpiar y rearmar el slot por fila costaba un
-	 * memset de natts más dos llamadas, por cada fila candidata.
-	 */
-	if (TTS_EMPTY(slot))
-	{
-		ExecClearTuple(slot);
-		memset(slot->tts_isnull, true,
-			   sizeof(bool) * slot->tts_tupleDescriptor->natts);
-		ExecStoreVirtualTuple(slot);
-	}
 
 	for (i = 0; i < state->nqualcols; i++)
 	{
@@ -2988,6 +3197,21 @@ dbe_agg_row_passes(DbeVectorAggState *state, uint64 row)
 	state->qual_row = row;
 	return dbe_dictqual_eval(state->qual, state->cursor, row, econtext,
 							 dbe_agg_fill_qualcol, state);
+}
+
+/*
+ * ¿Pasa la fila el WHERE?  Con el byte del prefiltro del stripe si lo hay
+ * (`sel`, de dbe_agg_prefilter()), y si no, o si el byte no alcanza, fila
+ * por fila.
+ */
+static pg_attribute_always_inline bool
+dbe_agg_row_selected(DbeVectorAggState *state, const uint8 *sel, uint64 row)
+{
+	if (state->qual == NULL)
+		return true;
+	if (sel != NULL && sel[row] != DBE_SEL_CHECK)
+		return sel[row] == DBE_SEL_PASS;
+	return dbe_agg_row_passes(state, row);
 }
 
 /* ------------------------------------------------------------------------
@@ -3369,6 +3593,7 @@ dbe_agg_fill_hash(DbeVectorAggState *state)
 		 * los gránulos que igual no pueden tener filas que pasen se saltean
 		 * enteros en vez de recorrerse fila por fila.
 		 */
+		state->stripe_sel = dbe_agg_prefilter(state, nrows);
 		for (row = dbe_cursor_next_live_row(state->cursor, 0); row < nrows;
 			 row = dbe_cursor_next_live_row(state->cursor, row + 1))
 		{
@@ -3382,7 +3607,7 @@ dbe_agg_fill_hash(DbeVectorAggState *state)
 			if (!all_visible &&
 				!dbe_cursor_row_is_visible(state->cursor, row))
 				continue;
-			if (state->qual != NULL && !dbe_agg_row_passes(state, row))
+			if (!dbe_agg_row_selected(state, state->stripe_sel, row))
 			{
 				state->rows_filtered++;
 				continue;
@@ -3614,6 +3839,103 @@ dbe_agg_exec_hashed(CustomScanState *node)
 	return slot;
 }
 
+/* Vacía las tablas propias: rescan, otro balde, o fin con un LIMIT. */
+static void
+dbe_agg_flat_reset(DbeVectorAggState *state)
+{
+	dbe_flat_reset(state->flatagg);
+	if (state->flatdist != NULL)
+		dbe_flat_reset(state->flatdist);
+}
+
+/*
+ * Las cifras del EXPLAIN.  Con count(DISTINCT) los grupos son los del
+ * segundo nivel, y el volcado y la memoria, los de los dos.
+ */
+static void
+dbe_agg_flat_stats(DbeVectorAggState *state, uint64 *groups, int *parts,
+				   uint64 *spilled, Size *peak)
+{
+	dbe_flat_stats(state->flatagg, groups, parts, spilled, peak);
+	if (state->flatdist != NULL)
+	{
+		int			p2;
+		uint64		s2;
+		Size		k2;
+
+		dbe_flat_stats(state->flatdist, groups, &p2, &s2, &k2);
+		*parts += p2;
+		*spilled += s2;
+		*peak += k2;
+	}
+}
+
+/*
+ * Una corrida de filas seguidas con las mismas claves (de ancho fijo), que
+ * va a la tabla una sola vez.  La tabla de ClickBench está ordenada por
+ * CounterID, fecha y UserID: en q9, de 10M filas 8,4M repiten el par
+ * (RegionID, UserID) de la anterior, y cuando el par no entraba en la tabla
+ * se volcaba una vez por fila.  Una corrida de una fila va como fila; una
+ * más larga, como estados.
+ */
+typedef struct DbeFlatRun
+{
+	int64		len;
+	Datum		keys[DBE_FLAT_MAX_KEYS];
+	bool		nulls[DBE_FLAT_MAX_KEYS];
+	Datum	   *vals;			/* los de la primera fila */
+	bool	   *valnulls;
+	uint64	   *states;			/* desde la segunda */
+} DbeFlatRun;
+
+static void
+dbe_agg_flat_flush_run(DbeVectorAggState *state, DbeFlatRun *run)
+{
+	if (run->len == 1)
+		dbe_flat_add(state->flatagg, run->keys, run->nulls, run->vals,
+					 run->valnulls);
+	else if (run->len > 1)
+		dbe_flat_add_states(state->flatagg, run->keys, run->nulls,
+							run->states);
+	run->len = 0;
+}
+
+/* Suma la fila de flat_keys/flat_vals a la corrida, o empieza otra. */
+static void
+dbe_agg_flat_run_add(DbeVectorAggState *state, DbeFlatRun *run, int nk,
+					 int nvals)
+{
+	DbeFlatAgg *fa = state->flatagg;
+
+	if (run->len > 0 &&
+		memcmp(run->nulls, state->flat_keynulls, sizeof(bool) * nk) == 0)
+	{
+		int			i;
+
+		for (i = 0; i < nk; i++)
+			if (!run->nulls[i] && run->keys[i] != state->flat_keys[i])
+				break;
+		if (i == nk)
+		{
+			if (run->len == 1)
+			{
+				memset(run->states, 0, sizeof(uint64) * dbe_flat_nstates(fa));
+				dbe_flat_accum(fa, run->states, run->vals, run->valnulls);
+			}
+			dbe_flat_accum(fa, run->states, state->flat_vals,
+						   state->flat_valnulls);
+			run->len++;
+			return;
+		}
+	}
+	dbe_agg_flat_flush_run(state, run);
+	memcpy(run->keys, state->flat_keys, sizeof(Datum) * nk);
+	memcpy(run->nulls, state->flat_keynulls, sizeof(bool) * nk);
+	memcpy(run->vals, state->flat_vals, sizeof(Datum) * nvals);
+	memcpy(run->valnulls, state->flat_valnulls, sizeof(bool) * nvals);
+	run->len = 1;
+}
+
 /*
  * Llena la tabla propia con todo el scan.  Es el mismo recorrido que
  * dbe_agg_fill_hash() sin el corte por memoria: la tabla vuelca sola.
@@ -3632,6 +3954,61 @@ dbe_agg_fill_flat(DbeVectorAggState *state, int bucket, uint32 nbuckets)
 	uint64	   *spill_states = NULL;	/* nstates por código volcado */
 	uint32_t   *spill_code = NULL;	/* el código de cada uno; dict_size = NULL */
 	uint32_t	nspill = 0;
+
+	/*
+	 * Varias claves con alguna de texto: el hash de cada texto con
+	 * diccionario se calcula una vez por código, y el de la fila combina esos
+	 * con los de las otras claves.  th_size[i] es el tamaño del diccionario
+	 * de la clave i en el stripe, 0 si no tiene o no es de texto.
+	 */
+	bool		multi_text = false;
+	uint64	   *th_hash[DBE_FLAT_MAX_KEYS] = {0};
+	bool	   *th_known[DBE_FLAT_MAX_KEYS] = {0};
+	uint32_t	th_cap[DBE_FLAT_MAX_KEYS] = {0};
+	uint32_t	th_size[DBE_FLAT_MAX_KEYS] = {0};
+	uint64		texthash[DBE_FLAT_MAX_KEYS];
+
+	/*
+	 * Con count(DISTINCT) la columna es una clave más, la última, y el
+	 * balde sale del hash de las otras: los grupos que se emiten son los de
+	 * `flatdist`.
+	 */
+	DbeAggState *dist = state->flat_dist >= 0 ? &state->aggs[state->flat_dist] : NULL;
+	uint8	   *sel;
+	bool		use_runs;
+	DbeFlatRun	run;
+	int			nk = state->ngroupcols + (dist != NULL);
+	uint32		groupmask = ((uint32) 1 << state->ngroupcols) - 1;
+	int16		ktyplen[DBE_FLAT_MAX_KEYS];
+	DbeColumnVector *kvec[DBE_FLAT_MAX_KEYS];
+
+	for (i = 0; i < state->ngroupcols; i++)
+	{
+		ktyplen[i] = state->group_typlen[i];
+		kvec[i] = &state->groupvecs[i];
+	}
+	if (dist != NULL)
+	{
+		ktyplen[nk - 1] = dist->inputtyplen;
+		kvec[nk - 1] = &dist->vec;
+	}
+	if (nk > 1)
+		for (i = 0; i < nk; i++)
+			if (ktyplen[i] == -1)
+				multi_text = true;
+
+	/* Las corridas, con claves de ancho fijo: se comparan como Datum. */
+	use_runs = true;
+	for (i = 0; i < nk; i++)
+		if (ktyplen[i] == -1)
+			use_runs = false;
+	if (use_runs)
+	{
+		run.len = 0;
+		run.vals = (Datum *) palloc(sizeof(Datum) * Max(state->naggs, 1));
+		run.valnulls = (bool *) palloc(sizeof(bool) * Max(state->naggs, 1));
+		run.states = (uint64 *) palloc(sizeof(uint64) * Max(nstates, 1));
+	}
 
 	for (;;)
 	{
@@ -3688,7 +4065,8 @@ dbe_agg_fill_flat(DbeVectorAggState *state, int bucket, uint32 nbuckets)
 		 * otro balde, y <= -3 el estado parcial número -3 - v.
 		 */
 		dict_size = 0;
-		if (state->ngroupcols == 1 && state->group_typlen[0] == -1 &&
+		if (dist == NULL && state->ngroupcols == 1 &&
+			state->group_typlen[0] == -1 &&
 			state->groupvec_ok[0] && state->groupvecs[0].reader != NULL)
 		{
 			int32_t		is_dict = 0;
@@ -3719,16 +4097,52 @@ dbe_agg_fill_flat(DbeVectorAggState *state, int bucket, uint32 nbuckets)
 			}
 		}
 
+		sel = dbe_agg_prefilter(state, nrows);
+
+		for (i = 0; multi_text && i < nk; i++)
+		{
+			int32_t		is_dict = 0;
+			uint32_t	n = 0;
+			bool		ok = i < state->ngroupcols ? state->groupvec_ok[i]
+				: dist->has_vector;
+
+			th_size[i] = 0;
+			if (ktyplen[i] != -1 || !ok || kvec[i]->reader == NULL)
+				continue;
+			{
+				DbeStatus	st = dbe_segreader_dict(kvec[i]->reader,
+													&is_dict, &n);
+
+				dbe_error_if_not_ok(&st, "consultando el diccionario del segmento");
+			}
+			if (!is_dict || n == 0)
+				continue;
+			if (th_cap[i] < n)
+			{
+				if (th_hash[i] != NULL)
+				{
+					pfree(th_hash[i]);
+					pfree(th_known[i]);
+				}
+				th_cap[i] = n;
+				th_hash[i] = (uint64 *) palloc(sizeof(uint64) * n);
+				th_known[i] = (bool *) palloc(sizeof(bool) * n);
+			}
+			memset(th_known[i], 0, sizeof(bool) * n);
+			th_size[i] = n;
+		}
+
 		for (row = dbe_cursor_next_live_row(state->cursor, 0); row < nrows;
 			 row = dbe_cursor_next_live_row(state->cursor, row + 1))
 		{
 			int			v = 0;
 			int64	   *cached = NULL;
+			uint64		h = 0;
 
 			if (!all_visible &&
 				!dbe_cursor_row_is_visible(state->cursor, row))
 				continue;
-			if (state->qual != NULL && !dbe_agg_row_passes(state, row))
+			if (!dbe_agg_row_selected(state, sel, row))
 			{
 				/* Cada balde ve las mismas: las cuenta uno solo. */
 				if (bucket <= 0)
@@ -3764,9 +4178,56 @@ dbe_agg_fill_flat(DbeVectorAggState *state, int bucket, uint32 nbuckets)
 								  &state->flat_keys[i],
 								  &state->flat_keynulls[i]);
 			}
-			if (bucket >= 0 && (cached == NULL || *cached == -2) &&
-				dbe_flat_bucket(state->flatagg, state->flat_keys,
-								state->flat_keynulls, nbuckets) != (uint32) bucket)
+			if (dist != NULL)
+			{
+				if (!dist->has_vector)
+					dbe_agg_missing_value(state, dist->attnum,
+										  &state->flat_keys[nk - 1],
+										  &state->flat_keynulls[nk - 1]);
+				else
+					dbe_vec_value(&dist->vec, row, dist->inputtypbyval,
+								  dist->inputtyplen, &state->flat_keys[nk - 1],
+								  &state->flat_keynulls[nk - 1]);
+			}
+			if (multi_text)
+			{
+				uint32		have = 0;
+
+				for (i = 0; i < nk; i++)
+				{
+					uint32_t	code;
+					int32_t		code_null;
+					DbeStatus	st;
+
+					if (th_size[i] == 0 || state->flat_keynulls[i])
+						continue;
+					st = dbe_segreader_code(kvec[i]->reader,
+											(uint32_t) row, &code, &code_null);
+					dbe_error_if_not_ok(&st, "leyendo el código del diccionario");
+					if (!th_known[i][code])
+					{
+						th_hash[i][code] = dbe_flat_text_hash(state->flat_keys[i]);
+						th_known[i][code] = true;
+					}
+					texthash[i] = th_hash[i][code];
+					have |= (uint32) 1 << i;
+				}
+				h = dbe_flat_hash_keys(state->flatagg, state->flat_keys,
+									   state->flat_keynulls, texthash, have);
+				if (bucket >= 0 &&
+					dbe_flat_bucket_of(dist == NULL ? h
+									   : dbe_flat_hash_keys(state->flatdist,
+															state->flat_keys,
+															state->flat_keynulls,
+															texthash,
+															have & groupmask),
+									   nbuckets) != (uint32) bucket)
+					continue;
+			}
+			else if (bucket >= 0 && (cached == NULL || *cached == -2) &&
+					 dbe_flat_bucket(dist != NULL ? state->flatdist : state->flatagg,
+									 state->flat_keys, state->flat_keynulls,
+									 nbuckets) != (uint32) bucket)
 			{
 				if (cached != NULL)
 					*cached = -1;
@@ -3778,7 +4239,7 @@ dbe_agg_fill_flat(DbeVectorAggState *state, int bucket, uint32 nbuckets)
 			{
 				DbeAggState *agg = &state->aggs[i];
 
-				if (agg->is_group)
+				if (agg->is_group || agg->is_distinct)
 					continue;
 				if (agg->is_count_star)
 				{
@@ -3789,6 +4250,18 @@ dbe_agg_fill_flat(DbeVectorAggState *state, int bucket, uint32 nbuckets)
 					dbe_agg_value(state, agg, row, &state->flat_vals[v],
 								  &state->flat_valnulls[v]);
 				v++;
+			}
+			if (multi_text)
+			{
+				dbe_flat_add_hashed(state->flatagg, h, state->flat_keys,
+									state->flat_keynulls, state->flat_vals,
+									state->flat_valnulls);
+				continue;
+			}
+			if (cached == NULL && use_runs)
+			{
+				dbe_agg_flat_run_add(state, &run, nk, v);
+				continue;
 			}
 			if (cached == NULL)
 			{
@@ -3841,8 +4314,8 @@ dbe_agg_fill_flat(DbeVectorAggState *state, int bucket, uint32 nbuckets)
 				key = dbe_varlena_datum(data, state->groupvecs[0].attalign,
 										state->groupvecs[0].cxt);
 			}
-			dbe_flat_spill_states(state->flatagg, &key, &keynull,
-								  &spill_states[(Size) k * nstates]);
+			dbe_flat_add_states(state->flatagg, &key, &keynull,
+								&spill_states[(Size) k * nstates]);
 		}
 		nspill = 0;
 	}
@@ -3852,7 +4325,26 @@ dbe_agg_fill_flat(DbeVectorAggState *state, int bucket, uint32 nbuckets)
 		pfree(spill_states);
 		pfree(spill_code);
 	}
-	dbe_flat_input_done(state->flatagg);
+	for (i = 0; i < nk; i++)
+		if (th_hash[i] != NULL)
+		{
+			pfree(th_hash[i]);
+			pfree(th_known[i]);
+		}
+	if (use_runs)
+	{
+		dbe_agg_flat_flush_run(state, &run);
+		pfree(run.vals);
+		pfree(run.valnulls);
+		pfree(run.states);
+	}
+	if (dist != NULL)
+	{
+		dbe_agg_flat_distinct(state);
+		dbe_flat_input_done(state->flatdist);
+	}
+	else
+		dbe_flat_input_done(state->flatagg);
 	state->flat_filled = true;
 }
 
@@ -3889,7 +4381,7 @@ dbe_agg_exec_flat(CustomScanState *node)
 					return NULL;
 				}
 				dbe_cursor_rescan(state->cursor);
-				dbe_flat_reset(state->flatagg);
+				dbe_agg_flat_reset(state);
 				dbe_agg_fill_flat(state, (int) b, state->shared->nbuckets);
 				if (b == 0)
 				{
@@ -3903,7 +4395,8 @@ dbe_agg_exec_flat(CustomScanState *node)
 				dbe_agg_fill_flat(state, -1, 0);
 		}
 
-		if (dbe_flat_next(state->flatagg, state->flat_keys,
+		if (dbe_flat_next(state->flatdist != NULL ? state->flatdist
+						  : state->flatagg, state->flat_keys,
 						  state->flat_keynulls, state->flat_outs,
 						  state->flat_outnulls))
 			break;
@@ -3998,6 +4491,7 @@ dbe_agg_exec_grouped(CustomScanState *node)
 					dbe_cursor_column(state->cursor, state->qualcols[i],
 									  &state->qualvecs[i]);
 
+			state->stripe_sel = dbe_agg_prefilter(state, state->stripe_nrows);
 			state->cur_row = dbe_cursor_next_live_row(state->cursor, 0);
 			state->in_stripe = true;
 		}
@@ -4012,7 +4506,7 @@ dbe_agg_exec_grouped(CustomScanState *node)
 				!dbe_cursor_row_is_visible(state->cursor, row))
 				continue;
 
-			if (state->qual != NULL && !dbe_agg_row_passes(state, row))
+			if (!dbe_agg_row_selected(state, state->stripe_sel, row))
 			{
 				state->rows_filtered++;
 				continue;
@@ -4172,13 +4666,14 @@ dbe_agg_exec(CustomScanState *node)
 		 * los gránulos que igual no pueden tener filas que pasen se saltean
 		 * enteros en vez de recorrerse fila por fila.
 		 */
+		state->stripe_sel = dbe_agg_prefilter(state, nrows);
 		for (row = dbe_cursor_next_live_row(state->cursor, 0); row < nrows;
 			 row = dbe_cursor_next_live_row(state->cursor, row + 1))
 		{
 			if (!all_visible && !dbe_cursor_row_is_visible(state->cursor, row))
 				continue;
 
-			if (state->qual != NULL && !dbe_agg_row_passes(state, row))
+			if (!dbe_agg_row_selected(state, state->stripe_sel, row))
 			{
 				state->rows_filtered++;
 				continue;
@@ -4289,7 +4784,7 @@ dbe_agg_end(CustomScanState *node)
 	 * por archivo.
 	 */
 	if (state->flatagg != NULL)
-		dbe_flat_reset(state->flatagg);
+		dbe_agg_flat_reset(state);
 
 	if (state->cursor != NULL)
 	{
@@ -4331,7 +4826,7 @@ dbe_agg_rescan(CustomScanState *node)
 
 	if (state->flat && state->flatagg != NULL)
 	{
-		dbe_flat_reset(state->flatagg);
+		dbe_agg_flat_reset(state);
 		state->flat_filled = false;
 	}
 
@@ -4419,7 +4914,7 @@ dbe_agg_shutdown(CustomScanState *node)
 			Size		peak;
 			uint64		cur;
 
-			dbe_flat_stats(state->flatagg, &groups, &parts, &spilled, &peak);
+			dbe_agg_flat_stats(state, &groups, &parts, &spilled, &peak);
 			pg_atomic_fetch_add_u64(&state->shared->flat_groups, groups);
 			pg_atomic_fetch_add_u64(&state->shared->flat_spilled, spilled);
 			pg_atomic_fetch_add_u64(&state->shared->flat_parts, (uint64) parts);
@@ -4502,7 +4997,7 @@ dbe_agg_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 			uint64		spilled;
 			Size		peak;
 
-			dbe_flat_stats(state->flatagg, &groups, &parts, &spilled, &peak);
+			dbe_agg_flat_stats(state, &groups, &parts, &spilled, &peak);
 			if (state->shared != NULL && state->totals_ready)
 			{
 				groups = state->flat_groups_total;

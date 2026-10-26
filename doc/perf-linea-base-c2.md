@@ -329,3 +329,60 @@ en estas unidades. Se cobra un `cpu_tuple_cost`.
 **q33 7,14 → 3,39 s, q34 5,21 → 2,50 s, q35 3,84 → 2,54 s, q16 1,55 → 0,85
 s, q31 1,19 → 0,80 s, q32 1,55 → 1,06 s.** Las 43 contra la línea base:
 media geométrica 0,471, suma 109,9 → 57,3 s.
+
+## Resultado: varias claves con texto, `count(DISTINCT)` por grupo y el WHERE por stripe
+
+**Varias claves con alguna de texto.** Estaban afuera porque el texto se
+hasheaba en cada fila y el camino paralelo con Finalize ganaba. Ahora el
+hash de cada texto con diccionario se calcula una vez por código y se
+combina con el de las demás claves. Con eso apareció otro problema: al
+procesar una partición la tabla conservaba el tamaño que había alcanzado
+con la entrada entera, y le dejaba al arena de textos lugar para 8 mil de
+los 150 mil grupos que cabían, así que cada partición volvía a volcar casi
+todo. La tabla ahora se achica cuando al arena le falta lugar y está a
+menos de la mitad, y para crecer proyecta el arena con lo que ocupan en
+promedio los textos que ya tiene, en vez de reservar 64 bytes por entrada.
+q17 en serie: dos niveles de particiones y 16M filas volcadas → un nivel
+y 8,9M.
+
+**`count(DISTINCT col)` por grupo**, en dos niveles. El primero agrupa por
+las claves más la columna, con los demás agregados. El segundo agrupa por
+las claves solas: combina esos estados y suma 1 por cada valor no nulo.
+En paralelo el balde sale del hash de las claves solas, así que cada
+participante emite grupos completos. Sirve si todos los `DISTINCT` son
+sobre la misma columna y esa columna puede ser clave; si no, queda el plan
+de Postgres. El segundo nivel vuelca estados con claves enteras, cosa que
+antes no pasaba: la lectura de una partición suponía que, sin texto, todos
+los registros eran filas del mismo largo, y perdía grupos. Hay un test
+para ese caso.
+
+**Corridas.** La tabla de ClickBench está ordenada por CounterID, fecha y
+UserID: en q9, 8,4M de las 10M filas repiten el par (RegionID, UserID) de
+la anterior, y cuando el par no entraba en la tabla se volcaba una vez por
+fila. Las filas seguidas con las mismas claves de ancho fijo se acumulan
+en un estado local y van a la tabla una sola vez.
+
+**El WHERE de diccionario, por stripe.** En q11 el 70% del tiempo era
+evaluar `MobilePhoneModel <> ''` fila por fila: una llamada al bridge por
+código y la consulta a la caché. Ahora se leen los códigos del stripe
+entero de una vez (`SegmentReader::codes`), cada código nuevo se resuelve
+evaluando la cláusula sobre el valor del diccionario, y queda un byte por
+fila: no pasa, pasa, o hay que evaluarla (cuando queda una cláusula que no
+es de diccionario). Solo se miran las filas que el cursor va a visitar,
+para no resolver códigos de gránulos que el zone map descarta. Vale para
+los cuatro recorridos del nodo. Con la tabla propia en paralelo cada
+participante filtra la tabla entera, y sin esto q11 y q12 quedaban más
+lentas que el plan de Postgres (326 contra 214 ms).
+
+**q10 6,73 → 1,02 s, q9 0,97 → 0,77 s, q17 3,07 → 1,87 s, q18 1,58 → 1,38
+s, q15 1,22 → 0,71 s, q14 1,06 → 0,82 s, q16 0,85 → 0,69 s, q31 0,80 →
+0,64 s, q32 1,06 → 0,91 s, q11 214 → 191 ms.** Las 43 contra la línea
+base: media geométrica 0,432, suma 109,9 → 49,1 s. q2 y q8 (WHERE sobre un
+entero) quedaron 1–2% arriba en la comparación alternando los dos `.so`,
+dentro del ruido.
+
+q29 (11,9 s) no cambia: la regex ya se calcula una vez por código (52 s
+sin eso, 25 s con eso, en serie), pero son 3,4M valores distintos por
+stripe a unos 6,5 µs cada uno en el motor de regex de Postgres. q19
+agrupa por `extract(minute FROM EventTime)`, una expresión, que la tabla
+todavía no acepta como clave.

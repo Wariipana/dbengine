@@ -299,6 +299,22 @@ dbe_segreader_code(DbeSegReader *r, uint32_t row, uint32_t *code_out,
 	});
 }
 
+static_assert(DBE_NULL_CODE == dbe::SegmentReader::kNullCode,
+			  "el código de las filas nulas es el mismo de los dos lados");
+
+DbeStatus
+dbe_segreader_codes(DbeSegReader *r, uint32_t start, uint32_t count,
+					uint32_t *codes_out)
+{
+	if (r == nullptr || codes_out == nullptr)
+		return dbe_status_make(DBE_ERR_INVALID_ARGUMENT, "argumento nulo");
+
+	return dbe_guard([r, start, count, codes_out] {
+		reinterpret_cast<dbe::SegmentReader *>(r)->codes(start, count,
+														 codes_out);
+	});
+}
+
 DbeStatus
 dbe_segreader_dict_value(DbeSegReader *r, uint32_t idx, const void **data_out,
 						 uint32_t *len_out)

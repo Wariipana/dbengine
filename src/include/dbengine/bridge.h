@@ -141,6 +141,14 @@ DbeStatus	dbe_segreader_dict_value(DbeSegReader *r, uint32_t idx,
 									 const void **data_out, uint32_t *len_out);
 
 /*
+ * Los códigos de `count` filas desde `start`, de una vez.  Una fila nula
+ * queda con DBE_NULL_CODE.
+ */
+#define DBE_NULL_CODE UINT32_MAX
+DbeStatus	dbe_segreader_codes(DbeSegReader *r, uint32_t start,
+								uint32_t count, uint32_t *codes_out);
+
+/*
  * ¿La entrada `idx` del diccionario contiene `needle`?  Sobre FSST se busca
  * en los códigos comprimidos, sin descomprimir.  `hdr_len` tiene 256
  * entradas: cuántos bytes de cabecera saltear según el primer byte de la

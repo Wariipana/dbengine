@@ -23,6 +23,9 @@ INSERT INTO dd SELECT i % 3, i % 2, md5(i::text) || md5((i * 7)::text), -0.0,
 ANALYZE dd;
 CREATE TABLE dd_heap AS SELECT * FROM dd;
 SET max_parallel_workers_per_gather = 0;
+-- count(DISTINCT) por grupo lo toma la tabla propia de VectorAgg; acá se
+-- prueba el plan de Postgres con el descarte en el scan.
+SET dbengine.enable_flat_hash = off;
 -- El plan: Sort y GroupAggregate de siempre, con el descarte en el scan.
 EXPLAIN (COSTS OFF) SELECT g, count(DISTINCT u) FROM dd GROUP BY g;
                       QUERY PLAN                      

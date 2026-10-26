@@ -268,11 +268,15 @@ Tres hechos del código que ordenan la lista:
        1,83×, q31 1,20×, q32 1,14×; las 43: media geométrica 0,529, suma
        69,6 s. Después, claves de texto con estado parcial por código al
        volcar, y ANALYZE con la muestra repartida por toda la tabla: q35
-       1,89×; las 43: media geométrica 0,511, suma 66,6 s. Falta:
-       `count(DISTINCT)` y claves que son expresiones. Hecho también el
-       camino paralelo que reparte los grupos por hash entre participantes
-       (grupos completos, Gather sin Finalize): q33 2,1×, q34 2,1×, q16
-       1,8×; las 43: media geométrica 0,471, suma 57,3 s.
+       1,89×; las 43: media geométrica 0,511, suma 66,6 s. Hecho también
+       el camino paralelo que reparte los grupos por hash entre
+       participantes (grupos completos, Gather sin Finalize): q33 2,1×,
+       q34 2,1×, q16 1,8×; las 43: media geométrica 0,471, suma 57,3 s.
+       Después, varias claves con texto, `count(DISTINCT)` por grupo en dos
+       niveles, corridas de claves repetidas y el WHERE de diccionario
+       decidido por stripe: q10 6,6×, q17 1,6×, q15 1,7×; las 43: media
+       geométrica 0,432, suma 49,1 s. Falta: claves que son expresiones
+       (q19).
 10. [ ] **Decodificación por lotes** (`decode_range` de 1024 filas a través
        del airlock) con desempaquetado de bits por ancho estilo FastLanes,
        escrito para que el compilador lo vectorice en NEON.

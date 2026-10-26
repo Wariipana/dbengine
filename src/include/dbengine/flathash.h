@@ -80,7 +80,11 @@ extern void dbe_flat_add(DbeFlatAgg *fa, const Datum *keys,
  * Con -1, en vez de volcar fila por fila, quien llama puede llevar un
  * estado parcial propio de dbe_flat_nstates() palabras, en cero, sumarle
  * las filas con dbe_flat_accum() y entregarlo una vez con
- * dbe_flat_spill_states(): un registro por código y no uno por fila.
+ * dbe_flat_add_states(): un registro por código y no uno por fila.
+ *
+ * dbe_flat_add_states() combina estados con los del grupo, como un
+ * Finalize, o los vuelca si el grupo no entra.  Los estados de cada
+ * agregado van seguidos, dbe_flat_state_words() palabras cada uno.
  */
 extern int64 dbe_flat_find(DbeFlatAgg *fa, const Datum *keys,
 						   const bool *keynulls);
@@ -89,8 +93,9 @@ extern void dbe_flat_add_to(DbeFlatAgg *fa, int64 idx, const Datum *vals,
 extern int	dbe_flat_nstates(DbeFlatAgg *fa);
 extern void dbe_flat_accum(DbeFlatAgg *fa, uint64 *states, const Datum *vals,
 						   const bool *valnulls);
-extern void dbe_flat_spill_states(DbeFlatAgg *fa, const Datum *keys,
-								  const bool *keynulls, const uint64 *states);
+extern void dbe_flat_add_states(DbeFlatAgg *fa, const Datum *keys,
+								const bool *keynulls, const uint64 *states);
+extern int	dbe_flat_state_words(DbeFlatKind kind);
 
 /*
  * En paralelo los participantes no se reparten stripes sino grupos: cada
@@ -99,6 +104,23 @@ extern void dbe_flat_spill_states(DbeFlatAgg *fa, const Datum *keys,
  */
 extern uint32 dbe_flat_bucket(DbeFlatAgg *fa, const Datum *keys,
 							  const bool *keynulls, uint32 nbuckets);
+
+/*
+ * Para quien agrupa por varias claves con alguna de texto: el hash de un
+ * texto se puede calcular una vez por código de diccionario con
+ * dbe_flat_text_hash() y pasarlo en `texthash[i]`, con el bit i de `have`
+ * prendido; las claves sin el bit se hashean ahí.  El hash que devuelve
+ * dbe_flat_hash_keys() sirve para dbe_flat_bucket_of() y para
+ * dbe_flat_add_hashed(), que es dbe_flat_add() sin volver a calcularlo.
+ */
+extern uint64 dbe_flat_text_hash(Datum d);
+extern uint64 dbe_flat_hash_keys(DbeFlatAgg *fa, const Datum *keys,
+								 const bool *keynulls, const uint64 *texthash,
+								 uint32 have);
+extern uint32 dbe_flat_bucket_of(uint64 hash, uint32 nbuckets);
+extern void dbe_flat_add_hashed(DbeFlatAgg *fa, uint64 hash,
+								const Datum *keys, const bool *keynulls,
+								const Datum *vals, const bool *valnulls);
 
 /* No hay más filas de entrada: lo que sigue es emitir. */
 extern void dbe_flat_input_done(DbeFlatAgg *fa);
@@ -109,6 +131,14 @@ extern void dbe_flat_input_done(DbeFlatAgg *fa);
  */
 extern bool dbe_flat_next(DbeFlatAgg *fa, Datum *keys, bool *keynulls,
 						  Datum *outs, bool *outnulls);
+
+/*
+ * Como dbe_flat_next(), pero sin terminar los agregados: `*states` apunta a
+ * los estados del grupo, que valen hasta la llamada siguiente.  Sirve para
+ * pasárselos a otra tabla con dbe_flat_add_states().
+ */
+extern bool dbe_flat_next_states(DbeFlatAgg *fa, Datum *keys, bool *keynulls,
+								 const uint64 **states);
 
 /* Vacía todo para volver a empezar: rescan. */
 extern void dbe_flat_reset(DbeFlatAgg *fa);
