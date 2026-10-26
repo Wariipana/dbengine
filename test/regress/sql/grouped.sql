@@ -234,6 +234,47 @@ SELECT (SELECT sum(hashtext(a || '/' || b || ':' || c)::bigint)
 		FROM (SELECT a, b, count(*) c FROM hhh WHERE n % 3 = 0 GROUP BY a, b) y)
 	AS hash_dos_cols_igual;
 
+-- HAVING: lo evalúa el Finalize, así que el parcial tiene que calcular
+-- también los agregados que aparecen solo ahí (sum(n) en el segundo).
+EXPLAIN (COSTS off) SELECT b, count(*) FROM hh GROUP BY b HAVING count(*) > 940;
+SELECT (SELECT sum(hashtext(b || ':' || c)::bigint)
+		FROM (SELECT b, count(*) c FROM hh GROUP BY b HAVING count(*) > 940) x)
+	 = (SELECT sum(hashtext(b || ':' || c)::bigint)
+		FROM (SELECT b, count(*) c FROM hhh GROUP BY b HAVING count(*) > 940) y)
+	AS having_igual;
+SELECT (SELECT sum(hashtext(a || ':' || c)::bigint)
+		FROM (SELECT a, count(*) c FROM hh GROUP BY a
+			  HAVING sum(n) > 12900000 AND max(n) > a * 500) x)
+	 = (SELECT sum(hashtext(a || ':' || c)::bigint)
+		FROM (SELECT a, count(*) c FROM hhh GROUP BY a
+			  HAVING sum(n) > 12900000 AND max(n) > a * 500) y)
+	AS having_agregado_aparte_igual;
+SELECT count(*) FROM hh HAVING sum(n) > 0;
+SELECT count(*) FROM hh HAVING sum(n) < 0;
+
+-- length() sobre texto se cuenta sin pasar por pg_mbstrlen: los bytes que no
+-- son de continuación en UTF-8.  Con caracteres de 2, 3 y 4 bytes, textos
+-- más cortos y más largos que los 8 bytes de a los que se cuenta, vacíos y
+-- nulos.
+CREATE TABLE ln (a int, t text) USING dbengine_columnar;
+INSERT INTO ln SELECT i % 5,
+	CASE WHEN i % 13 = 0 THEN NULL
+		 ELSE repeat(CASE i % 4 WHEN 0 THEN 'a' WHEN 1 THEN 'ñ'
+							   WHEN 2 THEN '日' ELSE '𝄞' END, i % 23)
+			  || CASE WHEN i % 3 = 0 THEN 'xyz' ELSE '' END END
+	FROM generate_series(1, 20000) i;
+ANALYZE ln;
+CREATE TABLE lnh AS SELECT * FROM ln;
+EXPLAIN (COSTS off) SELECT a, avg(length(t)) FROM ln GROUP BY a;
+SELECT (SELECT sum(hashtext(a || ':' || s || ':' || av || ':' || mx)::bigint)
+		FROM (SELECT a, sum(length(t)) s, avg(char_length(t)) av,
+					 max(character_length(t)) mx FROM ln GROUP BY a) x)
+	 = (SELECT sum(hashtext(a || ':' || s || ':' || av || ':' || mx)::bigint)
+		FROM (SELECT a, sum(length(t)) s, avg(char_length(t)) av,
+					 max(character_length(t)) mx FROM lnh GROUP BY a) y)
+	AS length_igual;
+DROP TABLE ln, lnh;
+
 -- Agrupar por una columna de texto con diccionario: el string se resuelve una
 -- vez por entrada del diccionario y no una por fila. El resultado tiene que
 -- ser el mismo; lo que cambia es cuántas búsquedas de hash se hacen.

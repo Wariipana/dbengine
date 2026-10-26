@@ -42,6 +42,7 @@
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
 #include "miscadmin.h"
+#include "mb/pg_wchar.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
 #include "utils/ruleutils.h"
@@ -55,6 +56,7 @@
 #include "optimizer/planner.h"
 #include "optimizer/prep.h"
 #include "parser/parse_agg.h"
+#include "port/pg_bitutils.h"
 #include "common/int.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -118,6 +120,14 @@ typedef struct DbeAggState
 	ExprState  *argexpr;
 	int16		valtyplen;
 	bool		valtypbyval;
+
+	/*
+	 * El argumento es length(col) sobre texto: se cuenta acá en vez de
+	 * evaluar la expresión.  len_bytes: la codificación es de un byte por
+	 * carácter y el largo es el de los bytes.
+	 */
+	bool		textlen;
+	bool		len_bytes;
 
 	/*
 	 * MIN/MAX se reconocen por pg_aggregate.aggsortop, que es la misma
@@ -349,6 +359,7 @@ static void dbe_agg_value(DbeVectorAggState *state, DbeAggState *agg,
 						  uint64 row, Datum *value, bool *isnull);
 static void dbe_agg_missing_value(DbeVectorAggState *state, AttrNumber attnum,
 								  Datum *value, bool *isnull);
+static void dbe_agg_detect_textlen(DbeAggState *agg, Expr *arg);
 typedef enum DbeStripeTake
 {
 	DBE_TAKE_DONE,			/* no queda nada por hacer */
@@ -645,14 +656,15 @@ dbe_add_parallel_agg_path(PlannerInfo *root, RelOptInfo *input_rel,
 		final = (Path *) create_agg_path(root, output_rel, gather,
 										 output_rel->reltarget,
 										 AGG_HASHED, AGGSPLIT_FINAL_DESERIAL,
-										 root->parse->groupClause, NIL,
+										 root->parse->groupClause,
+										 (List *) extra->havingQual,
 										 &extra->agg_final_costs, ngroups);
 	}
 	else
 		final = (Path *) create_agg_path(root, output_rel, gather,
 										 output_rel->reltarget,
 										 AGG_PLAIN, AGGSPLIT_FINAL_DESERIAL,
-										 NIL, NULL,
+										 NIL, (List *) extra->havingQual,
 										 &extra->agg_final_costs, 1);
 
 	add_path(output_rel, final);
@@ -826,6 +838,7 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	double		ngroups = 1;
 	int			n_distinct = 0;
 	bool		all_metadata = false;
+	Node	   *having = NULL;
 
 	if (prev_create_upper_paths_hook)
 		prev_create_upper_paths_hook(root, stage, input_rel, output_rel, extra);
@@ -841,14 +854,21 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	/*
 	 * Sobre una única relación base.  Se acepta GROUP BY solo si el scan ya
 	 * entrega las filas en ese orden (se comprueba más abajo, contra los
-	 * pathkeys del path de entrada).  HAVING, grouping sets, ventanas y
-	 * DISTINCT siguen cayendo al plan normal.
+	 * pathkeys del path de entrada).  Grouping sets, ventanas y DISTINCT
+	 * siguen cayendo al plan normal.  HAVING se acepta solo en el camino
+	 * paralelo, donde lo evalúa el Finalize de arriba (ver más abajo).
 	 */
-	if (parse->groupingSets != NIL ||
-		parse->havingQual != NULL || parse->hasWindowFuncs ||
-		parse->distinctClause != NIL || parse->hasTargetSRFs ||
-		root->hasHavingQual)
+	if (parse->groupingSets != NIL || parse->hasWindowFuncs ||
+		parse->distinctClause != NIL || parse->hasTargetSRFs)
 		return;
+	if (root->hasHavingQual)
+	{
+		if (extra == NULL)
+			return;
+		having = ((GroupPathExtraData *) extra)->havingQual;
+		if (contain_volatile_functions(having) || contain_subplans(having))
+			return;
+	}
 	grouped = (parse->groupClause != NIL);
 	if (!parse->hasAggs)
 		return;
@@ -1017,6 +1037,41 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	 */
 	if (grouped && list_length(group_attnums) != list_length(parse->groupClause))
 		return;
+
+	/*
+	 * Los agregados del HAVING tienen que salir del parcial aunque no estén
+	 * en el SELECT —`HAVING count(*) > 100000` en q28—, porque el Finalize
+	 * los arma combinando estados parciales.  Se agregan al final del tlist
+	 * del nodo; un Var suelto del HAVING solo puede ser una columna del
+	 * GROUP BY, que ya está.
+	 */
+	if (having != NULL)
+	{
+		List	   *hexprs = pull_var_clause(having,
+											 PVC_INCLUDE_AGGREGATES |
+											 PVC_RECURSE_PLACEHOLDERS);
+
+		foreach(lc, hexprs)
+		{
+			Node	   *e = (Node *) lfirst(lc);
+			AttrNumber	attnum;
+			bool		is_distinct;
+
+			if (tlist_member((Expr *) e, tlist) != NULL)
+				continue;
+			if (!IsA(e, Aggref) ||
+				!dbe_agg_supported((Aggref *) e, input_rel->relid,
+								   &attnum, grouped, &is_distinct))
+				return;
+			tlist = lappend(tlist,
+							makeTargetEntry((Expr *) copyObject(e),
+											list_length(tlist) + 1,
+											NULL, false));
+			agg_attnums = lappend_int(agg_attnums, attnum);
+			if (is_distinct)
+				n_distinct++;
+		}
+	}
 
 	/*
 	 * La versión con hash se ofrece aunque la estimación de grupos no entre
@@ -1260,7 +1315,7 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		 * paralelismo disponible, agrupa el HashAggregate de Postgres, que
 		 * vuelca a disco desde PG 13.
 		 */
-		if (!(grouped && hashed))
+		if (!(grouped && hashed) && having == NULL)
 			add_path(output_rel, (Path *) path);
 
 		/*
@@ -1439,8 +1494,64 @@ dbe_agg_init_one(DbeAggState *agg, Aggref *ref, AttrNumber attnum,
 			agg->argexpr = ExecInitExpr(arg, NULL);
 			get_typlenbyval(exprType((Node *) arg), &agg->valtyplen,
 							&agg->valtypbyval);
+			dbe_agg_detect_textlen(agg, arg);
 		}
 	}
+}
+
+/*
+ * ¿El argumento es length(col), char_length(col) o character_length(col)
+ * con col de tipo text?  Las tres son textlen().
+ *
+ * textlen() cuenta caracteres con pg_mbstrlen_with_len(), que llama a
+ * pg_mblen() por cada uno: en q28 eso es el 40% de la query.  En UTF-8 los
+ * caracteres son los bytes que no son de continuación (10xxxxxx), y eso se
+ * cuenta de a 8 bytes.  Vale porque lo guardado está validado: Postgres
+ * rechaza UTF-8 inválido al entrar, por texto o por binario.  Con otra
+ * codificación de varios bytes se evalúa la expresión.
+ */
+static void
+dbe_agg_detect_textlen(DbeAggState *agg, Expr *arg)
+{
+	FuncExpr   *fe = (FuncExpr *) arg;
+	Node	   *a;
+
+	agg->textlen = false;
+	if (!IsA(arg, FuncExpr) || list_length(fe->args) != 1)
+		return;
+	if (fe->funcid != F_LENGTH_TEXT && fe->funcid != F_CHAR_LENGTH_TEXT &&
+		fe->funcid != F_CHARACTER_LENGTH_TEXT)
+		return;
+	a = (Node *) linitial(fe->args);
+	if (!IsA(a, Var) || agg->inputtype != TEXTOID)
+		return;
+	if (GetDatabaseEncoding() == PG_UTF8)
+		agg->len_bytes = false;
+	else if (pg_database_encoding_max_length() == 1)
+		agg->len_bytes = true;
+	else
+		return;
+	agg->textlen = true;
+}
+
+/* Caracteres de un UTF-8 válido: los bytes que no son 10xxxxxx. */
+static int32
+dbe_utf8_chars(const char *p, Size len)
+{
+	Size		cont = 0;
+	Size		i = 0;
+
+	for (; i + 8 <= len; i += 8)
+	{
+		uint64		w;
+
+		memcpy(&w, p + i, 8);
+		/* Bit 7 prendido y bit 6 apagado, byte por byte. */
+		cont += pg_popcount64(w & ~(w << 1) & UINT64CONST(0x8080808080808080));
+	}
+	for (; i < len; i++)
+		cont += ((unsigned char) p[i] & 0xC0) == 0x80;
+	return (int32) (len - cont);
 }
 
 /*
@@ -2668,6 +2779,23 @@ dbe_agg_value(DbeVectorAggState *state, DbeAggState *agg, uint64 row,
 					  value, isnull);
 	if (agg->argexpr == NULL)
 		return;
+
+	if (agg->textlen)
+	{
+		struct varlena *v = (struct varlena *) DatumGetPointer(*value);
+
+		if (*isnull)
+			return;				/* textlen() es estricta */
+		/* Se guarda sin comprimir (columnar_write.c), pero por las dudas. */
+		if (!VARATT_IS_EXTERNAL(v) && !VARATT_IS_COMPRESSED(v))
+		{
+			Size		len = VARSIZE_ANY_EXHDR(v);
+
+			*value = Int32GetDatum(agg->len_bytes ? (int32) len
+								   : dbe_utf8_chars(VARDATA_ANY(v), len));
+			return;
+		}
+	}
 
 	slot = state->rel_slot;
 	econtext = state->css.ss.ps.ps_ExprContext;
