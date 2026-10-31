@@ -18,7 +18,7 @@ SET enable_bitmapscan = off;
 CREATE TABLE t (k int, ruido int, txt text) USING dbengine_columnar;
 INSERT INTO t SELECT g, g % 97, 'v' || (g % 13)
 	FROM generate_series(1, 200000) g;
-CREATE TABLE th AS SELECT * FROM t;
+CREATE TABLE th USING heap AS SELECT * FROM t;
 ANALYZE t;
 -- ===========================================================================
 -- El bloque se escribe, y solo donde sirve
@@ -128,7 +128,7 @@ CREATE TABLE n (k int) USING dbengine_columnar;
 -- Los primeros 8192 valores no nulos, los siguientes 8192 todos nulos, etc.
 INSERT INTO n SELECT CASE WHEN (g / 8192) % 2 = 1 THEN NULL ELSE g END
 	FROM generate_series(1, 100000) g;
-CREATE TABLE nh AS SELECT * FROM n;
+CREATE TABLE nh USING heap AS SELECT * FROM n;
 ANALYZE n;
 SELECT (SELECT count(*) FROM n WHERE k BETWEEN 1000 AND 2000)
 	 = (SELECT count(*) FROM nh WHERE k BETWEEN 1000 AND 2000) AS nulos_rango_igual;
@@ -159,7 +159,7 @@ SELECT (SELECT count(*) FROM n) = (SELECT count(*) FROM nh) AS total_igual;
 CREATE TABLE v (s text, b bytea, num numeric) USING dbengine_columnar;
 INSERT INTO v SELECT 'x' || g, ('\x' || lpad(to_hex(g), 8, '0'))::bytea, g
 	FROM generate_series(1, 100000) g;
-CREATE TABLE vh AS SELECT * FROM v;
+CREATE TABLE vh USING heap AS SELECT * FROM v;
 ANALYZE v;
 SELECT count(*) FILTER (WHERE granules IS NOT NULL) AS con_bloque
 FROM dbengine.stripe_column

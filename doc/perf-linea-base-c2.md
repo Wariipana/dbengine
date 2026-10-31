@@ -501,3 +501,71 @@ SSB y de cualquier tablero: `sum(precio * cantidad)`, `sum(CASE WHEN ...)`.
 ... GROUP BY UserID ORDER BY 2 DESC LIMIT 10`: **3,88 → 0,78 s**, mismo
 resultado. Las de ClickBench que ya usaban expresiones de una columna (q4,
 q28, q30) no cambian.
+
+## Resultado: el parcial con la tabla propia, y claves de varias columnas
+
+**Claves de varias columnas.** Una clave del GROUP BY que es expresión
+podía mirar una sola columna. Ahora lleva la lista de las demás, como los
+argumentos de los agregados: `CASE WHEN ismobile = 1 THEN mobilephone ELSE
+resolutionwidth END`, `regionid + os`.
+
+**El reparto por baldes no sirve con claves expresión.** Cada participante
+recorre la tabla entera y calcula la clave de todas las filas para saber de
+qué balde es. Con una columna sola eso es leer y hashear; con una
+expresión, evaluarla, y entonces el paralelo tarda lo mismo que el serial
+(1,32 contra 1,29 s en el CASE de arriba) y pierde contra el plan paralelo
+de Postgres (0,72 s), que reparte stripes.
+
+**El parcial con la tabla propia.** Un tercer modo del nodo: cada
+participante agrupa sus stripes en su tabla, y emite los estados como los
+emitiría un Partial Agg de Postgres, para que su Finalize los combine:
+count y sum de int2/int4 como int8, avg(int4) como el arreglo
+{cantidad, suma}, min/max como el valor, y sum/avg(int8) con el formato de
+`int8_avg_serialize()`, que cambió entre 18 (la suma como NumericVar) y 19
+(como int128 en dos mitades): se arman los dos a mano, porque las
+funciones de numeric.c no se exportan. Si la tabla se llena no vuelca:
+emite lo que tiene y sigue vacía, porque el Finalize junta la misma clave
+emitida dos veces (q13, que estima 4.533 frases donde hay 835K, volcaba
+750K filas a 384 particiones).
+
+Medido en 10M filas, parcial contra baldes: 190 contra 504 ms con 78
+grupos, 265 contra 615 con 41K, 960 contra 900 con 300K, 1,6 s contra 0,86
+con un millón. El cruce está entre 30 y 50 filas por grupo.
+
+**Cuándo.** El costo no alcanza para decidirlo (ver la sección anterior),
+así que se sigue decidiendo por la estimación de grupos, ahora con 300
+filas por grupo: las columnas de muchos valores se estiman cortas —q16
+estima 70K usuarios donde hay 1,5M, q36 60K IPs donde hay un millón— y el
+umbral les deja el doble de margen. Con muchos grupos el parcial con la
+tabla propia no se ofrece aunque cueste menos: ganaba por costo y q34
+(2,6M URLs) tardaba 2,4×.
+
+Para las claves que son expresión la estimación se equivoca para el otro
+lado: Postgres las estima por las columnas que miran, y para
+`extract(minute FROM EventTime)` dice 202.775 donde hay 60. Se acota por lo
+que la expresión puede dar: los valores del campo de un `extract`, la suma
+de las ramas de un CASE, 2|c| restos de `x % c`, y nunca más que la
+estimación. La cota también va a las filas del parcial y del Finalize, para
+que el costo los compare bien contra el plan normal.
+
+| Consulta (10M filas) | Antes | Después |
+|---|---|---|
+| `GROUP BY RegionID`, count(*) | 289 ms | 149 ms |
+| `extract(minute FROM EventTime)` | 1,74 s | 0,60 s |
+| `CASE WHEN ResolutionWidth > 1000 THEN RegionID ELSE 0 END` | 0,81 s | 0,26 s |
+| `UserID % 1000` | 0,77 s | 0,22 s |
+
+En ClickBench (alternando los `.so`, dos vueltas) q40 baja de 0,94 a
+0,44 s: su clave es un CASE sobre tres columnas, que antes caía al plan
+normal; las demás no cambian, y la media geométrica de las 43 queda en
+0,985 de la anterior.
+
+Las dos claves del primer ejemplo siguen en baldes: la segunda,
+`regionid + os`, se estima en 38.740 grupos y la cota no la mejora.
+
+**Un error que apareció de paso.** En el cluster de PG 19 local las copias
+"heap" de los tests eran columnares (`default_table_access_method`), y eso
+destapó que `count(c)` de un bigint daba "bigint out of range" con un
+stripe cuya suma no entra en int64: el atajo por metadatos convertía la
+suma aunque count no la usa. Arreglado, con test, y las copias de los tests
+ahora dicen `USING heap`.

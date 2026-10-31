@@ -23,7 +23,7 @@ INSERT INTO sm SELECT CASE WHEN g % 3 = 0 THEN NULL ELSE -g % 50 END,
 FROM generate_series(1, 4000) g;
 INSERT INTO sm SELECT NULL, NULL, NULL, NULL FROM generate_series(1, 300);
 INSERT INTO sm VALUES (32767, 2147483647, 9223372036854775807, 'max');
-CREATE TABLE sm_heap AS SELECT * FROM sm;
+CREATE TABLE sm_heap USING heap AS SELECT * FROM sm;
 
 -- La suma se guarda para los enteros y no para el texto.
 SELECT a.attname, count(*) AS stripes, count(sc.sum_value) AS con_suma
@@ -83,6 +83,13 @@ SELECT sum(a), avg(a), count(a), count(*) FROM sm_vacia;
 INSERT INTO sm_vacia SELECT NULL FROM generate_series(1, 10);
 SELECT sum(a), avg(a), count(a), count(*) FROM sm_vacia;
 
-DROP TABLE sm, sm_heap, sm_vacia;
+-- count(col) de un bigint no mira la suma del stripe, que acá no entra en
+-- int64.
+CREATE TABLE sm_grande (c int8) USING dbengine_columnar;
+INSERT INTO sm_grande SELECT g FROM generate_series(1, 5000) g
+UNION ALL SELECT 9223372036854775807;
+SELECT count(c), count(*) FROM sm_grande;
+
+DROP TABLE sm, sm_heap, sm_vacia, sm_grande;
 RESET max_parallel_workers_per_gather;
 DROP EXTENSION dbengine CASCADE;

@@ -22,7 +22,7 @@ INSERT INTO dd SELECT CASE WHEN i % 9 = 0 THEN NULL ELSE i % 7 END,
 INSERT INTO dd SELECT i % 3, i % 2, md5(i::text) || md5((i * 7)::text), -0.0,
 	1, i FROM generate_series(1, 2000) i;
 ANALYZE dd;
-CREATE TABLE dd_heap AS SELECT * FROM dd;
+CREATE TABLE dd_heap USING heap AS SELECT * FROM dd;
 
 SET max_parallel_workers_per_gather = 0;
 -- count(DISTINCT) por grupo lo toma la tabla propia de VectorAgg; acá se

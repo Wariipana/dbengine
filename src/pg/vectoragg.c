@@ -373,10 +373,13 @@ typedef struct DbeVectorAggState
 
 	/*
 	 * Agrupación por hash con la tabla propia (flathash.h): claves de
-	 * ancho fijo y agregados de estado entero.  Es un agregado completo, no
-	 * parcial, y vuelca a disco por su cuenta.
+	 * ancho fijo y agregados de estado entero.  Vuelca a disco por su
+	 * cuenta.  Es un agregado completo, salvo con `flat_partial`: debajo de
+	 * un Finalize, cada participante agrupa sus stripes y emite estados.
 	 */
 	bool		flat;
+	bool		flat_partial;
+	bool		flat_more;		/* parcial cortado por memoria: hay más */
 	DbeFlatAgg *flatagg;
 	bool		flat_filled;
 	Datum	   *flat_keys;
@@ -401,6 +404,7 @@ typedef struct DbeVectorAggState
 	 * durar hasta que la tabla lo copie.
 	 */
 	ExprState **group_exprs;
+	DbeAggState **group_aggs;	/* la entrada de cada una, con sus extra */
 	ExprContext *key_econtext;
 
 	/*
@@ -486,6 +490,8 @@ static void dbe_agg_value(DbeVectorAggState *state, DbeAggState *agg,
 static void dbe_agg_missing_value(DbeVectorAggState *state, AttrNumber attnum,
 								  Datum *value, bool *isnull);
 static void dbe_agg_detect_textlen(DbeAggState *agg, Expr *arg);
+static void dbe_agg_keys_expr(DbeVectorAggState *state, uint64 row,
+							  Datum *keys, bool *keynulls);
 typedef enum DbeStripeTake
 {
 	DBE_TAKE_DONE,			/* no queda nada por hacer */
@@ -676,29 +682,34 @@ dbe_flat_key_ok(Oid typid, Oid eqop, Oid collid)
  * tienen los mismos bytes.  Con second, epoch o julian no: tienen
  * decimales.
  */
-static bool
-dbe_flat_extract_integral(Node *expr)
+/* El campo (DTK_*) de un `extract(campo FROM ts)`, o -1 si no es eso. */
+static int
+dbe_extract_field(Node *expr)
 {
 	FuncExpr   *f = (FuncExpr *) expr;
 	Const	   *c;
 	char	   *units;
 	char	   *low;
 	int			val = 0;
-	int			type;
 
 	if (!IsA(f, FuncExpr) || list_length(f->args) != 2 ||
 		(f->funcid != F_EXTRACT_TEXT_TIMESTAMP &&
 		 f->funcid != F_EXTRACT_TEXT_TIMESTAMPTZ))
-		return false;
+		return -1;
 	c = (Const *) linitial(f->args);
 	if (!IsA(c, Const) || c->constisnull || c->consttype != TEXTOID)
-		return false;
+		return -1;
 	units = TextDatumGetCString(c->constvalue);
 	low = downcase_truncate_identifier(units, strlen(units), false);
-	type = DecodeUnits(0, low, &val);
-	if (type != UNITS)
-		return false;
-	switch (val)
+	if (DecodeUnits(0, low, &val) != UNITS)
+		return -1;
+	return val;
+}
+
+static bool
+dbe_flat_extract_integral(Node *expr)
+{
+	switch (dbe_extract_field(expr))
 	{
 		case DTK_MICROSEC:
 		case DTK_MINUTE:
@@ -723,10 +734,11 @@ dbe_flat_extract_integral(Node *expr)
 
 /*
  * ¿Una expresión del GROUP BY puede ser clave de la tabla propia?  Tiene que
- * mirar una sola columna de la relación —se calcula fila por fila contra el
- * slot con esa columna cargada, como el argumento de un agregado—, no ser
- * volátil, y dar un tipo que sirva de clave (dbe_flat_key_ok()), o el
- * numeric de un extract() con campo entero.  *attnum queda con la columna.
+ * mirar columnas de la relación —se calcula fila por fila contra el slot con
+ * ellas cargadas, como el argumento de un agregado—, no ser volátil, y dar
+ * un tipo que sirva de clave (dbe_flat_key_ok()), o el numeric de un
+ * extract() con campo entero.  *attnum queda con la primera columna; las
+ * demás las junta el executor.
  */
 static bool
 dbe_flat_expr_key_ok(Node *expr, Oid eqop, Index relid, AttrNumber *attnum)
@@ -747,10 +759,10 @@ dbe_flat_expr_key_ok(Node *expr, Oid eqop, Index relid, AttrNumber *attnum)
 		Var		   *var = (Var *) lfirst(lc);
 
 		if (var->varno != (int) relid || var->varattno <= 0 ||
-			var->varlevelsup != 0 ||
-			(*attnum != InvalidAttrNumber && var->varattno != *attnum))
+			var->varlevelsup != 0)
 			return false;
-		*attnum = var->varattno;
+		if (*attnum == InvalidAttrNumber)
+			*attnum = var->varattno;
 	}
 	if (*attnum == InvalidAttrNumber)
 		return false;
@@ -759,6 +771,86 @@ dbe_flat_expr_key_ok(Node *expr, Oid eqop, Index relid, AttrNumber *attnum)
 		return true;
 	return typid == NUMERICOID && dbe_flat_extract_integral(expr) &&
 		eqop == lookup_type_cache(NUMERICOID, TYPECACHE_EQ_OPR)->eq_opr;
+}
+
+/*
+ * Una cota de los grupos que da una clave, para la regla de pocos grupos.
+ * Postgres estima una expresión por las columnas que mira: para
+ * `extract(minute FROM EventTime)` dice 202.775 (los valores distintos de
+ * EventTime) donde hay 60, y para un CASE el producto de sus columnas.  La
+ * cota es lo que la expresión puede dar —60 minutos, la suma de las ramas
+ * de un CASE, 2|c| - 1 restos de `x % c`—, más uno por el NULL, y nunca
+ * más que la estimación.
+ */
+static double
+dbe_key_groups_bound(PlannerInfo *root, Node *e, double rows)
+{
+	double		est = estimate_num_groups(root, list_make1(e), rows, NULL, NULL);
+	double		b = est;
+
+	if (IsA(e, CaseExpr))
+	{
+		CaseExpr   *c = (CaseExpr *) e;
+		ListCell   *lc;
+
+		b = c->defresult != NULL
+			? dbe_key_groups_bound(root, (Node *) c->defresult, rows) : 1;
+		foreach(lc, c->args)
+			b += dbe_key_groups_bound(root,
+									  (Node *) ((CaseWhen *) lfirst(lc))->result,
+									  rows);
+	}
+	else if (IsA(e, OpExpr) && list_length(((OpExpr *) e)->args) == 2)
+	{
+		OpExpr	   *op = (OpExpr *) e;
+		Const	   *k = (Const *) lsecond(op->args);
+
+		if ((op->opfuncid == F_INT2MOD || op->opfuncid == F_INT4MOD ||
+			 op->opfuncid == F_INT8MOD) && IsA(k, Const) && !k->constisnull)
+		{
+			double		m = fabs(op->opfuncid == F_INT8MOD
+								 ? (double) DatumGetInt64(k->constvalue)
+								 : op->opfuncid == F_INT4MOD
+								 ? (double) DatumGetInt32(k->constvalue)
+								 : (double) DatumGetInt16(k->constvalue));
+
+			b = 2 * m;
+		}
+	}
+	else
+	{
+		switch (dbe_extract_field(e))
+		{
+			case DTK_MINUTE:
+				b = 61;
+				break;
+			case DTK_HOUR:
+				b = 25;
+				break;
+			case DTK_DAY:
+				b = 32;
+				break;
+			case DTK_MONTH:
+				b = 13;
+				break;
+			case DTK_QUARTER:
+				b = 5;
+				break;
+			case DTK_WEEK:
+				b = 54;
+				break;
+			case DTK_DOW:
+			case DTK_ISODOW:
+				b = 8;
+				break;
+			case DTK_DOY:
+				b = 367;
+				break;
+			default:
+				break;
+		}
+	}
+	return Min(est, Max(b, 1.0));
 }
 
 /* Más que esto no se guarda en el top-N: con un LIMIT grande no conviene. */
@@ -1063,10 +1155,15 @@ dbe_all_minmax(List *tlist)
  * su propio Partial Agg: mark_partial_aggref() ajusta el tipo de salida al
  * del estado de transición, o a bytea si hay que serializarlo.
  */
+/*
+ * `few_est`: los grupos según dbe_key_groups_bound(), que con claves que son
+ * expresión es mejor que la estimación de Postgres.
+ */
 static void
 dbe_add_parallel_agg_path(PlannerInfo *root, RelOptInfo *input_rel,
 						  RelOptInfo *output_rel, GroupPathExtraData *extra,
-						  List *tlist, List *custom_private, int natts)
+						  List *tlist, List *custom_private, int natts,
+						  double few_est)
 {
 	RelOptInfo *partial_rel;
 	PathTarget *partial_target;
@@ -1124,10 +1221,11 @@ dbe_add_parallel_agg_path(PlannerInfo *root, RelOptInfo *input_rel,
 	partial_rel->cheapest_parameterized_paths = NIL;
 	partial_rel->consider_parallel = true;
 	partial_rel->rows = (root->parse->groupClause != NIL)
-		? estimate_num_groups(root,
-							  get_sortgrouplist_exprs(root->parse->groupClause,
-													  root->parse->targetList),
-							  input_rel->rows, NULL, NULL)
+		? Min(few_est,
+			  estimate_num_groups(root,
+								  get_sortgrouplist_exprs(root->parse->groupClause,
+														  root->parse->targetList),
+								  input_rel->rows, NULL, NULL))
 		: 1;
 
 	ppath = makeNode(CustomPath);
@@ -1145,11 +1243,13 @@ dbe_add_parallel_agg_path(PlannerInfo *root, RelOptInfo *input_rel,
 	/*
 	 * El trabajo se reparte entre workers.  El costo se expresa como una
 	 * fracción del scan porque este nodo recorre los mismos bytes sin armar
-	 * tuplas: medido a 100M filas, 20 ns por fila contra 74.
+	 * tuplas: medido a 100M filas, 20 ns por fila contra 74.  Con la tabla
+	 * propia cada agregado cuesta lo que en el camino serial de ella.
 	 */
 	ppath->path.total_cost =
 		(input_rel->cheapest_total_path->total_cost * 0.35 +
-		 cpu_operator_cost * input_rel->rows * list_length(tlist)) /
+		 cpu_operator_cost * input_rel->rows * list_length(tlist) *
+		 (intVal(list_nth(custom_private, 6)) == 3 ? 0.3 : 1.0)) /
 		(workers + 0.5);
 
 	ppath->methods = &dbe_agg_path_methods;
@@ -1170,10 +1270,10 @@ dbe_add_parallel_agg_path(PlannerInfo *root, RelOptInfo *input_rel,
 		 * planner con Partial/Finalize Agg, solo que el parcial no
 		 * construye una tupla por fila.
 		 */
-		double		ngroups = estimate_num_groups(
+		double		ngroups = Min(few_est, estimate_num_groups(
 			root, get_sortgrouplist_exprs(root->parse->groupClause,
 										  root->parse->targetList),
-			gather->rows, NULL, NULL);
+			gather->rows, NULL, NULL));
 
 		final = (Path *) create_agg_path(root, output_rel, gather,
 										 output_rel->reltarget,
@@ -1363,12 +1463,13 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	Node	   *having = NULL;
 	bool		flat_ok;
 	bool		partial_ok = true;
-	bool		has_const = false;
 	bool		has_expr_key = false;
+	bool		has_const = false;
 	int			nflat_aggs = 0;
 	AttrNumber	dist_attnum = InvalidAttrNumber;
 	Node	   *dist_expr = NULL;
 	double		flat_groups = 1;	/* las entradas de la tabla propia */
+	double		few_est = 1;	/* ngroups con la cota de cada clave */
 
 	if (prev_create_upper_paths_hook)
 		prev_create_upper_paths_hook(root, stage, input_rel, output_rel, extra);
@@ -1595,9 +1696,12 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		}
 
 		/*
-		 * Una expresión del GROUP BY sobre una columna —`ClientIP - 1` en
-		 * q36, `extract(minute FROM EventTime)` en q19— la calcula la tabla
-		 * propia fila por fila.  Los demás caminos no saben.
+		 * Una expresión del GROUP BY —`ClientIP - 1` en q36,
+		 * `extract(minute FROM EventTime)` en q19, un CASE sobre varias
+		 * columnas— se calcula fila por fila en la tabla propia, serial o
+		 * en el parcial con pocos grupos.  El parcial con TupleHashTable
+		 * también sabría, pero con el regex de q29 tardaba el doble que el
+		 * plan normal.
 		 */
 		if (grouped && tle->ressortgroupref != 0 && !IsA(tle->expr, Const))
 		{
@@ -1656,7 +1760,7 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		partial_ok = false;
 	}
 
-	if (has_const || has_expr_key)
+	if (has_const)
 	{
 		if (!flat_ok)
 			return;
@@ -1719,6 +1823,11 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		 */
 		ngroups = estimate_num_groups(root, gexprs, input_path->rows,
 									  NULL, NULL);
+		few_est = 1;
+		foreach(lc, gexprs)
+			few_est *= dbe_key_groups_bound(root, (Node *) lfirst(lc),
+											input_path->rows);
+		few_est = Min(ngroups, few_est);
 		flat_groups = ngroups;
 		if (dist_expr != NULL)
 			flat_groups = estimate_num_groups(root, lappend(list_copy(gexprs),
@@ -1740,10 +1849,10 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		{
 			Size		per_group = sizeof(MinimalTupleData) + 64 +
 				sizeof(Datum) * 4 * list_length(agg_attnums);
-			bool		fits = ngroups * (double) per_group <=
+			bool		fits = few_est * (double) per_group <=
 				(double) work_mem * 1024.0;
 
-			if (!fits && ngroups > input_path->rows * 0.5)
+			if (!fits && few_est > input_path->rows * 0.5)
 				partial_ok = false;
 		}
 	}
@@ -1771,16 +1880,16 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 			nwanted++;
 		}
 	}
-	/* Las demás columnas de un argumento que mira varias. */
+	/* Las demás columnas de un argumento o una clave que mira varias. */
 	foreach(lc, tlist)
 	{
 		Expr	   *e = ((TargetEntry *) lfirst(lc))->expr;
 		Bitmapset  *attrs = NULL;
 		int			x = -1;
 
-		if (!IsA(e, Aggref))
-			continue;
-		pull_varattnos((Node *) ((Aggref *) e)->args, input_rel->relid, &attrs);
+		if (IsA(e, Aggref))
+			e = (Expr *) ((Aggref *) e)->args;
+		pull_varattnos((Node *) e, input_rel->relid, &attrs);
 		while ((x = bms_next_member(attrs, x)) >= 0)
 		{
 			AttrNumber	a = x + FirstLowInvalidHeapAttributeNumber;
@@ -1984,13 +2093,22 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		 * Con pocos grupos gana el parcial paralelo: reparte stripes y el
 		 * Finalize junta unos pocos estados, mientras que la tabla propia en
 		 * paralelo le hace leer la tabla entera a cada participante para
-		 * elegir su balde.  `GROUP BY RegionID` (3.586 grupos en 10M filas):
-		 * 410 contra 294 ms con count(*), 603 contra 440 con sum(int8).  El
-		 * modelo de costos no lo veía; sumarle al camino paralelo el hash de
-		 * todas las filas lo arreglaba acá pero empeoraba hasta 1,8× las de
-		 * muchos grupos (q15, q16, q34, q35).  Así que se decide por la
-		 * cantidad de grupos: más de mil filas por grupo, y que el parcial
-		 * se vaya a ofrecer.
+		 * elegir su balde, y calcular la clave de todas las filas: con una
+		 * clave que es expresión, el reparto por baldes tarda lo mismo que
+		 * el serial.  Medido en 10M filas, parcial contra baldes: 190 contra
+		 * 504 ms con 78 grupos, 265 contra 615 con 41K, 960 contra 900 con
+		 * 300K (`userid % 300000`), 1,6 s contra 0,86 con un millón.  El
+		 * cruce está entre 30 y 50 filas por grupo.
+		 *
+		 * El modelo de costos no lo veía; sumarle al camino paralelo el hash
+		 * de todas las filas lo arreglaba acá pero empeoraba hasta 1,8× las
+		 * de muchos grupos (q15, q16, q34, q35).  Así que se decide por la
+		 * estimación de grupos, que con columnas de muchos valores se queda
+		 * corta —q16 estima 70K usuarios donde hay 1,5M, q36 60K IPs donde
+		 * hay un millón—: el umbral es 300 filas por grupo, el doble de lo
+		 * que estiman ésas.  Para las claves que son expresión la
+		 * estimación es la contraria, de más, y se corrige con
+		 * dbe_key_groups_bound().
 		 */
 		partial_path = partial_ok && n_distinct == 0 && !all_metadata &&
 			input_rel->consider_parallel &&
@@ -1999,7 +2117,7 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 			compute_parallel_worker(input_rel, input_rel->pages, -1,
 									max_parallel_workers_per_gather) > 0;
 		few_groups = grouped && partial_path &&
-			ngroups * 1000.0 < input_path->rows;
+			few_est * 300.0 < input_path->rows;
 
 		if (grouped && hashed && flat_ok && !few_groups)
 		{
@@ -2127,10 +2245,30 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		 * conteos parciales daría de más, y combinar los conjuntos es otra
 		 * cosa que este nodo no emite.
 		 */
-		if (partial_path)
+		/*
+		 * Con pocos grupos el parcial agrupa con la tabla propia (marca 3):
+		 * cada participante sus stripes, y el Finalize de arriba combina los
+		 * estados.  Con muchos no: su costo es barato y ganaba por costo
+		 * contra el reparto por baldes, pero q34 (2,6M URLs) tardaba 2,4×.
+		 * Ahí queda el parcial de siempre, que cuesta más y no gana; con
+		 * una clave que es expresión, ninguno (ver arriba).
+		 */
+		if (partial_path && (!has_expr_key || few_groups))
+		{
+			List	   *pprivate = private;
+
+			if (flat_ok && few_groups)
+			{
+				pprivate = list_copy(private);
+				llast(pprivate) = makeInteger(3);
+				pprivate = lappend(pprivate,
+								   makeInteger((int) Min(ngroups, (double) PG_INT32_MAX)));
+				pprivate = lappend(pprivate, NIL);
+			}
 			dbe_add_parallel_agg_path(root, input_rel, output_rel,
 									  (GroupPathExtraData *) extra,
-									  tlist, private, natts);
+									  tlist, pprivate, natts, few_est);
+		}
 	}
 }
 
@@ -2183,6 +2321,33 @@ dbe_agg_create_state(CustomScan *cscan)
  * valor no nulo pasa a ser el estado inicial.  De ahí sale, por ejemplo,
  * que sum() sobre cero filas dé NULL y count() dé 0.
  */
+/* Las columnas que mira `expr` además de `attnum`, en agg->extra. */
+static void
+dbe_agg_collect_extra(DbeAggState *agg, Expr *expr, AttrNumber attnum)
+{
+	List	   *vars = pull_var_clause((Node *) expr, 0);
+	ListCell   *lv;
+
+	foreach(lv, vars)
+	{
+		AttrNumber	a = ((Var *) lfirst(lv))->varattno;
+		int			i;
+
+		for (i = 0; i < agg->nextra && agg->extra[i] != a; i++)
+			;
+		if (a == attnum || i < agg->nextra)
+			continue;
+		if (agg->extra == NULL)
+		{
+			agg->extra = (AttrNumber *) palloc(sizeof(AttrNumber) * list_length(vars));
+			agg->extravec = (DbeColumnVector *)
+				palloc0(sizeof(DbeColumnVector) * list_length(vars));
+			agg->extra_ok = (bool *) palloc0(sizeof(bool) * list_length(vars));
+		}
+		agg->extra[agg->nextra++] = a;
+	}
+}
+
 static void
 dbe_agg_init_one(DbeAggState *agg, Aggref *ref, AttrNumber attnum,
 				 TupleDesc desc)
@@ -2285,27 +2450,7 @@ dbe_agg_init_one(DbeAggState *agg, Aggref *ref, AttrNumber attnum,
 
 		if (!IsA(arg, Var))
 		{
-			List	   *vars = pull_var_clause((Node *) arg, 0);
-			ListCell   *lv;
-
-			foreach(lv, vars)
-			{
-				AttrNumber	a = ((Var *) lfirst(lv))->varattno;
-				int			i;
-
-				for (i = 0; i < agg->nextra && agg->extra[i] != a; i++)
-					;
-				if (a == attnum || i < agg->nextra)
-					continue;
-				if (agg->extra == NULL)
-				{
-					agg->extra = (AttrNumber *) palloc(sizeof(AttrNumber) * list_length(vars));
-					agg->extravec = (DbeColumnVector *)
-						palloc0(sizeof(DbeColumnVector) * list_length(vars));
-					agg->extra_ok = (bool *) palloc0(sizeof(bool) * list_length(vars));
-				}
-				agg->extra[agg->nextra++] = a;
-			}
+			dbe_agg_collect_extra(agg, arg, attnum);
 
 			/* Con parent NULL los Var se leen de ecxt_scantuple. */
 			agg->argexpr = ExecInitExpr(arg, NULL);
@@ -2698,13 +2843,20 @@ dbe_agg_stripe_sma(DbeVectorAggState *state, int idx)
 		if (!agg->sma_now)
 			continue;
 
-		if (segs[i].has_sum)
+		/*
+		 * count(col) no mira la suma, que con un bigint puede no entrar en
+		 * int64: un stripe con 1..5000 y el máximo de bigint daba "bigint
+		 * out of range" en count(c).  sum y avg solo van con smallint e
+		 * integer, que en un stripe no llegan.
+		 */
+		if (segs[i].has_sum && agg->sma != DBE_SMA_COUNT)
 		{
 			int			j;
 
 			/* Misma columna que un agregado anterior: la misma suma. */
 			for (j = 0; j < i; j++)
 				if (state->aggs[j].sma_now &&
+					state->aggs[j].sma != DBE_SMA_COUNT &&
 					state->aggs[j].attnum == agg->attnum)
 					break;
 			sums[i] = j < i ? sums[j]
@@ -3411,7 +3563,10 @@ dbe_agg_begin(CustomScanState *node, EState *estate, int eflags)
 			agg->group_attnum = (AttrNumber) lfirst_int(lc2);
 			agg->group_idx = state->ngroupcols++;
 			if (!IsA(tle->expr, Var))
+			{
 				agg->group_expr = tle->expr;
+				dbe_agg_collect_extra(agg, tle->expr, agg->group_attnum);
+			}
 			continue;
 		}
 
@@ -3498,9 +3653,12 @@ dbe_agg_begin(CustomScanState *node, EState *estate, int eflags)
 				{
 					state->group_exprs = (ExprState **)
 						palloc0(sizeof(ExprState *) * state->ngroupcols);
+					state->group_aggs = (DbeAggState **)
+						palloc0(sizeof(DbeAggState *) * state->ngroupcols);
 					state->key_econtext = CreateExprContext(estate);
 				}
 				state->group_exprs[g] = ExecInitExpr(agg->group_expr, NULL);
+				state->group_aggs[g] = agg;
 				get_typlenbyval(typid, &state->group_typlen[g],
 								&state->group_typbyval[g]);
 				state->group_collation[g] = exprCollation((Node *) agg->group_expr);
@@ -3534,7 +3692,8 @@ dbe_agg_begin(CustomScanState *node, EState *estate, int eflags)
 		state->in_stripe = false;
 
 		state->hashed = (intVal(list_nth(cscan->custom_private, 6)) != 0);
-		state->flat = (intVal(list_nth(cscan->custom_private, 6)) == 2);
+		state->flat = (intVal(list_nth(cscan->custom_private, 6)) >= 2);
+		state->flat_partial = (intVal(list_nth(cscan->custom_private, 6)) == 3);
 		if (state->flat)
 			dbe_agg_begin_flat(state, cscan, eflags);
 		else if (state->hashed)
@@ -3558,14 +3717,24 @@ dbe_agg_begin(CustomScanState *node, EState *estate, int eflags)
 			{
 				Form_pg_attribute att =
 					TupleDescAttr(desc, state->groupcols[i] - 1);
+				Oid			typid = att->atttypid;
+				int32		typmod = att->atttypmod;
 
+				/* Una clave que es expresión tiene el tipo de la expresión. */
+				if (state->group_exprs != NULL &&
+					state->group_exprs[i] != NULL)
+				{
+					Node	   *e = (Node *) state->group_aggs[i]->group_expr;
+
+					typid = exprType(e);
+					typmod = exprTypmod(e);
+				}
 				TupleDescInitEntry(gdesc, (AttrNumber) (i + 1),
-								   NameStr(att->attname), att->atttypid,
-								   att->atttypmod, 0);
+								   NameStr(att->attname), typid, typmod, 0);
 				TupleDescInitEntryCollation(gdesc, (AttrNumber) (i + 1),
-											att->attcollation);
+											state->group_collation[i]);
 				keycols[i] = (AttrNumber) (i + 1);
-				colls[i] = att->attcollation;
+				colls[i] = state->group_collation[i];
 			}
 			dbe_tupdesc_finalize(gdesc);
 
@@ -4213,11 +4382,11 @@ dbe_agg_fill_hash(DbeVectorAggState *state)
 		{
 			DbeAggState *agg = &state->aggs[i];
 
+			dbe_agg_load_extra(state, agg);
 			if (agg->is_group)
 				continue;
 			agg->has_vector = !agg->is_count_star &&
 				dbe_cursor_column(state->cursor, agg->attnum, &agg->vec);
-			dbe_agg_load_extra(state, agg);
 		}
 		for (i = 0; i < state->ngroupcols; i++)
 			state->groupvec_ok[i] =
@@ -4249,8 +4418,8 @@ dbe_agg_fill_hash(DbeVectorAggState *state)
 		MemoryContextReset(state->dictcxt);
 		dict_cache = NULL;
 		dict_size = 0;
-		if (state->ngroupcols == 1 && state->groupvec_ok[0] &&
-			state->groupvecs[0].reader != NULL)
+		if (state->ngroupcols == 1 && state->group_exprs == NULL &&
+			state->groupvec_ok[0] && state->groupvecs[0].reader != NULL)
 		{
 			int32_t		is_dict = 0;
 			uint32_t	n = 0;
@@ -4317,20 +4486,25 @@ dbe_agg_fill_hash(DbeVectorAggState *state)
 
 			if (!from_cache)
 			{
+				Datum	   *keys = state->group_slot->tts_values;
+				bool	   *keynulls = state->group_slot->tts_isnull;
+
 				ExecClearTuple(state->group_slot);
-				for (i = 0; i < state->ngroupcols; i++)
+				if (state->group_exprs != NULL)
+					dbe_agg_keys_expr(state, row, keys, keynulls);
+				else
 				{
-					if (!state->groupvec_ok[i])
+					for (i = 0; i < state->ngroupcols; i++)
 					{
-						state->group_slot->tts_values[i] = (Datum) 0;
-						state->group_slot->tts_isnull[i] = true;
-						continue;
+						if (!state->groupvec_ok[i])
+							dbe_agg_missing_value(state, state->groupcols[i],
+												  &keys[i], &keynulls[i]);
+						else
+							dbe_vec_value(&state->groupvecs[i], row,
+										  state->group_typbyval[i],
+										  state->group_typlen[i],
+										  &keys[i], &keynulls[i]);
 					}
-					dbe_vec_value(&state->groupvecs[i], row,
-								  state->group_typbyval[i],
-								  state->group_typlen[i],
-								  &state->group_slot->tts_values[i],
-								  &state->group_slot->tts_isnull[i]);
 				}
 				ExecStoreVirtualTuple(state->group_slot);
 
@@ -4553,14 +4727,15 @@ dbe_agg_flat_stats(DbeVectorAggState *state, uint64 *groups, int *parts,
 }
 
 /*
- * Las claves de la fila, en flat_keys, cuando alguna es una expresión del
+ * Las claves de la fila, en `keys`, cuando alguna es una expresión del
  * GROUP BY: esa se calcula sobre su columna, cargada en el slot de la
  * relación.  Una columna que el stripe no tiene vale su DEFAULT.  Va
  * aparte del lazo de las columnas solas, que es el de siempre: con la
  * rama adentro, q18 tardaba 11% más.
  */
 static pg_noinline void
-dbe_agg_flat_keys_expr(DbeVectorAggState *state, uint64 row)
+dbe_agg_keys_expr(DbeVectorAggState *state, uint64 row, Datum *keys,
+				  bool *keynulls)
 {
 	TupleTableSlot *slot = dbe_agg_qual_slot(state);
 
@@ -4568,8 +4743,8 @@ dbe_agg_flat_keys_expr(DbeVectorAggState *state, uint64 row)
 	state->key_econtext->ecxt_scantuple = slot;
 	for (int g = 0; g < state->ngroupcols; g++)
 	{
-		Datum	   *key = &state->flat_keys[g];
-		bool	   *isnull = &state->flat_keynulls[g];
+		Datum	   *key = &keys[g];
+		bool	   *isnull = &keynulls[g];
 		AttrNumber	a = state->groupcols[g];
 		Form_pg_attribute att;
 
@@ -4593,6 +4768,20 @@ dbe_agg_flat_keys_expr(DbeVectorAggState *state, uint64 row)
 			dbe_vec_value(&state->groupvecs[g], row, att->attbyval,
 						  att->attlen, &slot->tts_values[a - 1],
 						  &slot->tts_isnull[a - 1]);
+		}
+		for (int i = 0; i < state->group_aggs[g]->nextra; i++)
+		{
+			DbeAggState *agg = state->group_aggs[g];
+			AttrNumber	x = agg->extra[i];
+
+			att = TupleDescAttr(slot->tts_tupleDescriptor, x - 1);
+			if (!agg->extra_ok[i])
+				dbe_agg_missing_value(state, x, &slot->tts_values[x - 1],
+									  &slot->tts_isnull[x - 1]);
+			else
+				dbe_vec_value(&agg->extravec[i], row, att->attbyval,
+							  att->attlen, &slot->tts_values[x - 1],
+							  &slot->tts_isnull[x - 1]);
 		}
 		*key = ExecEvalExprSwitchContext(state->group_exprs[g],
 										 state->key_econtext, isnull);
@@ -4748,6 +4937,20 @@ dbe_agg_fill_flat(DbeVectorAggState *state, int bucket, uint32 nbuckets)
 
 		CHECK_FOR_INTERRUPTS();
 
+		/*
+		 * En el parcial no hace falta volcar: el Finalize junta la misma
+		 * clave emitida dos veces.  Si la tabla se llenó, se emite lo que
+		 * hay y se sigue después con la tabla vacía; lo que ya se volcó en
+		 * este stripe se procesa al emitir.  q13 estima 4.533 frases donde
+		 * hay 835.092: volcaba 750K filas a 384 particiones.  Va antes de
+		 * tomar el stripe, como en dbe_agg_fill_hash().
+		 */
+		if (state->flat_partial && dbe_flat_spilling(state->flatagg))
+		{
+			state->flat_more = true;
+			break;
+		}
+
 		/* Con un balde se recorre la tabla entera: los grupos son los repartidos. */
 		if (bucket >= 0)
 			take = dbe_cursor_next_stripe(state->cursor) ? DBE_TAKE_STRIPE
@@ -4766,11 +4969,11 @@ dbe_agg_fill_flat(DbeVectorAggState *state, int bucket, uint32 nbuckets)
 		{
 			DbeAggState *agg = &state->aggs[i];
 
+			dbe_agg_load_extra(state, agg);
 			if (agg->is_group)
 				continue;
 			agg->has_vector = !agg->is_count_star &&
 				dbe_cursor_column(state->cursor, agg->attnum, &agg->vec);
-			dbe_agg_load_extra(state, agg);
 		}
 		for (i = 0; i < state->ngroupcols; i++)
 			state->groupvec_ok[i] =
@@ -4912,7 +5115,8 @@ dbe_agg_fill_flat(DbeVectorAggState *state, int bucket, uint32 nbuckets)
 				}
 			}
 			else
-				dbe_agg_flat_keys_expr(state, row);
+				dbe_agg_keys_expr(state, row, state->flat_keys,
+								  state->flat_keynulls);
 			if (dist != NULL)
 			{
 				if (!dist->has_vector)
@@ -5104,7 +5308,17 @@ dbe_agg_exec_flat(CustomScanState *node)
 	{
 		if (!state->flat_filled)
 		{
-			if (state->shared != NULL)
+			if (state->flat_partial)
+			{
+				/* Los stripes salen del contador compartido. */
+				state->flat_more = false;
+				dbe_agg_fill_flat(state, -1, 0);
+				state->flat_stripes_pruned =
+					dbe_cursor_stripes_pruned(state->cursor);
+				state->flat_granules_pruned =
+					dbe_cursor_granules_pruned(state->cursor);
+			}
+			else if (state->shared != NULL)
 			{
 				uint32		b = pg_atomic_fetch_add_u32(&state->shared->next_bucket, 1);
 				uint64		sp0 = dbe_cursor_stripes_pruned(state->cursor);
@@ -5140,12 +5354,21 @@ dbe_agg_exec_flat(CustomScanState *node)
 			if (dbe_agg_topn_next(state))
 				break;
 		}
+		else if (state->flat_partial)
+		{
+			if (dbe_flat_next_partial(state->flatagg, state->flat_keys,
+									  state->flat_keynulls, state->flat_outs,
+									  state->flat_outnulls))
+				break;
+		}
 		else if (dbe_flat_next(state->flatdist != NULL ? state->flatdist
 							   : state->flatagg, state->flat_keys,
 							   state->flat_keynulls, state->flat_outs,
 							   state->flat_outnulls))
 			break;
-		if (state->shared == NULL)
+		if (state->flat_partial && state->flat_more)
+			dbe_agg_flat_reset(state);
+		else if (state->shared == NULL || state->flat_partial)
 		{
 			state->done = true;
 			return NULL;
@@ -5829,7 +6052,10 @@ dbe_agg_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 		ExplainPropertyText("Agrupación", "tabla de hash propia", es);
 		if (topn != NIL)
 			ExplainPropertyInteger("Top-N", NULL, intVal(linitial(topn)), es);
-		if (node->ss.ps.plan->parallel_aware)
+		if (state->flat_partial)
+			ExplainPropertyText("Reparto", "stripes entre participantes",
+								es);
+		else if (node->ss.ps.plan->parallel_aware)
 			ExplainPropertyText("Reparto", "grupos por hash entre participantes",
 								es);
 		if (es->analyze && state->flatagg != NULL)

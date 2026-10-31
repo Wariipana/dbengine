@@ -103,7 +103,7 @@ DEALLOCATE dqp;
 RESET plan_cache_mode;
 
 -- Resultados concretos, contra heap.
-CREATE TABLE dq_heap AS SELECT * FROM dq;
+CREATE TABLE dq_heap USING heap AS SELECT * FROM dq;
 SELECT (SELECT count(*) FROM dq WHERE s LIKE '%a%') AS columnar,
        (SELECT count(*) FROM dq_heap WHERE s LIKE '%a%') AS heap;
 SELECT s, count(*) FROM dq WHERE s <> 'zoe' GROUP BY s ORDER BY s;
@@ -119,7 +119,7 @@ INSERT INTO lk SELECT x, x FROM (SELECT (ARRAY['', 'a', 'ab', 'aba', 'abba',
 	'𝄞ab𝄞', NULL])[1 + g % 17] AS x FROM generate_series(1, 3400) g) z;
 INSERT INTO lk SELECT 'ab' || g || CASE WHEN g % 2 = 0 THEN 'ba' ELSE 'ñ' END,
 	'q' || g FROM generate_series(1, 2000) g;
-CREATE TABLE lk_heap AS SELECT * FROM lk;
+CREATE TABLE lk_heap USING heap AS SELECT * FROM lk;
 SELECT DISTINCT sc.encoding IN (3, 4) AS con_diccionario
 FROM dbengine.stripe_column sc
 WHERE sc.relfilenode = pg_relation_filenode('lk') AND sc.attnum = 1
@@ -176,7 +176,7 @@ INSERT INTO fz SELECT 'http://www.example' || (g % 400) || '.com/path/' ||
 			   WHEN 3 THEN 'añoñgoogle日本' WHEN 4 THEN NULL ELSE 'xgooglx' END
 	|| '/index.html?q=' || (g % 400)
 	FROM generate_series(1, 4000) g;
-CREATE TABLE fz_heap AS SELECT * FROM fz;
+CREATE TABLE fz_heap USING heap AS SELECT * FROM fz;
 SELECT DISTINCT sc.encoding = 4 AS fsst
 FROM dbengine.stripe_column sc
 WHERE sc.relfilenode = pg_relation_filenode('fz');

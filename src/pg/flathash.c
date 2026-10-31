@@ -32,6 +32,7 @@
 #include "catalog/pg_type.h"
 #include "common/hashfn.h"
 #include "fmgr.h"
+#include "libpq/pqformat.h"
 #include "miscadmin.h"
 #include "port/pg_bitutils.h"
 #include "storage/buffile.h"
@@ -1310,6 +1311,86 @@ dbe_flat_final(DbeFlatAgg *fa, int i, const uint64 *states, bool *isnull)
 	return (Datum) 0;
 }
 
+/*
+ * El estado parcial del agregado `i`, como lo entregaría un Partial Agg de
+ * Postgres (AGGSPLIT_INITIAL_SERIAL) para que su Finalize lo combine:
+ *
+ *	 - count: el int8; sum(int2/int4), min y max: el valor, o NULL si no
+ *	   hubo ninguno no nulo, igual que el final.
+ *	 - avg(int2/int4): el arreglo int8[] {cantidad, suma}.
+ *	 - sum/avg(int8): lo que arma int8_avg_serialize().  En PG 18 la suma va
+ *	   como NumericVar —int128_to_numericvar() y numericvar_serialize(),
+ *	   que no se exportan: dígitos en base 10000, el más significativo
+ *	   primero—; desde PG 19, como int128 en dos mitades.
+ */
+static Datum
+dbe_flat_partial(DbeFlatAgg *fa, int i, const uint64 *states, bool *isnull)
+{
+	const uint64 *s = states + (fa->stateoff[i] - 1 - fa->nkeys);
+	const DbeFlatAggDef *d = &fa->defs[i];
+	Datum		pair[2];
+	StringInfoData buf;
+	int128		v;
+
+	*isnull = false;
+	switch (d->kind)
+	{
+		case DBE_FLAT_AVG:
+			pair[0] = Int64GetDatum((int64) s[1]);
+			pair[1] = Int64GetDatum((int64) s[0]);
+			return PointerGetDatum(construct_array_builtin(pair, 2, INT8OID));
+		case DBE_FLAT_SUM8:
+		case DBE_FLAT_AVG8:
+			v = dbe_flat_get128(s);
+			pq_begintypsend(&buf);
+			pq_sendint64(&buf, (int64) s[2]);
+#if PG_VERSION_NUM >= 190000
+			pq_sendint64(&buf, (int64) (v >> 64));
+			pq_sendint64(&buf, (uint64) v);
+#else
+			{
+				uint128		u = v < 0 ? -(uint128) v : (uint128) v;
+				int16		digits[40 / 4];
+				int			n = 0;
+
+				while (u != 0)
+				{
+					digits[n++] = (int16) (u % 10000);
+					u /= 10000;
+				}
+				pq_sendint32(&buf, n);	/* ndigits */
+				pq_sendint32(&buf, n == 0 ? 0 : n - 1);	/* weight */
+				pq_sendint32(&buf, v < 0 ? 0x4000 : 0x0000);	/* sign */
+				pq_sendint32(&buf, 0);	/* dscale */
+				while (n > 0)
+					pq_sendint16(&buf, digits[--n]);
+			}
+#endif
+			return PointerGetDatum(pq_endtypsend(&buf));
+		default:
+			return dbe_flat_final(fa, i, states, isnull);
+	}
+}
+
+bool
+dbe_flat_next_partial(DbeFlatAgg *fa, Datum *keys, bool *keynulls,
+					  Datum *outs, bool *outnulls)
+{
+	const uint64 *e;
+	MemoryContext old;
+
+	MemoryContextReset(fa->outcxt);
+	e = dbe_flat_next_entry(fa, keys, keynulls);
+	if (e == NULL)
+		return false;
+
+	old = MemoryContextSwitchTo(fa->outcxt);
+	for (int i = 0; i < fa->naggs; i++)
+		outs[i] = dbe_flat_partial(fa, i, e + 1 + fa->nkeys, &outnulls[i]);
+	MemoryContextSwitchTo(old);
+	return true;
+}
+
 bool
 dbe_flat_next(DbeFlatAgg *fa, Datum *keys, bool *keynulls, Datum *outs,
 			  bool *outnulls)
@@ -1327,6 +1408,12 @@ dbe_flat_next(DbeFlatAgg *fa, Datum *keys, bool *keynulls, Datum *outs,
 		outs[i] = dbe_flat_final(fa, i, e + 1 + fa->nkeys, &outnulls[i]);
 	MemoryContextSwitchTo(old);
 	return true;
+}
+
+bool
+dbe_flat_spilling(DbeFlatAgg *fa)
+{
+	return fa->nparts > 0;
 }
 
 void

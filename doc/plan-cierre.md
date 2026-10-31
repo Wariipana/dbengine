@@ -288,7 +288,11 @@ Tres hechos del código que ordenan la lista:
        sobre una columna (con el numeric de `extract()` de campos enteros)
        y las comparaciones de enteros contra constantes sobre el arreglo
        del stripe: q19 1,6×, q36 1,8×, q2 4,2×; las 43: media geométrica
-       0,364, suma 43,7 s.
+       0,364, suma 43,7 s. Después, el parcial paralelo con la tabla
+       propia (cada participante sus stripes, estados en el formato del
+       Partial Agg de Postgres para su Finalize), elegido cuando se estiman
+       más de 300 filas por grupo: `GROUP BY RegionID` 2×, claves
+       expresión con pocos grupos 3×.
 10. [ ] **Decodificación por lotes** (`decode_range` de 1024 filas a través
        del airlock) con desempaquetado de bits por ancho estilo FastLanes,
        escrito para que el compilador lo vectorice en NEON.
@@ -387,17 +391,19 @@ conservadores.
 Por orden de cuántas consultas de BI desbloquea; se reordena con lo que
 muestre C5.0.
 
-5. [~] **Agregados sobre expresiones de varias columnas**:
+5. [x] **Agregados sobre expresiones de varias columnas**:
        `sum(precio * cantidad)`, `sum(CASE WHEN ... THEN monto END)`. Es la
        medida central de SSB (`lo_extendedprice * lo_discount`). Hoy el
        argumento puede mirar una sola columna; la evaluación ya pasa por el
        slot, así que es cargar varias. Lo mismo para las claves (`CASE
        WHEN` sobre varias columnas). Hecho para los agregados (5×
-       en `sum(a * b)` por UserID); faltan las claves.
+       en `sum(a * b)` por UserID) y para las claves, que ahora también
+       van al parcial paralelo (un CASE de dos columnas: 0,8 → 0,26 s).
 6. [~] **`sum`/`avg` de `bigint`** en la tabla propia y por SMA (q4). El
        estado es int128, como en Postgres. Hecho en la tabla propia; falta
        por SMA, que necesita armar el estado interno de Postgres para el
-       camino parcial.
+       camino parcial (la serialización de PG 18 y 19 ya está, en
+       `dbe_flat_partial()`).
 7. [ ] **`sum`/`avg` de `numeric`** (TPC-H Q1, montos de dinero) como
        enteros escalados en int128, mientras el valor entre: si no, se
        pasa a la suma de Postgres para ese grupo. La escala del resultado

@@ -135,6 +135,13 @@ extern bool dbe_flat_next(DbeFlatAgg *fa, Datum *keys, bool *keynulls,
 						  Datum *outs, bool *outnulls);
 
 /*
+ * Como dbe_flat_next(), pero con los estados parciales que espera el
+ * Finalize de Postgres sobre un Partial Agg (AGGSPLIT_INITIAL_SERIAL).
+ */
+extern bool dbe_flat_next_partial(DbeFlatAgg *fa, Datum *keys, bool *keynulls,
+								  Datum *outs, bool *outnulls);
+
+/*
  * Como dbe_flat_next(), pero sin terminar los agregados: `*states` apunta a
  * los estados del grupo, que valen hasta la llamada siguiente.  Sirve para
  * pasárselos a otra tabla con dbe_flat_add_states().
@@ -149,6 +156,9 @@ extern bool dbe_flat_next_states(DbeFlatAgg *fa, Datum *keys, bool *keynulls,
  */
 extern Datum dbe_flat_final(DbeFlatAgg *fa, int i, const uint64 *states,
 							bool *isnull);
+
+/* ¿La entrada ya empezó a volcarse a particiones? */
+extern bool dbe_flat_spilling(DbeFlatAgg *fa);
 
 /* Vacía todo para volver a empezar: rescan. */
 extern void dbe_flat_reset(DbeFlatAgg *fa);

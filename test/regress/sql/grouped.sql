@@ -23,7 +23,7 @@ CREATE INDEX g_k ON g (k);
 ANALYZE g;
 
 -- Copia en heap: es contra esto que se comparan todos los resultados.
-CREATE TABLE gh AS SELECT * FROM g;
+CREATE TABLE gh USING heap AS SELECT * FROM g;
 
 -- ===========================================================================
 -- Sin CLUSTER no hay orden que declarar
@@ -162,7 +162,7 @@ END
 $$;
 CLUSTER f USING f_k;
 ANALYZE f;
-CREATE TABLE fh AS SELECT * FROM f;
+CREATE TABLE fh USING heap AS SELECT * FROM f;
 
 SELECT count(*) AS marca_antes FROM dbengine.relation_order
 WHERE relfilenode = pg_relation_filenode('f');
@@ -197,7 +197,7 @@ SET work_mem = '64MB';
 CREATE TABLE hh (a int, b text, n int) USING dbengine_columnar;
 INSERT INTO hh SELECT i % 97, 'x' || (i % 53), i FROM generate_series(1, 50000) i;
 ANALYZE hh;
-CREATE TABLE hhh AS SELECT * FROM hh;
+CREATE TABLE hhh USING heap AS SELECT * FROM hh;
 
 -- El camino serial con hash NO se ofrece: es el único sin un Finalize
 -- arriba, así que no puede emitir la misma clave dos veces y por lo tanto no
@@ -268,7 +268,7 @@ INSERT INTO ln SELECT i % 5,
 			  || CASE WHEN i % 3 = 0 THEN 'xyz' ELSE '' END END
 	FROM generate_series(1, 20000) i;
 ANALYZE ln;
-CREATE TABLE lnh AS SELECT * FROM ln;
+CREATE TABLE lnh USING heap AS SELECT * FROM ln;
 EXPLAIN (COSTS off) SELECT a, avg(length(t)) FROM ln GROUP BY a;
 SELECT (SELECT sum(hashtext(a || ':' || s || ':' || av || ':' || mx)::bigint)
 		FROM (SELECT a, sum(length(t)) s, avg(char_length(t)) av,
@@ -293,7 +293,7 @@ CREATE TABLE dn (b text, n int) USING dbengine_columnar;
 INSERT INTO dn SELECT CASE WHEN i % 11 = 0 THEN NULL ELSE 'y' || (i % 31) END, i
 	FROM generate_series(1, 30000) i;
 ANALYZE dn;
-CREATE TABLE dnh AS SELECT * FROM dn;
+CREATE TABLE dnh USING heap AS SELECT * FROM dn;
 
 SELECT (SELECT count(*) FROM (SELECT b FROM dn GROUP BY b) x)
 	 = (SELECT count(*) FROM (SELECT b FROM dnh GROUP BY b) y) AS dict_nulos_grupos;
@@ -325,7 +325,7 @@ CREATE TABLE sp (b text, n int) USING dbengine_columnar;
 INSERT INTO sp SELECT 'k' || (i % 50), i FROM generate_series(1, 5000) i;
 ANALYZE sp;
 INSERT INTO sp SELECT 'k' || i, i FROM generate_series(1, 200000) i;
-CREATE TABLE sph AS SELECT * FROM sp;
+CREATE TABLE sph USING heap AS SELECT * FROM sp;
 
 -- El planner sigue creyendo que hay ~50 grupos; hay más de 200.000.
 EXPLAIN (COSTS off) SELECT b, count(*) FROM sp GROUP BY b;
@@ -365,7 +365,7 @@ SELECT (SELECT count(DISTINCT n) FROM hh WHERE n % 7 = 0)
 CREATE TABLE nulos (x int) USING dbengine_columnar;
 INSERT INTO nulos SELECT CASE WHEN i % 3 = 0 THEN NULL ELSE i % 10 END
 	FROM generate_series(1, 1000) i;
-CREATE TABLE nulosh AS SELECT * FROM nulos;
+CREATE TABLE nulosh USING heap AS SELECT * FROM nulos;
 SELECT (SELECT count(DISTINCT x) FROM nulos) = (SELECT count(DISTINCT x) FROM nulosh)
 	AS distinct_con_nulos_igual;
 
@@ -376,7 +376,7 @@ CREATE TABLE dr (t text, n int8) USING dbengine_columnar;
 INSERT INTO dr SELECT CASE WHEN i % 13 = 0 THEN NULL ELSE 'v' || (i / 5) % 300 END,
 	i / 4 FROM generate_series(1, 100000) i;
 INSERT INTO dr SELECT md5((i / 2)::text), NULL FROM generate_series(1, 30000) i;
-CREATE TABLE drh AS SELECT * FROM dr;
+CREATE TABLE drh USING heap AS SELECT * FROM dr;
 SELECT (SELECT count(DISTINCT t) FROM dr) = (SELECT count(DISTINCT t) FROM drh)
 	AS distinct_codigos_y_corridas,
 	(SELECT count(DISTINCT n) FROM dr) = (SELECT count(DISTINCT n) FROM drh)
@@ -420,7 +420,7 @@ INSERT INTO fx SELECT
 	CASE WHEN i % 29 = 0 THEN NULL ELSE 'x' || i % 3 END
 	FROM generate_series(1, 30000) i;
 ANALYZE fx;
-CREATE TABLE fxh AS SELECT * FROM fx;
+CREATE TABLE fxh USING heap AS SELECT * FROM fx;
 
 EXPLAIN (COSTS OFF)
 SELECT a, b, count(*), sum(v), avg(w) FROM fx GROUP BY a, b;
@@ -479,6 +479,12 @@ SELECT extract(hour FROM t) AS h, count(*) FROM fx GROUP BY 1 ORDER BY 1 LIMIT 3
 -- Con decimales no: 1.0 y 1.00 son iguales con bytes distintos.
 EXPLAIN (COSTS OFF) SELECT extract(second FROM t), count(*) FROM fx GROUP BY 1;
 EXPLAIN (COSTS OFF) SELECT v / 2.0, count(*) FROM fx GROUP BY 1;
+-- Claves que miran varias columnas: el CASE que arma una categoría de
+-- tablero, con nulos, texto y la columna nueva.
+EXPLAIN (COSTS OFF) SELECT CASE WHEN a = 1 THEN b ELSE c END, count(*) FROM fx GROUP BY 1;
+SELECT fx_check('SELECT CASE WHEN a = 1 THEN b ELSE c END, count(*), sum(v) FROM fx GROUP BY 1') AS clave_varias_columnas;
+SELECT fx_check('SELECT a, a + b, CASE WHEN f THEN s ELSE ''no'' END, count(*), avg(w) FROM fx GROUP BY 1, 2, 3') AS clave_varias_texto;
+SELECT fx_check('SELECT k * b, count(*), sum(k * v) FROM fx GROUP BY 1') AS clave_varias_nueva;
 
 -- Volcado: con work_mem al mínimo y una estimación mala (se analiza con
 -- pocos grupos y se insertan muchos más), varios niveles de particiones.
@@ -487,7 +493,7 @@ INSERT INTO fxs SELECT i % 10, i % 3, i FROM generate_series(1, 2000) i;
 ANALYZE fxs;
 INSERT INTO fxs SELECT i, i % 3, i % 1000 FROM generate_series(1, 200000) i;
 INSERT INTO fxs SELECT i * 7, NULL, NULL FROM generate_series(1, 50000) i;
-CREATE TABLE fxsh AS SELECT * FROM fxs;
+CREATE TABLE fxsh USING heap AS SELECT * FROM fxs;
 SET work_mem = '64kB';
 EXPLAIN (COSTS OFF) SELECT g, h, count(*), sum(v) FROM fxs GROUP BY g, h;
 SELECT count(*) AS grupos, sum(c) AS filas
@@ -500,6 +506,7 @@ SELECT (SELECT sum(hashtext(g || ':' || coalesce(h, -1) || ':' || c || ':' || co
 		FROM (SELECT g, h, count(*) c, sum(v) s, avg(v) a FROM fxsh GROUP BY g, h) y)
 	AS volcado_igual;
 SELECT fx_check('SELECT g + 1, h, count(*) FROM fxs GROUP BY 1, 2', 'fxs') AS volcado_expresion;
+SELECT fx_check('SELECT g + coalesce(h, 5), count(*), sum(v) FROM fxs GROUP BY 1', 'fxs') AS volcado_expresion_varias;
 -- sum/avg de bigint: la suma va en int128, como el estado de Postgres, y
 -- el resultado es el mismo numeric.  Sumas que se pasan de int64 hacia los
 -- dos lados, grupos sin valores y volcado con registros de estados.
@@ -510,7 +517,7 @@ INSERT INTO fb SELECT i % 5000,
 		 ELSE i::int8 * 1000003 END
 	FROM generate_series(1, 120000) i;
 INSERT INTO fb SELECT 99999, NULL FROM generate_series(1, 10);
-CREATE TABLE fbh AS SELECT * FROM fb;
+CREATE TABLE fbh USING heap AS SELECT * FROM fb;
 EXPLAIN (COSTS OFF) SELECT g, sum(b), avg(b) FROM fb GROUP BY g;
 SELECT fx_check('SELECT g, sum(b), avg(b), count(b) FROM fb GROUP BY g', 'fb') AS sum_avg_bigint;
 SELECT g, sum(b), avg(b) FROM fb WHERE g IN (0, 1, 2, 99999) GROUP BY g ORDER BY g;
@@ -525,7 +532,7 @@ INSERT INTO fr SELECT i / 7, CASE WHEN (i / 7) % 11 = 0 THEN NULL ELSE (i / 7) %
 	CASE WHEN i % 5 = 0 THEN NULL ELSE i % 100 END, 's' || (i / 3) % 50
 	FROM generate_series(1, 150000) i;
 INSERT INTO fr SELECT 5, 1, i, NULL FROM generate_series(1, 70000) i;
-CREATE TABLE frh AS SELECT * FROM fr;
+CREATE TABLE frh USING heap AS SELECT * FROM fr;
 SET work_mem = '64kB';
 SELECT fx_check('SELECT g, h, count(*), count(v), sum(v), avg(v), min(v), max(v) FROM fr GROUP BY g, h', 'fr') AS corridas;
 SELECT fx_check('SELECT h, count(DISTINCT g), count(*), sum(v) FROM fr GROUP BY h', 'fr') AS corridas_distinct;
@@ -563,7 +570,7 @@ INSERT INTO ft SELECT CASE WHEN i % 97 = 0 THEN NULL
 	'v' || (i % 7), i % 1000
 	FROM generate_series(1, 150000) i;
 INSERT INTO ft SELECT md5(i::text), NULL, i FROM generate_series(1, 20000) i;
-CREATE TABLE fth AS SELECT * FROM ft;
+CREATE TABLE fth USING heap AS SELECT * FROM ft;
 SET work_mem = '64kB';
 EXPLAIN (COSTS OFF) SELECT u, count(*), sum(n) FROM ft GROUP BY u;
 SELECT (SELECT sum(hashtext(coalesce(u, '-') || ':' || c || ':' || s || ':' || a)::bigint)
@@ -643,7 +650,7 @@ CREATE TABLE fpt (k text, v int4) USING dbengine_columnar;
 INSERT INTO fpt SELECT 'k' || (i % 40000) || CASE WHEN i % 3 = 0 THEN 'ñ' ELSE '' END,
 	i % 100 FROM generate_series(1, 120000) i;
 ANALYZE fpt;
-CREATE TABLE fpth AS SELECT * FROM fpt;
+CREATE TABLE fpth USING heap AS SELECT * FROM fpt;
 SET work_mem = '64kB';
 EXPLAIN (COSTS OFF) SELECT g, h, count(*), sum(v) FROM fxs GROUP BY g, h;
 EXPLAIN (COSTS OFF) SELECT k, count(*), sum(v) FROM fpt GROUP BY k;
@@ -664,11 +671,27 @@ EXPLAIN (COSTS OFF) SELECT v, count(DISTINCT k), count(*) FROM fpt GROUP BY v;
 SELECT fx_check('SELECT v, count(DISTINCT k), count(*) FROM fpt GROUP BY v', 'fpt') AS paralelo_distinct;
 SELECT fx_check('SELECT k, v, count(*) FROM fpt GROUP BY k, v', 'fpt') AS paralelo_texto_y_entero;
 SELECT fx_check('SELECT upper(k), v % 7, count(*) FROM fpt GROUP BY 1, 2', 'fpt') AS paralelo_expresiones;
--- Con pocos grupos (más de mil filas por grupo) va el parcial con
+-- Con pocos grupos (más de 300 filas por grupo) va el parcial con
 -- Finalize, que reparte stripes; la tabla propia en paralelo le haría leer
 -- la tabla entera a cada participante.  Con muchos, la tabla propia.
 EXPLAIN (COSTS OFF) SELECT v, count(*), sum(v::int8) FROM fpt GROUP BY v;
+-- El parcial agrupa con la tabla propia, cada participante sus stripes, y
+-- entrega los estados como un Partial Agg de Postgres: avg(int4) como
+-- {cantidad, suma}, sum/avg(int8) serializados (la suma en int128, que acá
+-- se pasa de int64 hacia los dos lados), y grupos sin valores no nulos.
 SELECT fx_check('SELECT v, count(*), sum(v::int8), avg(v::int8) FROM fpt GROUP BY v', 'fpt') AS pocos_grupos;
+SELECT fx_check('SELECT v, count(k), sum(v), avg(v), min(k), max(v), min(v) FROM fpt GROUP BY v', 'fpt') AS pocos_grupos_todos;
+SELECT fx_check('SELECT v, sum(v::int8 * 3000000000000000), sum((v - 50)::int8 * -3000000000000000), avg((v - 50)::int8 * 3000000000000000) FROM fpt GROUP BY v', 'fpt') AS pocos_grupos_int128;
+SELECT fx_check('SELECT v, sum(CASE WHEN v > 200 THEN v::int8 END), avg(CASE WHEN v > 200 THEN v::int8 END), avg(CASE WHEN v > 200 THEN v END), count(CASE WHEN v > 200 THEN v END) FROM fpt GROUP BY v', 'fpt') AS pocos_grupos_sin_valores;
+-- Claves que son expresiones, sobre una y varias columnas.
+EXPLAIN (COSTS OFF) SELECT v % 10, count(*) FROM fpt GROUP BY 1;
+SELECT fx_check('SELECT v % 10, CASE WHEN v > 50 THEN 1 ELSE length(k) END, count(*), sum(v::int8), avg(v) FROM fpt GROUP BY 1, 2', 'fpt') AS pocos_grupos_expresiones;
+-- Postgres estima una expresión por sus columnas (40.000 valores de k): la
+-- regla usa lo que la expresión puede dar, dos ramas de un CASE o 2|c|
+-- restos.
+EXPLAIN (COSTS OFF) SELECT CASE WHEN k LIKE 'k1%' THEN 'uno' ELSE 'otro' END, count(*) FROM fpt GROUP BY 1;
+EXPLAIN (COSTS OFF) SELECT hashtext(k) % 5, count(*) FROM fpt GROUP BY 1;
+SELECT fx_check('SELECT CASE WHEN k LIKE ''k1%'' THEN ''uno'' ELSE ''otro'' END, hashtext(k) % 5, count(*), sum(v) FROM fpt GROUP BY 1, 2', 'fpt') AS cota_de_grupos;
 -- Top-N en paralelo: cada participante emite sus k mejores.
 EXPLAIN (COSTS OFF) SELECT k, sum(v) s FROM fpt GROUP BY k ORDER BY s DESC, k LIMIT 10;
 SELECT fx_check('SELECT k, sum(v) s FROM fpt GROUP BY k ORDER BY s DESC, k LIMIT 10', 'fpt') AS paralelo_topn;
@@ -679,11 +702,13 @@ SET max_parallel_workers = 0;
 SELECT count(*) AS grupos, sum(c) AS filas
 FROM (SELECT g, h, count(*) c FROM fxs GROUP BY g, h) x;
 SELECT fx_check('SELECT v, count(DISTINCT k), count(*) FROM fpt GROUP BY v', 'fpt') AS distinct_sin_workers;
+SELECT fx_check('SELECT v, count(*), sum(v::int8 * 3000000000000000), avg(v) FROM fpt GROUP BY v', 'fpt') AS pocos_grupos_sin_workers;
 RESET max_parallel_workers;
 SET parallel_leader_participation = off;
 SELECT count(*) AS grupos, sum(c) AS filas
 FROM (SELECT g, h, count(*) c FROM fxs GROUP BY g, h) x;
 SELECT fx_check('SELECT v, count(DISTINCT k), count(*) FROM fpt GROUP BY v', 'fpt') AS distinct_sin_lider;
+SELECT fx_check('SELECT v, count(*), sum(v::int8 * 3000000000000000), avg(v) FROM fpt GROUP BY v', 'fpt') AS pocos_grupos_sin_lider;
 RESET parallel_leader_participation;
 RESET work_mem;
 DROP TABLE fpt, fpth;
