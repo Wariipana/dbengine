@@ -1,0 +1,63 @@
+=== C2, sin índices — 2026-10-31T10:41:58-05:00 — commit 81d5a38 ===
+=== ClickBench / 10M filas — dbengine vs heap ===
+datos: /config/.dbengine/clickbench/hits10m.tsv
+NOTICE:  extension "dbengine" already exists, skipping
+(carga salteada: SKIP_LOAD=1)
+
+--- tamaño en disco ---
+    am    |   tam   
+----------+---------
+ heap     | 6835 MB
+ dbengine | 1785 MB
+(2 rows)
+
+
+--- correctitud: heap vs dbengine, 43 queries ---
+  las 43 coinciden
+
+q      heap(ms)    dbe(ms)    ratio   disp h/d  plan dbengine
+1        1261.0        2.0  105.92x   25%  22%  agg pushdown
+2        1762.6       29.4   44.99x   10%   6%  agg pushdown
+3        2026.4       14.8   82.11x    2%   4%  agg pushdown
+4        1592.6       83.7   17.10x    1%   4%  agg pushdown
+5        4563.1      577.0    7.79x    0%   2%  agg pushdown
+6        6569.3      544.6   11.86x    2%   1%  agg pushdown
+7        1594.9       16.5   60.56x    2%   1%  agg pushdown
+8        1710.7       33.6   39.47x    2%   2%  agg pushdown
+9        7397.3      760.7    9.61x    0%   1%  agg pushdown
+10       8397.6     1021.9    8.15x    1%   2%  agg pushdown
+11       1977.3      192.8    9.80x    2%   1%  agg pushdown
+12       2049.8      208.7    9.42x    1%   2%  agg pushdown
+13       3350.7     1063.2    3.13x    3%   0%  agg pushdown
+14       2771.3      734.9    3.73x    3%   2%  agg pushdown
+15       3710.8      593.5    6.17x    5%   2%  agg pushdown
+16       5545.5      557.7    9.79x    5%   1%  agg pushdown
+17       7308.0     1610.0    4.52x    3%   3%  agg pushdown
+18       6308.2     1368.3    4.58x    2%   3%  agg pushdown
+19       8028.5     3475.3    2.31x    2%   0%  agg pushdown
+20       1435.5       20.5   47.39x    1%   3%  custom scan
+21       2106.2      249.6    8.15x    1%   3%  agg pushdown
+22       2473.9      285.7    8.40x    1%   1%  agg pushdown
+23       2761.4      370.8    7.28x    4%   2%  custom scan
+24       2154.9      677.6    3.15x    2%   1%  custom scan
+25       1916.6      204.8    8.97x    2%   1%  custom scan
+26       1889.6      158.2   11.29x    4%   1%  custom scan
+27       1913.4      204.3    8.98x    0%   2%  custom scan
+28       2773.6      951.6    2.89x    2%   1%  agg pushdown
+29      21617.6    11646.6    1.86x    0%   1%  custom scan
+30       6043.2       10.6  293.84x    4%   1%  agg pushdown
+31       5495.5      518.4   10.42x    0%   1%  agg pushdown
+32       5919.7      667.8    8.75x    0%   1%  agg pushdown
+33      22058.3     1879.4   11.68x    2%   2%  agg pushdown
+34      12151.9     2270.5    5.33x    0%   2%  agg pushdown
+35      12176.3     2210.2    5.49x    3%   3%  agg pushdown
+36       3438.9     1412.7    2.42x    4%   1%  agg pushdown
+37       2320.1      310.1    7.28x    0%   3%  agg pushdown
+38       2052.4       48.7   35.13x    4%   2%  agg pushdown
+39       1901.9       30.4   47.32x    3%   1%  agg pushdown
+40       2448.6      416.2    5.77x    2%   2%  agg pushdown
+41       2590.1       40.1   51.90x    1%   3%  agg pushdown
+42       2451.7       25.2   69.93x    5%   2%  agg pushdown
+43       1944.9      107.9   16.58x    2%   1%  agg pushdown
+rc=0
+Resumen: media geométrica 11,80× (fórmula oficial, +10 ms); suma 202,0 s heap / 37,6 s dbengine = 5,37×

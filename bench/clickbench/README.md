@@ -107,6 +107,7 @@ frío — sólo que no era lo que explicaba la dispersión.
 | `resultado-10m-clusterizado.txt` | 6 índices | PGM + clusterizada + Bloom | 1,46× (suma) |
 | `resultado-10m-final.txt` | 6 índices | + FSST + gránulos + Bloom | **2,06× caliente / 13,97× frío** |
 | `resultado-10m-linea-base-c2.txt` | sin índices | sin índices ni Bloom (línea base de C2) | 3,97× media geom. / 1,83× suma |
+| `resultado-10m-c2.txt` | sin índices | sin índices ni Bloom, después de C2 (`81d5a38`) | **11,80× media geom. / 5,37× suma** |
 
 Las tres primeras son anteriores a FSST, al zone map por gránulo y al arreglo
 del fetch por TID, y reportan la suma de tiempos, no la media geométrica.

@@ -569,3 +569,41 @@ destapó que `count(c)` de un bigint daba "bigint out of range" con un
 stripe cuya suma no entra en int64: el atajo por metadatos convertía la
 suma aunque count no la usa. Arreglado, con test, y las copias de los tests
 ahora dicen `USING heap`.
+
+## Medición limpia al cierre de lo hecho en C2
+
+2026-10-31, commit `81d5a38`, mismas tablas que la línea base (sin índices
+ni Bloom), con la máquina sin otra carga: heap tarda lo mismo que el 24/10
+(202,0 contra 201,4 s de suma; por query entre −11% y +10%, salvo q1,
++16%), así que las dos corridas se pueden comparar directamente. Las 43 queries dan lo
+mismo que heap. Tiempos en
+[`bench/clickbench/resultado-10m-c2.txt`](../bench/clickbench/resultado-10m-c2.txt).
+
+| | línea base | ahora |
+|---|---|---|
+| media geométrica contra heap (fórmula oficial, +10 ms) | 3,97× | **11,80×** |
+| suma dbengine | 109,9 s | **37,6 s** |
+| suma, heap / dbengine | 1,83× | **5,37×** |
+| queries más lentas que heap | 1 (q24, 0,66×) | ninguna |
+
+Lo que más cambió:
+
+| query | línea base | ahora | |
+|---|---|---|---|
+| q30 `SUM(ResolutionWidth + k)` ×90 | 5.088 ms | 10,6 | desde el catálogo |
+| q3 `SUM, COUNT, AVG` | 473 | 14,8 | agregados precalculados |
+| q9 / q10 `GROUP BY RegionID` + `count(DISTINCT)` | 6.261 / 7.136 | 761 / 1.022 | tabla propia en paralelo |
+| q33 `GROUP BY WatchID, ClientIP` | 12.520 | 1.879 | tabla propia, sin volcar en Postgres |
+| q24 `SELECT * ... LIKE ... LIMIT 10` | 3.252 | 678 | apertura perezosa, LIKE sobre FSST |
+| q29 `REGEXP_REPLACE` + `GROUP BY` | 21.080 | 11.647 | |
+| q34 / q35 `GROUP BY URL` | 7.179 | 2.271 / 2.210 | |
+
+Lo que no se movió: q1 (2 ms), q7 (16,5 ms) y q43 (108 ms) ya eran
+metadatos o casi; q4 (`AVG(UserID)`, bigint, 84 ms) espera el atajo por
+metadatos para sum/avg de bigint, que ahora puede usar la serialización de
+la tabla propia; q13 (`GROUP BY SearchPhrase`, 1,06 s, 0,87 de la base) es
+la que menos mejoró de las grandes.
+
+Donde la ventaja sobre heap es menor: q29 1,86× (el motor de regexp de
+Postgres), q19 2,31× (3,5 s, `GROUP BY UserID, minuto, SearchPhrase`), q36
+2,43× y q28 2,91×. Son las candidatas para lo que queda de C2 y C5.

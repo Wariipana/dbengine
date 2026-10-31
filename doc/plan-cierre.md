@@ -134,6 +134,10 @@ Tres hechos del código que ordenan la lista:
       **abrir un segmento lo decodifica entero** (48% de q24), el `LIKE` y
       el regexp dominan la CPU de q21–q24 y q29, y en frío el 75% es
       espera de I/O. El orden de abajo ya está ajustado a eso.
+- [x] ClickBench completo de nuevo con lo hecho hasta `81d5a38`
+      (2026-10-31): **11,80×** media geométrica, 5,37× suma, ninguna
+      query más lenta que heap. Ver la última sección de
+      [`doc/perf-linea-base-c2.md`](perf-linea-base-c2.md).
 
 ### C2.1 — Lo que encontró el perfil
 
