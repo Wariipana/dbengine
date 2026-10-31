@@ -486,3 +486,18 @@ propia no se ofrece. Esas dos consultas quedan en 289 y 474 ms. Las 43 de
 ClickBench no cambian (comparación alternando los `.so`; la máquina tenía
 carga y las corridas sueltas salían hasta 20% más lentas en consultas que
 no tocan el cambio).
+
+## Resultado: agregados sobre expresiones de varias columnas
+
+Un argumento de agregado podía ser una expresión, pero de una sola columna
+(la que se carga en el slot), y la tabla propia solo aceptaba la columna
+sola. Ahora cada agregado con expresión lleva la lista de las demás
+columnas que mira, con su vista por stripe en los cuatro recorridos, y la
+tabla propia acepta la expresión si su tipo entra (enteros para sum y avg,
+cualquiera para count, enteros para min/max). Es la forma de la medida de
+SSB y de cualquier tablero: `sum(precio * cantidad)`, `sum(CASE WHEN ...)`.
+
+`SELECT UserID, sum(ResolutionWidth::int4 * ResolutionHeight), count(*)
+... GROUP BY UserID ORDER BY 2 DESC LIMIT 10`: **3,88 → 0,78 s**, mismo
+resultado. Las de ClickBench que ya usaban expresiones de una columna (q4,
+q28, q30) no cambian.

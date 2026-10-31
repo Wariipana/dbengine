@@ -755,6 +755,41 @@ SELECT k, count(*) FROM fx GROUP BY k ORDER BY k;
  7 | 30000
 (5 rows)
 
+-- Argumentos que miran varias columnas —la medida típica de un tablero,
+-- sum(precio * cantidad)—, en la tabla propia y sin GROUP BY.  Con nulos,
+-- CASE, y una columna que los stripes viejos no tienen (vale su DEFAULT).
+EXPLAIN (COSTS OFF) SELECT a, sum(v * w) FROM fx GROUP BY a;
+              QUERY PLAN               
+---------------------------------------
+ Custom Scan (DbengineVectorAgg) on fx
+   Agregados empujados al scan: 2
+   Agrupación: tabla de hash propia
+(3 rows)
+
+SELECT fx_check('SELECT a, sum(v * w), avg(v + w), count(v + w), min(v - w) FROM fx GROUP BY a') AS varias_columnas;
+ varias_columnas 
+-----------------
+ t
+(1 row)
+
+SELECT fx_check('SELECT b, sum(CASE WHEN a = 1 THEN v ELSE w END), sum(CASE WHEN f THEN v::int8 * c END) FROM fx GROUP BY b') AS varias_columnas_case;
+ varias_columnas_case 
+----------------------
+ t
+(1 row)
+
+SELECT fx_check('SELECT a, sum(k * v), max(k + w) FROM fx GROUP BY a') AS varias_columnas_nueva;
+ varias_columnas_nueva 
+-----------------------
+ t
+(1 row)
+
+SELECT fx_check('SELECT sum(v * w), avg(v::int8 * c), count(v + w) FROM fx WHERE a = 2') AS varias_columnas_sin_grupo;
+ varias_columnas_sin_grupo 
+---------------------------
+ t
+(1 row)
+
 -- Claves que son una expresión sobre una columna: se calculan fila por
 -- fila.  Con nulos, texto, el DEFAULT de una columna nueva, y el numeric de
 -- extract() con campos enteros, que tiene una sola forma por valor.
@@ -1392,6 +1427,12 @@ SELECT fx_check('SELECT k, sum(v) s FROM fpt GROUP BY k ORDER BY s DESC, k LIMIT
 SELECT fx_check('SELECT k, sum(v::int8 * 3000000000) s, avg(v::int8) FROM fpt GROUP BY k ORDER BY s DESC, k LIMIT 10', 'fpt') AS paralelo_bigint;
  paralelo_bigint 
 -----------------
+ t
+(1 row)
+
+SELECT fx_check('SELECT v, sum(length(k) * v), avg(length(k) + v) FROM fpt GROUP BY v', 'fpt') AS paralelo_varias_columnas;
+ paralelo_varias_columnas 
+--------------------------
  t
 (1 row)
 

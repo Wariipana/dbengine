@@ -387,12 +387,13 @@ conservadores.
 Por orden de cuántas consultas de BI desbloquea; se reordena con lo que
 muestre C5.0.
 
-5. [ ] **Agregados sobre expresiones de varias columnas**:
+5. [~] **Agregados sobre expresiones de varias columnas**:
        `sum(precio * cantidad)`, `sum(CASE WHEN ... THEN monto END)`. Es la
        medida central de SSB (`lo_extendedprice * lo_discount`). Hoy el
        argumento puede mirar una sola columna; la evaluación ya pasa por el
        slot, así que es cargar varias. Lo mismo para las claves (`CASE
-       WHEN` sobre varias columnas).
+       WHEN` sobre varias columnas). Hecho para los agregados (5×
+       en `sum(a * b)` por UserID); faltan las claves.
 6. [~] **`sum`/`avg` de `bigint`** en la tabla propia y por SMA (q4). El
        estado es int128, como en Postgres. Hecho en la tabla propia; falta
        por SMA, que necesita armar el estado interno de Postgres para el

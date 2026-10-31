@@ -457,6 +457,15 @@ INSERT INTO fxh (a, b, k, v) SELECT 1, i % 3, i % 4, i FROM generate_series(1, 1
 SELECT fx_check('SELECT k, count(*), sum(k), min(k) FROM fx GROUP BY k') AS columna_nueva;
 SELECT k, count(*) FROM fx GROUP BY k ORDER BY k;
 
+-- Argumentos que miran varias columnas —la medida típica de un tablero,
+-- sum(precio * cantidad)—, en la tabla propia y sin GROUP BY.  Con nulos,
+-- CASE, y una columna que los stripes viejos no tienen (vale su DEFAULT).
+EXPLAIN (COSTS OFF) SELECT a, sum(v * w) FROM fx GROUP BY a;
+SELECT fx_check('SELECT a, sum(v * w), avg(v + w), count(v + w), min(v - w) FROM fx GROUP BY a') AS varias_columnas;
+SELECT fx_check('SELECT b, sum(CASE WHEN a = 1 THEN v ELSE w END), sum(CASE WHEN f THEN v::int8 * c END) FROM fx GROUP BY b') AS varias_columnas_case;
+SELECT fx_check('SELECT a, sum(k * v), max(k + w) FROM fx GROUP BY a') AS varias_columnas_nueva;
+SELECT fx_check('SELECT sum(v * w), avg(v::int8 * c), count(v + w) FROM fx WHERE a = 2') AS varias_columnas_sin_grupo;
+
 -- Claves que son una expresión sobre una columna: se calculan fila por
 -- fila.  Con nulos, texto, el DEFAULT de una columna nueva, y el numeric de
 -- extract() con campos enteros, que tiene una sola forma por valor.
@@ -664,6 +673,7 @@ SELECT fx_check('SELECT v, count(*), sum(v::int8), avg(v::int8) FROM fpt GROUP B
 EXPLAIN (COSTS OFF) SELECT k, sum(v) s FROM fpt GROUP BY k ORDER BY s DESC, k LIMIT 10;
 SELECT fx_check('SELECT k, sum(v) s FROM fpt GROUP BY k ORDER BY s DESC, k LIMIT 10', 'fpt') AS paralelo_topn;
 SELECT fx_check('SELECT k, sum(v::int8 * 3000000000) s, avg(v::int8) FROM fpt GROUP BY k ORDER BY s DESC, k LIMIT 10', 'fpt') AS paralelo_bigint;
+SELECT fx_check('SELECT v, sum(length(k) * v), avg(length(k) + v) FROM fpt GROUP BY v', 'fpt') AS paralelo_varias_columnas;
 SELECT fx_check('SELECT v, count(DISTINCT k) d FROM fpt GROUP BY v ORDER BY d DESC, v LIMIT 5', 'fpt') AS paralelo_topn_distinct;
 SET max_parallel_workers = 0;
 SELECT count(*) AS grupos, sum(c) AS filas

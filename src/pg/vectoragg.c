@@ -125,6 +125,12 @@ typedef struct DbeAggState
 	int16		valtyplen;
 	bool		valtypbyval;
 
+	/* Las demás columnas que mira argexpr, con su vista en el stripe. */
+	int			nextra;
+	AttrNumber *extra;
+	DbeColumnVector *extravec;
+	bool	   *extra_ok;
+
 	/*
 	 * El argumento es length(col) sobre texto: se cuenta acá en vez de
 	 * evaluar la expresión.  len_bytes: la codificación es de un byte por
@@ -592,9 +598,11 @@ dbe_agg_supported(Aggref *ref, Index relid, AttrNumber *attnum,
 	}
 
 	/*
-	 * Una expresión sobre UNA columna —`sum(ResolutionWidth + 1)`, q30— se
-	 * evalúa fila por fila contra el slot de la relación, como el WHERE.
-	 * Con DISTINCT no: el conjunto de hash es sobre la columna.
+	 * Una expresión —`sum(ResolutionWidth + 1)` en q30, `sum(precio *
+	 * cantidad)` en un tablero— se evalúa fila por fila contra el slot de
+	 * la relación, como el WHERE, con sus columnas cargadas.  *attnum queda
+	 * con la primera; las demás las busca dbe_agg_init_one().  Con DISTINCT
+	 * no: el conjunto de hash es sobre la columna.
 	 */
 	if (*is_distinct || contain_volatile_functions(arg) ||
 		contain_subplans(arg) || expression_returns_set(arg))
@@ -609,10 +617,10 @@ dbe_agg_supported(Aggref *ref, Index relid, AttrNumber *attnum,
 			Var		   *var = (Var *) lfirst(lc);
 
 			if (var->varno != relid || var->varattno <= 0 ||
-				var->varlevelsup != 0 ||
-				(*attnum != InvalidAttrNumber && var->varattno != *attnum))
+				var->varlevelsup != 0)
 				return false;
-			*attnum = var->varattno;
+			if (*attnum == InvalidAttrNumber)
+				*attnum = var->varattno;
 		}
 		if (*attnum == InvalidAttrNumber)
 			return false;		/* sin columnas: que lo haga el executor */
@@ -887,7 +895,9 @@ dbe_flat_agg_def(Aggref *ref, Index relid, DbeFlatAggDef *def)
 {
 	HeapTuple	tup;
 	Form_pg_aggregate aggform;
+	Node	   *arg;
 	Var		   *var;
+	Oid			typid;
 	Oid			transfn;
 	Oid			finalfn;
 	Oid			sortop;
@@ -916,10 +926,19 @@ dbe_flat_agg_def(Aggref *ref, Index relid, DbeFlatAggDef *def)
 
 	if (list_length(ref->args) != 1)
 		return false;
-	var = (Var *) ((TargetEntry *) linitial(ref->args))->expr;
-	if (!IsA(var, Var) || var->varattno <= 0 || var->varlevelsup != 0 ||
-		(relid != 0 && var->varno != (int) relid))
+	arg = (Node *) ((TargetEntry *) linitial(ref->args))->expr;
+	var = (Var *) arg;
+	if (IsA(arg, Var) &&
+		(var->varattno <= 0 || var->varlevelsup != 0 ||
+		 (relid != 0 && var->varno != (int) relid)))
 		return false;
+
+	/*
+	 * Una expresión —`sum(precio * cantidad)`— la calcula dbe_agg_value()
+	 * fila por fila; acá solo importa su tipo.  Que mire solo columnas de
+	 * la relación y no sea volátil ya lo comprobó dbe_agg_supported().
+	 */
+	typid = exprType(arg);
 
 	if (transfn == F_INT8INC_ANY && !OidIsValid(finalfn))
 	{
@@ -928,7 +947,7 @@ dbe_flat_agg_def(Aggref *ref, Index relid, DbeFlatAggDef *def)
 		return true;
 	}
 
-	switch (var->vartype)
+	switch (typid)
 	{
 		case INT2OID:
 			def->vallen = 2;
@@ -937,7 +956,7 @@ dbe_flat_agg_def(Aggref *ref, Index relid, DbeFlatAggDef *def)
 		case INT4OID:
 		case DATEOID:
 			def->vallen = 4;
-			ok = (var->vartype == INT4OID &&
+			ok = (typid == INT4OID &&
 				  (transfn == F_INT4_SUM || transfn == F_INT4_AVG_ACCUM));
 			break;
 		case INT8OID:
@@ -950,7 +969,7 @@ dbe_flat_agg_def(Aggref *ref, Index relid, DbeFlatAggDef *def)
 			 * numeric_poly_avg.  La tabla lleva la suma en int128, como el
 			 * estado de Postgres.
 			 */
-			if (var->vartype == INT8OID && transfn == F_INT8_AVG_ACCUM)
+			if (typid == INT8OID && transfn == F_INT8_AVG_ACCUM)
 			{
 				if (finalfn == F_NUMERIC_POLY_SUM)
 				{
@@ -985,9 +1004,9 @@ dbe_flat_agg_def(Aggref *ref, Index relid, DbeFlatAggDef *def)
 		return false;
 	}
 
-	if (OidIsValid(sortop) && ref->aggtype == var->vartype)
+	if (OidIsValid(sortop) && ref->aggtype == typid)
 	{
-		TypeCacheEntry *tc = lookup_type_cache(var->vartype,
+		TypeCacheEntry *tc = lookup_type_cache(typid,
 											   TYPECACHE_LT_OPR | TYPECACHE_GT_OPR);
 
 		if (sortop == tc->lt_opr)
@@ -1752,6 +1771,27 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 			nwanted++;
 		}
 	}
+	/* Las demás columnas de un argumento que mira varias. */
+	foreach(lc, tlist)
+	{
+		Expr	   *e = ((TargetEntry *) lfirst(lc))->expr;
+		Bitmapset  *attrs = NULL;
+		int			x = -1;
+
+		if (!IsA(e, Aggref))
+			continue;
+		pull_varattnos((Node *) ((Aggref *) e)->args, input_rel->relid, &attrs);
+		while ((x = bms_next_member(attrs, x)) >= 0)
+		{
+			AttrNumber	a = x + FirstLowInvalidHeapAttributeNumber;
+
+			if (a >= 1 && a <= natts && !wanted[a - 1])
+			{
+				wanted[a - 1] = true;
+				nwanted++;
+			}
+		}
+	}
 	{
 		Bitmapset  *attrs = NULL;
 		int			x = -1;
@@ -2245,6 +2285,28 @@ dbe_agg_init_one(DbeAggState *agg, Aggref *ref, AttrNumber attnum,
 
 		if (!IsA(arg, Var))
 		{
+			List	   *vars = pull_var_clause((Node *) arg, 0);
+			ListCell   *lv;
+
+			foreach(lv, vars)
+			{
+				AttrNumber	a = ((Var *) lfirst(lv))->varattno;
+				int			i;
+
+				for (i = 0; i < agg->nextra && agg->extra[i] != a; i++)
+					;
+				if (a == attnum || i < agg->nextra)
+					continue;
+				if (agg->extra == NULL)
+				{
+					agg->extra = (AttrNumber *) palloc(sizeof(AttrNumber) * list_length(vars));
+					agg->extravec = (DbeColumnVector *)
+						palloc0(sizeof(DbeColumnVector) * list_length(vars));
+					agg->extra_ok = (bool *) palloc0(sizeof(bool) * list_length(vars));
+				}
+				agg->extra[agg->nextra++] = a;
+			}
+
 			/* Con parent NULL los Var se leen de ecxt_scantuple. */
 			agg->argexpr = ExecInitExpr(arg, NULL);
 			get_typlenbyval(exprType((Node *) arg), &agg->valtyplen,
@@ -4007,6 +4069,15 @@ dbe_agg_missing_value(DbeVectorAggState *state, AttrNumber attnum,
  * El contexto por tupla se vacía antes de evaluar: el valor de la fila
  * anterior ya lo consumió dbe_agg_advance(), que copia lo que se queda.
  */
+/* Las vistas de las demás columnas de un argumento, para el stripe cargado. */
+static void
+dbe_agg_load_extra(DbeVectorAggState *state, DbeAggState *agg)
+{
+	for (int i = 0; i < agg->nextra; i++)
+		agg->extra_ok[i] = dbe_cursor_column(state->cursor, agg->extra[i],
+											 &agg->extravec[i]);
+}
+
 static void
 dbe_agg_value(DbeVectorAggState *state, DbeAggState *agg, uint64 row,
 			  Datum *value, bool *isnull)
@@ -4050,6 +4121,18 @@ dbe_agg_value(DbeVectorAggState *state, DbeAggState *agg, uint64 row,
 	}
 	slot->tts_values[agg->attnum - 1] = *value;
 	slot->tts_isnull[agg->attnum - 1] = *isnull;
+	for (int i = 0; i < agg->nextra; i++)
+	{
+		AttrNumber	a = agg->extra[i];
+		Form_pg_attribute att = TupleDescAttr(slot->tts_tupleDescriptor, a - 1);
+
+		if (!agg->extra_ok[i])
+			dbe_agg_missing_value(state, a, &slot->tts_values[a - 1],
+								  &slot->tts_isnull[a - 1]);
+		else
+			dbe_vec_value(&agg->extravec[i], row, att->attbyval, att->attlen,
+						  &slot->tts_values[a - 1], &slot->tts_isnull[a - 1]);
+	}
 
 	ResetExprContext(econtext);
 	econtext->ecxt_scantuple = slot;
@@ -4134,6 +4217,7 @@ dbe_agg_fill_hash(DbeVectorAggState *state)
 				continue;
 			agg->has_vector = !agg->is_count_star &&
 				dbe_cursor_column(state->cursor, agg->attnum, &agg->vec);
+			dbe_agg_load_extra(state, agg);
 		}
 		for (i = 0; i < state->ngroupcols; i++)
 			state->groupvec_ok[i] =
@@ -4686,6 +4770,7 @@ dbe_agg_fill_flat(DbeVectorAggState *state, int bucket, uint32 nbuckets)
 				continue;
 			agg->has_vector = !agg->is_count_star &&
 				dbe_cursor_column(state->cursor, agg->attnum, &agg->vec);
+			dbe_agg_load_extra(state, agg);
 		}
 		for (i = 0; i < state->ngroupcols; i++)
 			state->groupvec_ok[i] =
@@ -5142,6 +5227,7 @@ dbe_agg_exec_grouped(CustomScanState *node)
 					continue;
 				agg->has_vector = !agg->is_count_star &&
 					dbe_cursor_column(state->cursor, agg->attnum, &agg->vec);
+				dbe_agg_load_extra(state, agg);
 			}
 			for (i = 0; i < state->ngroupcols; i++)
 				state->groupvec_ok[i] =
@@ -5385,6 +5471,7 @@ dbe_agg_exec(CustomScanState *node)
 			/* Los que ya avanzó el SMA no necesitan la columna. */
 			agg->has_vector = !agg->is_count_star && !agg->sma_now &&
 				dbe_cursor_column(state->cursor, agg->attnum, &agg->vec);
+			dbe_agg_load_extra(state, agg);
 			if (agg->is_distinct)
 				dbe_agg_distinct_stripe(agg, nrows);
 		}
