@@ -393,8 +393,10 @@ muestre C5.0.
        argumento puede mirar una sola columna; la evaluación ya pasa por el
        slot, así que es cargar varias. Lo mismo para las claves (`CASE
        WHEN` sobre varias columnas).
-6. [ ] **`sum`/`avg` de `bigint`** en la tabla propia y por SMA (q4). El
-       estado es int128, como en Postgres.
+6. [~] **`sum`/`avg` de `bigint`** en la tabla propia y por SMA (q4). El
+       estado es int128, como en Postgres. Hecho en la tabla propia; falta
+       por SMA, que necesita armar el estado interno de Postgres para el
+       camino parcial.
 7. [ ] **`sum`/`avg` de `numeric`** (TPC-H Q1, montos de dinero) como
        enteros escalados en int128, mientras el valor entre: si no, se
        pasa a la suma de Postgres para ese grupo. La escala del resultado

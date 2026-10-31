@@ -13,7 +13,7 @@
  * Esta tabla sirve para claves cuya igualdad es la binaria —enteros,
  * fechas, timestamps, y texto con collation determinista— y para los
  * agregados cuyo estado es un par de enteros: count, sum y avg de
- * smallint/integer, min y max de enteros.  Una entrada es un arreglo de
+ * smallint/integer/bigint, min y max de enteros.  Una entrada es un arreglo de
  * uint64 —hash, máscara de nulos, claves, estados— en un arreglo denso, con
  * un directorio de direccionamiento abierto encima; un texto es un puntero a
  * una copia en un arena de la tabla.
@@ -41,7 +41,9 @@ typedef enum DbeFlatKind
 	DBE_FLAT_SUM,				/* sum(int2/int4) → int8 */
 	DBE_FLAT_AVG,				/* avg(int2/int4) → numeric, con int8_avg() */
 	DBE_FLAT_MIN,				/* min de un entero, mismo tipo */
-	DBE_FLAT_MAX
+	DBE_FLAT_MAX,
+	DBE_FLAT_SUM8,				/* sum(int8) → numeric, suma en int128 */
+	DBE_FLAT_AVG8				/* avg(int8) → numeric */
 } DbeFlatKind;
 
 typedef struct DbeFlatAggDef

@@ -876,6 +876,7 @@ dbe_flat_distinct_ok(Aggref *ref, Index relid, AttrNumber *attnum)
  *   count(col)                  int8inc_any, cualquier tipo
  *   sum(int2/int4)              int2_sum / int4_sum → int8
  *   avg(int2/int4)              int2/int4_avg_accum + int8_avg → numeric
+ *   sum/avg(int8)               int8_avg_accum + numeric_poly_sum/avg → numeric
  *   min/max de enteros y fechas aggsortop = el < o > del tipo
  *
  * El argumento tiene que ser la columna sola.  `relid` 0 no comprueba de
@@ -943,6 +944,26 @@ dbe_flat_agg_def(Aggref *ref, Index relid, DbeFlatAggDef *def)
 		case TIMESTAMPOID:
 		case TIMESTAMPTZOID:
 			def->vallen = 8;
+
+			/*
+			 * sum/avg(int8): int8_avg_accum, con numeric_poly_sum o
+			 * numeric_poly_avg.  La tabla lleva la suma en int128, como el
+			 * estado de Postgres.
+			 */
+			if (var->vartype == INT8OID && transfn == F_INT8_AVG_ACCUM)
+			{
+				if (finalfn == F_NUMERIC_POLY_SUM)
+				{
+					def->kind = DBE_FLAT_SUM8;
+					return true;
+				}
+				if (finalfn == F_NUMERIC_POLY_AVG)
+				{
+					def->kind = DBE_FLAT_AVG8;
+					return true;
+				}
+				return false;
+			}
 			break;
 		default:
 			return false;
@@ -1893,6 +1914,8 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	 */
 	{
 		List	   *private = path->custom_private;
+		bool		partial_path;
+		bool		few_groups;
 
 		/*
 		 * El camino SERIAL con tabla de hash no se ofrece.
@@ -1917,7 +1940,28 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		 * custom_private, con la marca 2 y la estimación de grupos, porque
 		 * `private` sigue siendo la del camino paralelo.
 		 */
-		if (grouped && hashed && flat_ok)
+		/*
+		 * Con pocos grupos gana el parcial paralelo: reparte stripes y el
+		 * Finalize junta unos pocos estados, mientras que la tabla propia en
+		 * paralelo le hace leer la tabla entera a cada participante para
+		 * elegir su balde.  `GROUP BY RegionID` (3.586 grupos en 10M filas):
+		 * 410 contra 294 ms con count(*), 603 contra 440 con sum(int8).  El
+		 * modelo de costos no lo veía; sumarle al camino paralelo el hash de
+		 * todas las filas lo arreglaba acá pero empeoraba hasta 1,8× las de
+		 * muchos grupos (q15, q16, q34, q35).  Así que se decide por la
+		 * cantidad de grupos: más de mil filas por grupo, y que el parcial
+		 * se vaya a ofrecer.
+		 */
+		partial_path = partial_ok && n_distinct == 0 && !all_metadata &&
+			input_rel->consider_parallel &&
+			output_rel->consider_parallel && extra != NULL &&
+			((GroupPathExtraData *) extra)->partial_costs_set &&
+			compute_parallel_worker(input_rel, input_rel->pages, -1,
+									max_parallel_workers_per_gather) > 0;
+		few_groups = grouped && partial_path &&
+			ngroups * 1000.0 < input_path->rows;
+
+		if (grouped && hashed && flat_ok && !few_groups)
 		{
 			double		in_rows = input_path->rows;
 			double		nagg = (double) list_length(agg_attnums);
@@ -2043,10 +2087,7 @@ dbe_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		 * conteos parciales daría de más, y combinar los conjuntos es otra
 		 * cosa que este nodo no emite.
 		 */
-		if (partial_ok && n_distinct == 0 && !all_metadata &&
-			input_rel->consider_parallel &&
-			output_rel->consider_parallel && extra != NULL &&
-			((GroupPathExtraData *) extra)->partial_costs_set)
+		if (partial_path)
 			dbe_add_parallel_agg_path(root, input_rel, output_rel,
 									  (GroupPathExtraData *) extra,
 									  tlist, private, natts);

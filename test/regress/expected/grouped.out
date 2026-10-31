@@ -870,6 +870,41 @@ SELECT fx_check('SELECT g + 1, h, count(*) FROM fxs GROUP BY 1, 2', 'fxs') AS vo
  t
 (1 row)
 
+-- sum/avg de bigint: la suma va en int128, como el estado de Postgres, y
+-- el resultado es el mismo numeric.  Sumas que se pasan de int64 hacia los
+-- dos lados, grupos sin valores y volcado con registros de estados.
+CREATE TABLE fb (g int4, b int8) USING dbengine_columnar;
+INSERT INTO fb SELECT i % 5000,
+	CASE WHEN i % 7 = 0 THEN NULL
+		 WHEN i % 5000 < 3 THEN (CASE WHEN i % 2 = 0 THEN 1 ELSE -1 END) * 4611686018427387904
+		 ELSE i::int8 * 1000003 END
+	FROM generate_series(1, 120000) i;
+INSERT INTO fb SELECT 99999, NULL FROM generate_series(1, 10);
+CREATE TABLE fbh AS SELECT * FROM fb;
+EXPLAIN (COSTS OFF) SELECT g, sum(b), avg(b) FROM fb GROUP BY g;
+              QUERY PLAN               
+---------------------------------------
+ Custom Scan (DbengineVectorAgg) on fb
+   Agregados empujados al scan: 3
+   Agrupación: tabla de hash propia
+(3 rows)
+
+SELECT fx_check('SELECT g, sum(b), avg(b), count(b) FROM fb GROUP BY g', 'fb') AS sum_avg_bigint;
+ sum_avg_bigint 
+----------------
+ t
+(1 row)
+
+SELECT g, sum(b), avg(b) FROM fb WHERE g IN (0, 1, 2, 99999) GROUP BY g ORDER BY g;
+   g   |          sum          |         avg          
+-------+-----------------------+----------------------
+     0 |  96845406386975145984 |  4611686018427387904
+     1 | -96845406386975145984 | -4611686018427387904
+     2 |  96845406386975145984 |  4611686018427387904
+ 99999 |                       |                     
+(4 rows)
+
+DROP TABLE fb, fbh;
 RESET work_mem;
 -- Corridas: filas seguidas con las mismas claves van a la tabla una vez,
 -- como estados.  Corridas de largo variable, con nulos en las claves y en
@@ -1312,6 +1347,26 @@ SELECT fx_check('SELECT upper(k), v % 7, count(*) FROM fpt GROUP BY 1, 2', 'fpt'
  t
 (1 row)
 
+-- Con pocos grupos (más de mil filas por grupo) va el parcial con
+-- Finalize, que reparte stripes; la tabla propia en paralelo le haría leer
+-- la tabla entera a cada participante.  Con muchos, la tabla propia.
+EXPLAIN (COSTS OFF) SELECT v, count(*), sum(v::int8) FROM fpt GROUP BY v;
+                         QUERY PLAN                          
+-------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: v
+   ->  Gather
+         Workers Planned: 2
+         ->  Parallel Custom Scan (DbengineVectorAgg) on fpt
+               Agregados empujados al scan: 3
+(6 rows)
+
+SELECT fx_check('SELECT v, count(*), sum(v::int8), avg(v::int8) FROM fpt GROUP BY v', 'fpt') AS pocos_grupos;
+ pocos_grupos 
+--------------
+ t
+(1 row)
+
 -- Top-N en paralelo: cada participante emite sus k mejores.
 EXPLAIN (COSTS OFF) SELECT k, sum(v) s FROM fpt GROUP BY k ORDER BY s DESC, k LIMIT 10;
                             QUERY PLAN                             
@@ -1331,6 +1386,12 @@ EXPLAIN (COSTS OFF) SELECT k, sum(v) s FROM fpt GROUP BY k ORDER BY s DESC, k LI
 SELECT fx_check('SELECT k, sum(v) s FROM fpt GROUP BY k ORDER BY s DESC, k LIMIT 10', 'fpt') AS paralelo_topn;
  paralelo_topn 
 ---------------
+ t
+(1 row)
+
+SELECT fx_check('SELECT k, sum(v::int8 * 3000000000) s, avg(v::int8) FROM fpt GROUP BY k ORDER BY s DESC, k LIMIT 10', 'fpt') AS paralelo_bigint;
+ paralelo_bigint 
+-----------------
  t
 (1 row)
 
@@ -1376,7 +1437,7 @@ RESET parallel_setup_cost;
 RESET parallel_tuple_cost;
 RESET min_parallel_table_scan_size;
 SET max_parallel_workers_per_gather = 0;
--- Lo que no entra: un float como clave (0 y -0 son iguales), sum(int8) y un
+-- Lo que no entra: un float como clave (0 y -0 son iguales), sum(numeric) y un
 -- HAVING, que la tabla no puede dejarle a un Finalize.
 EXPLAIN (COSTS OFF) SELECT v::float8, count(*) FROM fx GROUP BY 1;
                    QUERY PLAN                   
@@ -1387,7 +1448,7 @@ EXPLAIN (COSTS OFF) SELECT v::float8, count(*) FROM fx GROUP BY 1;
          Columnas leídas: v
 (4 rows)
 
-EXPLAIN (COSTS OFF) SELECT a, sum(c) FROM fx GROUP BY a;
+EXPLAIN (COSTS OFF) SELECT a, sum(c::numeric) FROM fx GROUP BY a;
                    QUERY PLAN                   
 ------------------------------------------------
  HashAggregate

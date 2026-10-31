@@ -38,6 +38,7 @@
 #include "utils/array.h"
 #include "utils/fmgrprotos.h"
 #include "utils/memutils.h"
+#include "utils/numeric.h"
 #include "varatt.h"
 
 #include "dbengine/flathash.h"
@@ -126,7 +127,61 @@ struct DbeFlatAgg
 int
 dbe_flat_state_words(DbeFlatKind kind)
 {
-	return (kind == DBE_FLAT_COUNT_STAR || kind == DBE_FLAT_COUNT) ? 1 : 2;
+	switch (kind)
+	{
+		case DBE_FLAT_COUNT_STAR:
+		case DBE_FLAT_COUNT:
+			return 1;
+		case DBE_FLAT_SUM8:
+		case DBE_FLAT_AVG8:
+			return 3;			/* la suma en int128 y la cantidad */
+		default:
+			return 2;
+	}
+}
+
+/* La suma de sum/avg(int8): un int128 en dos palabras, sin alinear. */
+static inline int128
+dbe_flat_get128(const uint64 *s)
+{
+	int128		v;
+
+	memcpy(&v, s, sizeof(int128));
+	return v;
+}
+
+static inline void
+dbe_flat_put128(uint64 *s, int128 v)
+{
+	memcpy(s, &v, sizeof(int128));
+}
+
+/*
+ * Un int128 como numeric de escala 0: lo mismo que int128_to_numericvar() y
+ * make_result() de numeric.c, que no se exportan.  Partido en tramos de
+ * 10^18, que entran en int64.
+ */
+static Datum
+dbe_flat_int128_numeric(int128 v)
+{
+	const int64 base = INT64CONST(1000000000000000000);
+	Datum		b = NumericGetDatum(int64_to_numeric(base));
+	int64		lo;
+	int64		mid;
+	int64		hi;
+	Datum		r;
+
+	if (v >= PG_INT64_MIN && v <= PG_INT64_MAX)
+		return NumericGetDatum(int64_to_numeric((int64) v));
+	lo = (int64) (v % base);
+	v /= base;
+	mid = (int64) (v % base);
+	hi = (int64) (v / base);
+	r = NumericGetDatum(int64_to_numeric(hi));
+	r = DirectFunctionCall2(numeric_mul, r, b);
+	r = DirectFunctionCall2(numeric_add, r, NumericGetDatum(int64_to_numeric(mid)));
+	r = DirectFunctionCall2(numeric_mul, r, b);
+	return DirectFunctionCall2(numeric_add, r, NumericGetDatum(int64_to_numeric(lo)));
 }
 
 static inline int64
@@ -412,6 +467,13 @@ dbe_flat_update(DbeFlatAgg *fa, uint64 *st, const Datum *vals,
 				s[0] = (uint64) ((int64) s[0] + dbe_flat_int(vals[i], d->vallen));
 				s[1]++;
 				break;
+			case DBE_FLAT_SUM8:
+			case DBE_FLAT_AVG8:
+				if (valnulls[i])
+					break;
+				dbe_flat_put128(s, dbe_flat_get128(s) + DatumGetInt64(vals[i]));
+				s[2]++;
+				break;
 			case DBE_FLAT_MIN:
 			case DBE_FLAT_MAX:
 				if (valnulls[i])
@@ -445,6 +507,11 @@ dbe_flat_merge(DbeFlatAgg *fa, uint64 *e, const uint64 *states)
 			case DBE_FLAT_AVG:
 				s[0] = (uint64) ((int64) s[0] + (int64) r[0]);
 				s[1] += r[1];
+				break;
+			case DBE_FLAT_SUM8:
+			case DBE_FLAT_AVG8:
+				dbe_flat_put128(s, dbe_flat_get128(s) + dbe_flat_get128(r));
+				s[2] += r[2];
 				break;
 			case DBE_FLAT_MIN:
 			case DBE_FLAT_MAX:
@@ -1225,6 +1292,19 @@ dbe_flat_final(DbeFlatAgg *fa, int i, const uint64 *states, bool *isnull)
 		case DBE_FLAT_MAX:
 			*isnull = (s[1] == 0);
 			return *isnull ? (Datum) 0 : dbe_flat_datum((int64) s[0], d->vallen);
+		case DBE_FLAT_SUM8:
+		case DBE_FLAT_AVG8:
+			/* Lo mismo que numeric_poly_sum() y numeric_poly_avg(). */
+			if (s[2] == 0)
+			{
+				*isnull = true;
+				return (Datum) 0;
+			}
+			if (d->kind == DBE_FLAT_SUM8)
+				return dbe_flat_int128_numeric(dbe_flat_get128(s));
+			return DirectFunctionCall2(numeric_div,
+									   dbe_flat_int128_numeric(dbe_flat_get128(s)),
+									   NumericGetDatum(int64_to_numeric((int64) s[2])));
 	}
 	*isnull = true;
 	return (Datum) 0;

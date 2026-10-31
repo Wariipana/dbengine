@@ -491,6 +491,21 @@ SELECT (SELECT sum(hashtext(g || ':' || coalesce(h, -1) || ':' || c || ':' || co
 		FROM (SELECT g, h, count(*) c, sum(v) s, avg(v) a FROM fxsh GROUP BY g, h) y)
 	AS volcado_igual;
 SELECT fx_check('SELECT g + 1, h, count(*) FROM fxs GROUP BY 1, 2', 'fxs') AS volcado_expresion;
+-- sum/avg de bigint: la suma va en int128, como el estado de Postgres, y
+-- el resultado es el mismo numeric.  Sumas que se pasan de int64 hacia los
+-- dos lados, grupos sin valores y volcado con registros de estados.
+CREATE TABLE fb (g int4, b int8) USING dbengine_columnar;
+INSERT INTO fb SELECT i % 5000,
+	CASE WHEN i % 7 = 0 THEN NULL
+		 WHEN i % 5000 < 3 THEN (CASE WHEN i % 2 = 0 THEN 1 ELSE -1 END) * 4611686018427387904
+		 ELSE i::int8 * 1000003 END
+	FROM generate_series(1, 120000) i;
+INSERT INTO fb SELECT 99999, NULL FROM generate_series(1, 10);
+CREATE TABLE fbh AS SELECT * FROM fb;
+EXPLAIN (COSTS OFF) SELECT g, sum(b), avg(b) FROM fb GROUP BY g;
+SELECT fx_check('SELECT g, sum(b), avg(b), count(b) FROM fb GROUP BY g', 'fb') AS sum_avg_bigint;
+SELECT g, sum(b), avg(b) FROM fb WHERE g IN (0, 1, 2, 99999) GROUP BY g ORDER BY g;
+DROP TABLE fb, fbh;
 RESET work_mem;
 
 -- Corridas: filas seguidas con las mismas claves van a la tabla una vez,
@@ -640,9 +655,15 @@ EXPLAIN (COSTS OFF) SELECT v, count(DISTINCT k), count(*) FROM fpt GROUP BY v;
 SELECT fx_check('SELECT v, count(DISTINCT k), count(*) FROM fpt GROUP BY v', 'fpt') AS paralelo_distinct;
 SELECT fx_check('SELECT k, v, count(*) FROM fpt GROUP BY k, v', 'fpt') AS paralelo_texto_y_entero;
 SELECT fx_check('SELECT upper(k), v % 7, count(*) FROM fpt GROUP BY 1, 2', 'fpt') AS paralelo_expresiones;
+-- Con pocos grupos (más de mil filas por grupo) va el parcial con
+-- Finalize, que reparte stripes; la tabla propia en paralelo le haría leer
+-- la tabla entera a cada participante.  Con muchos, la tabla propia.
+EXPLAIN (COSTS OFF) SELECT v, count(*), sum(v::int8) FROM fpt GROUP BY v;
+SELECT fx_check('SELECT v, count(*), sum(v::int8), avg(v::int8) FROM fpt GROUP BY v', 'fpt') AS pocos_grupos;
 -- Top-N en paralelo: cada participante emite sus k mejores.
 EXPLAIN (COSTS OFF) SELECT k, sum(v) s FROM fpt GROUP BY k ORDER BY s DESC, k LIMIT 10;
 SELECT fx_check('SELECT k, sum(v) s FROM fpt GROUP BY k ORDER BY s DESC, k LIMIT 10', 'fpt') AS paralelo_topn;
+SELECT fx_check('SELECT k, sum(v::int8 * 3000000000) s, avg(v::int8) FROM fpt GROUP BY k ORDER BY s DESC, k LIMIT 10', 'fpt') AS paralelo_bigint;
 SELECT fx_check('SELECT v, count(DISTINCT k) d FROM fpt GROUP BY v ORDER BY d DESC, v LIMIT 5', 'fpt') AS paralelo_topn_distinct;
 SET max_parallel_workers = 0;
 SELECT count(*) AS grupos, sum(c) AS filas
@@ -661,10 +682,10 @@ RESET parallel_tuple_cost;
 RESET min_parallel_table_scan_size;
 SET max_parallel_workers_per_gather = 0;
 
--- Lo que no entra: un float como clave (0 y -0 son iguales), sum(int8) y un
+-- Lo que no entra: un float como clave (0 y -0 son iguales), sum(numeric) y un
 -- HAVING, que la tabla no puede dejarle a un Finalize.
 EXPLAIN (COSTS OFF) SELECT v::float8, count(*) FROM fx GROUP BY 1;
-EXPLAIN (COSTS OFF) SELECT a, sum(c) FROM fx GROUP BY a;
+EXPLAIN (COSTS OFF) SELECT a, sum(c::numeric) FROM fx GROUP BY a;
 EXPLAIN (COSTS OFF) SELECT a, count(*) FROM fx GROUP BY a HAVING count(*) > 1;
 
 -- Apagada, el plan de antes.

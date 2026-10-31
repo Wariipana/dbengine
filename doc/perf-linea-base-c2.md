@@ -460,3 +460,29 @@ En la comparación alternando los dos `.so`: **q25 306 → 207 ms, q26 261 →
 159 ms, q27 307 → 205 ms, q20 32 → 20 ms, q23 436 → 362 ms, q24 773 → 687
 ms**; las demás, igual. Las 43 contra la línea base: media geométrica
 0,328, suma 109,9 → 38,7 s.
+
+## Resultado: `sum`/`avg` de bigint en la tabla propia, y pocos grupos al parcial
+
+**`sum`/`avg(int8)`.** Postgres los lleva con un estado interno (la suma en
+int128) y devuelve numeric. La tabla propia lleva la misma suma en int128
+—tres palabras: la suma en dos y la cantidad— y arma el resultado como
+`numeric_poly_sum()` y `numeric_poly_avg()`: el int128 como numeric de
+escala 0 y, para avg, `numeric_div` por la cantidad. No se reusa la
+serialización del estado de Postgres porque cambió entre 18 (numeric) y 19
+(int128 en dos int64). El test compara contra heap con sumas que se pasan
+de int64 para los dos lados.
+
+**Pocos grupos.** Al medirlo apareció un problema que ya existía: con pocos
+grupos la tabla propia en paralelo pierde contra el parcial con Finalize.
+`GROUP BY RegionID` (3.586 grupos en 10M filas) tardaba 410 ms contra 294
+con count(*), y 617 contra 439 con sum(int8). Cada participante lee la
+tabla entera para elegir su balde; el parcial reparte stripes y el Finalize
+junta unos pocos estados. Sumarle al costo del camino paralelo el hash de
+todas las filas elegía bien acá pero empeoraba hasta 1,8× las de muchos
+grupos (q15, q16, q34, q35): el costo del Finalize con millones de grupos
+también está subestimado. Así que se decide por la cantidad de grupos:
+con más de mil filas por grupo, y si el parcial se va a ofrecer, la tabla
+propia no se ofrece. Esas dos consultas quedan en 289 y 474 ms. Las 43 de
+ClickBench no cambian (comparación alternando los `.so`; la máquina tenía
+carga y las corridas sueltas salían hasta 20% más lentas en consultas que
+no tocan el cambio).
